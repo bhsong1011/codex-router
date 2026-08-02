@@ -24,10 +24,14 @@ import { MERGED_CATALOG_PATH, PORTS, loopback } from "./paths.mjs";
 import { MODEL_BY_SLUG, PROVIDERS, providerForModel } from "./model-registry.mjs";
 import { readNativeAliases } from "./native-alias.mjs";
 import { readProviderSelection } from "./provider-selection.mjs";
-import { ResponseUsageTransform } from "./response-usage.mjs";
+import { ResponseUsageTransform, tokenUsageFromPayload } from "./response-usage.mjs";
 import { activityMetadataFromHeaders } from "./codex-session-names.mjs";
 import { recordUsageEvent } from "./usage-events.mjs";
 import { VERSION } from "./version.mjs";
+import {
+  chatgptLoginRequestHeaders,
+  ensureFreshChatgptLoginToken,
+} from "./chatgpt-login-session.mjs";
 
 const LISTEN_HOST =
   process.env.CODEX_ROUTER_HOST || process.env.KIMI_ROUTER_HOST || "127.0.0.1";
@@ -42,6 +46,15 @@ const GATEWAY_BASE = (
   process.env.KIMI_GATEWAY_BASE_URL ||
   loopback(PORTS.gateway, "/v1")
 ).replace(/\/+$/, "");
+const API_FORWARD_BASE = (
+  process.env.CODEX_ROUTER_API_FORWARD_BASE_URL ||
+  process.env.KIMI_API_FORWARD_BASE_URL ||
+  loopback(PORTS.api, "/v1")
+).replace(/\/+$/, "");
+const RESPONSES_HISTORY_LIMIT = Number(
+  process.env.CODEX_ROUTER_RESPONSES_HISTORY_LIMIT || 64,
+);
+const responsesHistory = new Map();
 const OAUTH_HEALTH =
   process.env.CODEX_ROUTER_OAUTH_HEALTH_URL ||
   process.env.KIMI_OAUTH_HEALTH_URL ||
@@ -242,6 +255,12 @@ function nativeTarget(pathname, search) {
   return `${NATIVE_BASE}${withoutV1}${search}`;
 }
 
+function routedTarget(route) {
+  return route?.requestProfile === "deepseek-responses"
+    ? API_FORWARD_BASE
+    : GATEWAY_BASE;
+}
+
 function catalogModels() {
   try {
     const parsed = JSON.parse(readFileSync(CATALOG_PATH, "utf8"));
@@ -310,19 +329,77 @@ function messageItem(text) {
   };
 }
 
+// DeepSeek-origin subagent messages can be stored with readable payload text
+// inside an `encrypted_content` content part (plus a header-only `input_text`
+// twin). Codex's compact task chokes on that shape. OpenAI-issued encrypted
+// content is opaque Fernet and must be left untouched; only rewrite readable
+// blobs back to plaintext.
+function sanitizeEncryptedContentParts(item) {
+  if (!item || typeof item !== "object" || !Array.isArray(item.content)) return item;
+  let changed = false;
+  const content = item.content.map((part) => {
+    if (part?.type !== "encrypted_content" || isOpaqueEncryptedContent(part.encrypted_content)) {
+      return part;
+    }
+    changed = true;
+    return { type: "input_text", text: String(part.encrypted_content) };
+  });
+  return changed ? { ...item, content } : item;
+}
+
 function normalizeRoutedInput(input) {
   if (!Array.isArray(input)) return input;
   return input
     .filter((item) => item?.type !== "compaction_trigger")
     .map((item) => {
-      if (item?.type !== "compaction") return item;
-      const summary = decodeSummary(item.encrypted_content);
+      const cleaned = sanitizeEncryptedContentParts(item);
+      if (cleaned?.type !== "compaction") return cleaned;
+      const summary = decodeSummary(cleaned.encrypted_content);
       return messageItem(
         summary
           ? `${SUMMARY_PREFIX}\n\n${summary}`
           : "[Earlier conversation history was compacted in an unreadable format.]",
       );
     });
+}
+
+function statelessDeepSeekInput(payload, route) {
+  if (route?.requestProfile !== "deepseek-responses" || !Array.isArray(payload.input)) {
+    return undefined;
+  }
+  const previousId =
+    typeof payload.previous_response_id === "string"
+      ? payload.previous_response_id
+      : undefined;
+  const currentInput = normalizeRoutedInput(payload.input);
+  if (previousId) {
+    const prior = responsesHistory.get(previousId);
+    if (!prior) {
+      const error = new Error(
+        `Stateless Responses history for ${previousId} is unavailable. Continue the session from a recent checkpoint.`,
+      );
+      error.status = 400;
+      throw error;
+    }
+    return {
+      input: [...prior.input, ...(prior.output || []), ...currentInput],
+      instructions: payload.instructions ?? prior.instructions,
+    };
+  }
+  return { input: currentInput, instructions: payload.instructions };
+}
+
+function rememberDeepSeekResponsesInput(responseId, history, output) {
+  responsesHistory.set(responseId, {
+    input: history.input,
+    output,
+    instructions: history.instructions,
+  });
+  while (responsesHistory.size > RESPONSES_HISTORY_LIMIT) {
+    const oldest = responsesHistory.keys().next().value;
+    if (oldest === undefined) break;
+    responsesHistory.delete(oldest);
+  }
 }
 
 // OpenAI-issued reasoning `encrypted_content` is an opaque token (Fernet-style,
@@ -347,13 +424,45 @@ function sanitizeReasoningForNative(item) {
 function normalizeNativeInput(input) {
   if (!Array.isArray(input)) return input;
   return input.map((item) => {
-    if (item?.type === "reasoning") return sanitizeReasoningForNative(item);
-    if (item?.type !== "compaction") return item;
-    const summary = decodeSummary(item.encrypted_content);
+    const cleaned = sanitizeEncryptedContentParts(item);
+    if (cleaned?.type === "reasoning") return sanitizeReasoningForNative(cleaned);
+    if (cleaned?.type !== "compaction") return cleaned;
+    const summary = decodeSummary(cleaned.encrypted_content);
     return summary === undefined
-      ? item
+      ? cleaned
       : messageItem(`${SUMMARY_PREFIX}\n\n${summary}`);
   });
+}
+
+function normalizeChatgptLoginInput(input) {
+  if (typeof input === "string") {
+    return [{ type: "message", role: "user", content: [{ type: "input_text", text: input }] }];
+  }
+  return normalizeNativeInput(input);
+}
+
+function completedChatgptLoginResponse(body) {
+  let completed;
+  const outputItems = [];
+  for (const line of body.toString("utf8").split(/\r?\n/)) {
+    if (!line.startsWith("data:")) continue;
+    const data = line.slice(5).trim();
+    if (!data || data === "[DONE]") continue;
+    try {
+      const event = JSON.parse(data);
+      if (event?.type === "response.completed" && event.response) {
+        completed = event.response;
+      } else if (event?.type === "response.output_item.done" && event.item) {
+        outputItems.push(event.item);
+      }
+    } catch {
+      // Keep scanning; malformed keepalive lines are not fatal.
+    }
+  }
+  if (completed && Array.isArray(completed.output) && completed.output.length === 0 && outputItems.length) {
+    completed.output = outputItems;
+  }
+  return completed;
 }
 
 function extractUserMessages(input) {
@@ -421,19 +530,21 @@ function extractResponseText(payload) {
 
 async function summarize(payload, route, signal) {
   const originalInput = Array.isArray(payload.input) ? payload.input : [];
+  const stateless = statelessDeepSeekInput(payload, route);
+  const expandedInput = stateless
+    ? [...stateless.input, messageItem(COMPACT_PROMPT)]
+    : [...normalizeRoutedInput(originalInput), messageItem(COMPACT_PROMPT)];
   const body = {
     ...payload,
     model: route.gatewayModel,
     stream: false,
     tools: [],
     tool_choice: "none",
-    input: [
-      ...normalizeRoutedInput(originalInput),
-      messageItem(COMPACT_PROMPT),
-    ],
+    input: expandedInput,
   };
+  if (stateless?.instructions !== undefined) body.instructions = stateless.instructions;
   delete body.previous_response_id;
-  const upstream = await fetch(`${GATEWAY_BASE}/responses`, {
+  const upstream = await fetch(`${routedTarget(route)}/responses`, {
     method: "POST",
     headers: routedHeaders(),
     body: JSON.stringify(body),
@@ -594,7 +705,7 @@ async function handleResponses(request, response, requestUrl) {
       }
     });
 
-    if (route && (compactV1 || compactV2)) {
+    if (route && route.requestProfile !== "chatgpt-login" && (compactV1 || compactV2)) {
       await handleRoutedCompaction(response, payload, route, controller.signal, compactV2);
       return;
     }
@@ -602,13 +713,41 @@ async function handleResponses(request, response, requestUrl) {
     let target;
     let headers;
     let routedBody;
-    if (route) {
+    let stateless;
+    if (route?.requestProfile === "chatgpt-login") {
+      let session;
+      try {
+        session = await ensureFreshChatgptLoginToken();
+      } catch (error) {
+        writeJson(response, error.status || 401, {
+          error: {
+            type: error.code || "oauth_unauthorized",
+            message: error instanceof Error ? error.message : String(error),
+          },
+        });
+        activity.finish(response.statusCode);
+        return;
+      }
+      const routed = { ...payload, model: route.upstreamModel };
+      routed.input = normalizeChatgptLoginInput(payload.input);
+      routed.store = false;
+      routed.stream = true;
+      if (!compactV1) delete routed.previous_response_id;
+      target = nativeTarget(requestUrl.pathname, requestUrl.search);
+      headers = chatgptLoginRequestHeaders(session, request.headers);
+      routedBody = Buffer.from(JSON.stringify(routed), "utf8");
+    } else if (route) {
+      stateless = statelessDeepSeekInput(payload, route);
       const routed = {
         ...payload,
         model: route.gatewayModel,
-        input: normalizeRoutedInput(payload.input),
+        input: stateless ? stateless.input : normalizeRoutedInput(payload.input),
       };
-      target = `${GATEWAY_BASE}/responses`;
+      if (stateless) {
+        delete routed.previous_response_id;
+        if (stateless.instructions !== undefined) routed.instructions = stateless.instructions;
+      }
+      target = `${routedTarget(route)}/responses`;
       headers = routedHeaders();
       routedBody = Buffer.from(JSON.stringify(routed), "utf8");
     } else {
@@ -628,11 +767,44 @@ async function handleResponses(request, response, requestUrl) {
       body: routedBody,
       signal: controller.signal,
     });
+    if (route?.requestProfile === "chatgpt-login" && payload.stream !== true) {
+      const bytes = Buffer.from(await upstream.arrayBuffer());
+      const completed = completedChatgptLoginResponse(bytes);
+      if (!upstream.ok || !completed) {
+        writeJson(response, upstream.status || 502, {
+          error: {
+            type: "upstream_error",
+            message: completed?.error?.message || "Personal ChatGPT backend returned no completed response.",
+          },
+        });
+      } else {
+        writeJson(response, 200, completed);
+      }
+      const usage = tokenUsageFromPayload(completed);
+      recordUsageEvent({
+        model: route?.slug || requestedModel,
+        provider: route?.provider || "openai",
+        status: upstream.status,
+        durationMs: Date.now() - startedAt,
+        ...usage,
+      });
+      if (!QUIET) {
+        console.error(
+          `[codex-router] model=${requestedModel || "unknown"} provider=${route?.provider || "openai"} status=${upstream.status}`,
+        );
+      }
+      activity.finish(response.statusCode);
+      return;
+    }
     const usageTransform = route
       ? new ResponseUsageTransform(upstream.headers.get("content-type") || "")
       : undefined;
     await pipeResponse(upstream, response, HOP_BY_HOP_HEADERS, usageTransform);
     const usage = usageTransform?.tokenUsage();
+    const responseId = usageTransform?.responseId();
+    if (route && stateless && upstream.ok && responseId) {
+      rememberDeepSeekResponsesInput(responseId, stateless, usageTransform?.outputItems() || []);
+    }
     recordUsageEvent({
       model: route?.slug || requestedModel,
       provider: route?.provider || "openai",

@@ -4,6 +4,10 @@ import path from "node:path";
 import { PROVIDERS } from "./model-registry.mjs";
 import { grokOAuthStatus } from "./grok-oauth-status.mjs";
 import { kimiOAuthStatus } from "./oauth-status.mjs";
+import {
+  chatgptLoginStatus,
+  CHATGPT_LOGIN_HOME,
+} from "./chatgpt-login-session.mjs";
 import { credentialStatus } from "./provider-credentials.mjs";
 import {
   disableProvider,
@@ -20,7 +24,9 @@ function configured(provider) {
   return provider.kind === "oauth"
     ? provider.id === "kimi-oauth"
       ? kimiOAuthStatus().configured
-      : provider.id === "grok-oauth" && grokOAuthStatus().configured
+      : provider.id === "grok-oauth"
+        ? grokOAuthStatus().configured
+        : provider.id === "chatgpt-login" && chatgptLoginStatus().configured
     : credentialStatus(provider, { persistent: true }).configured;
 }
 
@@ -58,7 +64,9 @@ function main() {
     const setup = provider.kind === "oauth"
       ? provider.id === "grok-oauth"
         ? "run `grok login --oauth`"
-        : "run `kimi login`"
+        : provider.id === "chatgpt-login"
+          ? `run \`CODEX_HOME=${CHATGPT_LOGIN_HOME} codex login\``
+          : "run `kimi login`"
       : `run \`${targetCli(`provider-key ${provider.id} set`)}\``;
     throw new Error(`${provider.displayName} is not configured; ${setup} first.`);
   }

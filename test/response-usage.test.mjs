@@ -33,12 +33,18 @@ test("normalizes Responses and Chat Completions token usage", () => {
 
 test("captures final SSE usage without changing streamed bytes", async () => {
   const body = [
+    "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_created\"}}\n\n",
     "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+    "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"pwd\"}}\n\n",
     "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":21,\"output_tokens\":8}}}\n\n",
     "data: [DONE]\n\n",
   ];
   const transform = new ResponseUsageTransform("text/event-stream; charset=utf-8");
   assert.equal(await passThrough(transform, body), body.join(""));
+  assert.equal(transform.responseId(), "resp_created");
+  assert.deepEqual(transform.outputItems(), [
+    { type: "function_call", call_id: "call_1", name: "pwd" },
+  ]);
   assert.deepEqual(transform.tokenUsage(), {
     inputTokens: 21,
     outputTokens: 8,
@@ -49,10 +55,15 @@ test("captures final SSE usage without changing streamed bytes", async () => {
 test("captures JSON usage without changing the response", async () => {
   const body = JSON.stringify({
     id: "response-test",
+    output: [{ type: "function_call", call_id: "call_1", name: "pwd" }],
     usage: { input_tokens: 31, output_tokens: 11, total_tokens: 42 },
   });
   const transform = new ResponseUsageTransform("application/json");
   assert.equal(await passThrough(transform, [body]), body);
+  assert.equal(transform.responseId(), "response-test");
+  assert.deepEqual(transform.outputItems(), [
+    { type: "function_call", call_id: "call_1", name: "pwd" },
+  ]);
   assert.deepEqual(transform.tokenUsage(), {
     inputTokens: 31,
     outputTokens: 11,

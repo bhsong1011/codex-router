@@ -57,6 +57,54 @@ function deepSeekEffort(value) {
   return ["xhigh", "max", "ultra"].includes(value) ? "max" : "high";
 }
 
+function normalizeDeepSeekResponsesInput(input) {
+  if (!Array.isArray(input)) return input;
+  const items = input.flatMap((item) => {
+    const emptyMessage =
+      item?.type === "message" &&
+      (item.content === undefined ||
+        item.content === "" ||
+        (Array.isArray(item.content) &&
+          (item.content.length === 0 ||
+            item.content.every((part) => part?.text === ""))));
+    if (
+      emptyMessage
+    ) {
+      return [];
+    }
+    if (item?.type !== "reasoning") return [item];
+    const { summary, encrypted_content, ...supported } = item;
+    return supported.content === undefined ? [] : [supported];
+  });
+  // DeepSeek's stateless Responses API requires function_call and
+  // function_call_output items to form one contiguous tool-call turn. Codex
+  // can inject developer context messages between those items; hoist those
+  // messages out of the turn so the upstream validator accepts the output IDs.
+  const output = [];
+  const deferredDeveloper = [];
+  let toolBlock = [];
+  const flushToolBlock = () => {
+    if (toolBlock.length) {
+      output.push(...toolBlock);
+      toolBlock = [];
+    }
+  };
+  for (const item of items) {
+    if (["function_call", "function_call_output", "web_search_call"].includes(item?.type)) {
+      toolBlock.push(item);
+      continue;
+    }
+    if (toolBlock.length && item?.type === "message" && item?.role === "developer") {
+      deferredDeveloper.push(item);
+      continue;
+    }
+    flushToolBlock();
+    output.push(item);
+  }
+  flushToolBlock();
+  return [...deferredDeveloper, ...output];
+}
+
 // Strict chat-completions providers (e.g. MiniMax) reject a turn whose tool
 // result messages do not immediately follow the assistant message carrying the
 // matching tool_calls. When the upstream Responses-API history is translated to
@@ -125,7 +173,11 @@ function normalizeBody(buffer, contentType, route) {
     error.status = 400;
     throw error;
   }
-  const expectedRoute = provider.protocol === "anthropic" ? "/messages" : "/chat/completions";
+  const expectedRoute = model.requestProfile === "deepseek-responses"
+    ? "/responses"
+    : provider.protocol === "anthropic"
+      ? "/messages"
+      : "/chat/completions";
   if (route !== expectedRoute) {
     const error = new Error(`Model ${model.gatewayModel} does not support ${route}.`);
     error.status = 400;
@@ -133,7 +185,16 @@ function normalizeBody(buffer, contentType, route) {
   }
 
   payload.model = model.upstreamModel;
-  if (Array.isArray(payload.messages)) {
+  if (model.requestProfile === "deepseek-responses") {
+    payload.input = normalizeDeepSeekResponsesInput(payload.input);
+    delete payload.previous_response_id;
+    const reasoning = payload.reasoning && typeof payload.reasoning === "object"
+      ? { ...payload.reasoning }
+      : {};
+    reasoning.effort = deepSeekEffort(reasoning.effort || payload.reasoning_effort || "high");
+    payload.reasoning = reasoning;
+    delete payload.reasoning_effort;
+  } else if (Array.isArray(payload.messages)) {
     payload.messages = coalesceAssistantMessages(payload.messages);
   }
   if (model.requestProfile === "kimi-k3") {
@@ -265,7 +326,7 @@ async function handleRequest(request, response) {
     localModels(response);
     return;
   }
-  if (request.method !== "POST" || !["/chat/completions", "/messages"].includes(route)) {
+  if (request.method !== "POST" || !["/chat/completions", "/messages", "/responses"].includes(route)) {
     writeJson(response, 404, {
       error: { type: "proxy_route_not_found", message: "Unsupported API-provider route." },
     });

@@ -40,6 +40,8 @@ export class ResponseUsageTransform extends Transform {
   #buffer = "";
   #capturedBytes = 0;
   #usage;
+  #responseId;
+  #outputItems = [];
 
   constructor(contentType = "") {
     super();
@@ -80,6 +82,14 @@ export class ResponseUsageTransform extends Transform {
     return this.#usage;
   }
 
+  responseId() {
+    return this.#responseId;
+  }
+
+  outputItems() {
+    return this.#outputItems;
+  }
+
   #consumeEventLines(flush = false) {
     const lines = this.#buffer.split(/\r?\n/);
     this.#buffer = flush ? "" : lines.pop() || "";
@@ -98,5 +108,16 @@ export class ResponseUsageTransform extends Transform {
   #observe(payload) {
     const usage = tokenUsageFromPayload(payload);
     if (usage) this.#usage = usage;
+    if (typeof payload?.id === "string") this.#responseId = payload.id;
+    if (payload?.type === "response.created" && typeof payload.response?.id === "string") {
+      this.#responseId = payload.response.id;
+    }
+    if (this.#eventStream) {
+      if (payload?.type === "response.output_item.done" && payload.item) {
+        this.#outputItems.push(payload.item);
+      }
+    } else if (Array.isArray(payload?.output)) {
+      this.#outputItems.push(...payload.output);
+    }
   }
 }

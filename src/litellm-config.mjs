@@ -22,13 +22,14 @@ export function renderLiteLlmConfig() {
     const translatedModel =
       provider.kind === "oauth" ? model.upstreamModel : model.gatewayModel;
     const protocol = provider.protocol === "anthropic" ? "anthropic" : "openai";
+    const useChatCompletionsApi = model.requestProfile !== "deepseek-responses";
     lines.push(
       `  - model_name: ${yamlString(model.gatewayModel)}`,
       "    litellm_params:",
       `      model: ${yamlString(`${protocol}/${translatedModel}`)}`,
       `      api_base: ${yamlString(`os.environ/${apiBaseEnv}`)}`,
       '      api_key: "os.environ/CODEX_ROUTER_INTERNAL_KEY"',
-      "      use_chat_completions_api: true",
+      `      use_chat_completions_api: ${useChatCompletionsApi}`,
       "",
     );
   }

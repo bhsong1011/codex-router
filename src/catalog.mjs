@@ -160,7 +160,7 @@ export function routedModel(template, model) {
     supports_search_tool: false,
     supports_image_detail_original: false,
     use_responses_lite: false,
-    multi_agent_version: "v1",
+    multi_agent_version: "v2",
   };
   if (typeof next.base_instructions === "string") {
     next.base_instructions = rewriteIdentity(next.base_instructions, model);

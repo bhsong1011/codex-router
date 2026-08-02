@@ -182,6 +182,7 @@ test("router requires the configured path capability before any model route", as
   const router = run("router.mjs", {
     CODEX_ROUTER_PORT: String(routerPort),
     CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_API_FORWARD_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
     CODEX_ROUTER_OAUTH_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
     CODEX_ROUTER_API_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
     CODEX_ROUTER_GATEWAY_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
@@ -488,6 +489,7 @@ test("router preserves native auth and isolates every external route", async () 
     CODEX_ROUTER_PORT: String(routerPort),
     CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${native.port}/backend-api/codex`,
     CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_API_FORWARD_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
     CODEX_ROUTER_QUIET: "1",
   });
 
@@ -546,6 +548,95 @@ test("router preserves native auth and isolates every external route", async () 
   } finally {
     await stopChild(router);
     await Promise.all([closeServer(native.server), closeServer(gateway.server)]);
+  }
+});
+
+test("router replays full stateless history for DeepSeek Responses", async () => {
+  const gatewayRequests = [];
+  const gateway = await mockServer(async (request, response) => {
+    if (request.method === "GET" && request.url === "/health") {
+      json(response, 200, { ok: true });
+      return;
+    }
+    const body = await bodyJson(request);
+    gatewayRequests.push({ url: request.url, headers: request.headers, body });
+    const responseNumber = gatewayRequests.length;
+    json(response, 200, {
+      id: `resp_${responseNumber}`,
+      object: "response",
+      output:
+        responseNumber === 1
+          ? [
+              {
+                type: "function_call",
+                call_id: "call_1",
+                name: "pwd",
+                arguments: "{}",
+              },
+            ]
+          : [],
+      usage: { input_tokens: 1, output_tokens: 1 },
+    });
+  });
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_API_FORWARD_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_OAUTH_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
+    CODEX_ROUTER_API_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
+    CODEX_ROUTER_GATEWAY_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
+    CODEX_ROUTER_QUIET: "1",
+  });
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const headers = {
+      Authorization: "Bearer codex-caller-auth",
+      "Content-Type": "application/json",
+    };
+    const first = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "deepseek/deepseek-v4-flash",
+        instructions: "system prompt",
+        input: [
+          {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "hello" }],
+          },
+        ],
+      }),
+    });
+    assert.equal(first.status, 200);
+
+    const second = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "deepseek/deepseek-v4-flash",
+        previous_response_id: "resp_1",
+        input: [
+          { type: "function_call_output", call_id: "call_1", output: "pwd" },
+        ],
+      }),
+    });
+    assert.equal(second.status, 200);
+    assert.equal(gatewayRequests.length, 2);
+    assert.equal(gatewayRequests[0].body.previous_response_id, undefined);
+    assert.equal(gatewayRequests[0].body.input.length, 1);
+    assert.equal(gatewayRequests[1].body.previous_response_id, undefined);
+    assert.deepEqual(
+      gatewayRequests[1].body.input.map((item) => item.type),
+      ["message", "function_call", "function_call_output"],
+    );
+    assert.equal(gatewayRequests[1].body.input[1].call_id, "call_1");
+    assert.equal(gatewayRequests[1].body.instructions, "system prompt");
+  } finally {
+    await stopChild(router);
+    await closeServer(gateway.server);
   }
 });
 
@@ -881,7 +972,7 @@ test("API forwarder health omits disabled API providers", async () => {
   }
 });
 
-test("API forwarder supports all DeepSeek V4 models and normalizes thinking", async () => {
+test("API forwarder routes DeepSeek Pro through Chat Completions", async () => {
   const upstreamRequests = [];
   const upstream = await mockServer(async (request, response) => {
     upstreamRequests.push({ headers: request.headers, body: await bodyJson(request) });
@@ -899,38 +990,174 @@ test("API forwarder supports all DeepSeek V4 models and normalizes thinking", as
     await waitFor(`http://127.0.0.1:${forwarderPort}/health`, forwarder, {
       Authorization: `Bearer ${INTERNAL_KEY}`,
     });
-    for (const [gatewayModel, upstreamModel, effort] of [
-      ["deepseek-v4-flash", "deepseek-v4-flash", "high"],
-      ["deepseek-v4-pro", "deepseek-v4-pro", "max"],
-    ]) {
-      const response = await fetch(
-        `http://127.0.0.1:${forwarderPort}/v1/chat/completions`,
-        {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${INTERNAL_KEY}`,
-            "ChatGPT-Account-Id": "must-not-forward",
-            "X-Codex-Installation-Id": "must-not-forward",
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            model: gatewayModel,
-            reasoning_effort: effort === "max" ? "xhigh" : "low",
-            temperature: 0.7,
-            messages: [{ role: "user", content: "test" }],
-          }),
+    const response = await fetch(
+      `http://127.0.0.1:${forwarderPort}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${INTERNAL_KEY}`,
+          "ChatGPT-Account-Id": "must-not-forward",
+          "X-Codex-Installation-Id": "must-not-forward",
+          "Content-Type": "application/json",
         },
-      );
-      assert.equal(response.status, 200);
-      const request = upstreamRequests.at(-1);
-      assert.equal(request.headers.authorization, "Bearer TEST_DEEPSEEK_API_KEY");
-      assert.equal(request.headers["chatgpt-account-id"], undefined);
-      assert.equal(request.headers["x-codex-installation-id"], undefined);
-      assert.equal(request.body.model, upstreamModel);
-      assert.deepEqual(request.body.thinking, { type: "enabled" });
-      assert.equal(request.body.reasoning_effort, effort);
-      assert.equal(request.body.temperature, undefined);
-    }
+        body: JSON.stringify({
+          model: "deepseek-v4-pro",
+          reasoning_effort: "xhigh",
+          temperature: 0.7,
+          messages: [{ role: "user", content: "test" }],
+        }),
+      },
+    );
+    assert.equal(response.status, 200);
+    const request = upstreamRequests.at(-1);
+    assert.equal(request.headers.authorization, "Bearer TEST_DEEPSEEK_API_KEY");
+    assert.equal(request.headers["chatgpt-account-id"], undefined);
+    assert.equal(request.headers["x-codex-installation-id"], undefined);
+    assert.equal(request.body.model, "deepseek-v4-pro");
+    assert.deepEqual(request.body.thinking, { type: "enabled" });
+    assert.equal(request.body.reasoning_effort, "max");
+    assert.equal(request.body.temperature, undefined);
+  } finally {
+    await stopChild(forwarder);
+    await closeServer(upstream.server);
+  }
+});
+
+test("API forwarder routes DeepSeek Flash through native Responses", async () => {
+  const upstreamRequests = [];
+  const upstream = await mockServer(async (request, response) => {
+    upstreamRequests.push({ headers: request.headers, body: await bodyJson(request) });
+    json(response, 200, { id: "resp_test", output: [] });
+  });
+  const forwarderPort = await openPort();
+  const forwarder = run("api-forwarder.mjs", {
+    CODEX_ROUTER_API_PORT: String(forwarderPort),
+    DEEPSEEK_API_BASE_URL: `http://127.0.0.1:${upstream.port}`,
+    DEEPSEEK_API_KEY: "TEST_DEEPSEEK_API_KEY",
+    CODEX_ROUTER_QUIET: "1",
+  });
+
+  try {
+    await waitFor(`http://127.0.0.1:${forwarderPort}/health`, forwarder, {
+      Authorization: `Bearer ${INTERNAL_KEY}`,
+    });
+    const response = await fetch(
+      `http://127.0.0.1:${forwarderPort}/v1/responses`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${INTERNAL_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "deepseek-v4-flash",
+          previous_response_id: "unsupported",
+          reasoning_effort: "xhigh",
+          input: [
+            { type: "message", role: "user", content: [{ type: "input_text", text: "test" }] },
+            { type: "reasoning", encrypted_content: "unsupported" },
+            { type: "function_call", call_id: "call_1", name: "pwd", arguments: "{}" },
+            {
+              type: "message",
+              role: "developer",
+              content: [{ type: "input_text", text: "" }],
+            },
+            { type: "function_call_output", call_id: "call_1", output: "done" },
+          ],
+        }),
+      },
+    );
+    assert.equal(response.status, 200);
+    const request = upstreamRequests[0];
+    assert.equal(request.headers.authorization, "Bearer TEST_DEEPSEEK_API_KEY");
+    assert.equal(request.body.model, "deepseek-v4-flash");
+    assert.equal(request.body.previous_response_id, undefined);
+    assert.deepEqual(request.body.reasoning, { effort: "max" });
+    assert.equal(request.body.input.length, 3);
+    assert.equal(request.body.input[1].type, "function_call");
+  } finally {
+    await stopChild(forwarder);
+    await closeServer(upstream.server);
+  }
+});
+
+test("API forwarder keeps DeepSeek tool-call turns contiguous", async () => {
+  const upstreamRequests = [];
+  const upstream = await mockServer(async (request, response) => {
+    upstreamRequests.push({ headers: request.headers, body: await bodyJson(request) });
+    json(response, 200, { id: "resp_test", output: [] });
+  });
+  const forwarderPort = await openPort();
+  const forwarder = run("api-forwarder.mjs", {
+    CODEX_ROUTER_API_PORT: String(forwarderPort),
+    DEEPSEEK_API_BASE_URL: `http://127.0.0.1:${upstream.port}`,
+    DEEPSEEK_API_KEY: "TEST_DEEPSEEK_API_KEY",
+    CODEX_ROUTER_QUIET: "1",
+  });
+
+  try {
+    await waitFor(`http://127.0.0.1:${forwarderPort}/health`, forwarder, {
+      Authorization: `Bearer ${INTERNAL_KEY}`,
+    });
+    const response = await fetch(
+      `http://127.0.0.1:${forwarderPort}/v1/responses`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${INTERNAL_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "deepseek-v4-flash",
+          input: [
+            {
+              type: "message",
+              role: "assistant",
+              content: [{ type: "output_text", text: "running" }],
+            },
+            { type: "function_call", call_id: "call_1", name: "pwd", arguments: "{}" },
+            {
+              type: "message",
+              role: "developer",
+              content: [{ type: "input_text", text: "<context_guidance>" }],
+            },
+            { type: "function_call", call_id: "call_2", name: "echo", arguments: "{}" },
+            { type: "function_call_output", call_id: "call_1", output: "ok" },
+            {
+              type: "message",
+              role: "developer",
+              content: [{ type: "input_text", text: "" }],
+            },
+            { type: "function_call_output", call_id: "call_2", output: "ok" },
+            {
+              type: "message",
+              role: "user",
+              content: [{ type: "input_text", text: "next" }],
+            },
+          ],
+        }),
+      },
+    );
+    assert.equal(response.status, 200);
+    const input = upstreamRequests[0].body.input;
+    assert.deepEqual(
+      input.map((item) => item.type),
+      [
+        "message",
+        "message",
+        "function_call",
+        "function_call",
+        "function_call_output",
+        "function_call_output",
+        "message",
+      ],
+    );
+    assert.equal(input[0].role, "developer");
+    assert.deepEqual(
+      input.slice(2, 6).map((item) => item.call_id),
+      ["call_1", "call_2", "call_1", "call_2"],
+    );
+    assert.equal(input.at(-1).role, "user");
   } finally {
     await stopChild(forwarder);
     await closeServer(upstream.server);

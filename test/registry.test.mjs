@@ -32,6 +32,9 @@ test("provider registry exposes configured API and OAuth model families", () => 
       "ollama-cloud/minimax-m3",
       "ollama-cloud/deepseek-v4-pro",
       "minimax-token-plan/minimax-m3",
+      "chatgpt-login/gpt-5.6-luna",
+      "chatgpt-login/gpt-5.6-terra",
+      "chatgpt-login/gpt-5.6-sol",
     ],
   );
   assert.equal(PROVIDERS.get("deepseek").baseUrl, "https://api.deepseek.com");
@@ -48,6 +51,10 @@ test("provider registry exposes configured API and OAuth model families", () => 
   assert.equal(PROVIDERS.get("grok-api").baseUrl, "https://api.x.ai/v1");
   assert.equal(PROVIDERS.get("grok-oauth").proxyBaseEnv, "GROK_OAUTH_FORWARD_BASE_URL");
   assert.equal(PROVIDERS.get("anthropic-api").protocol, "anthropic");
+  assert.equal(
+    PROVIDERS.get("chatgpt-login").proxyBaseEnv,
+    "CODEX_ROUTER_CHATGPT_LOGIN_FORWARD_BASE_URL",
+  );
   for (const slug of [
     "kimi-oauth/kimi-for-coding-highspeed",
     "kimi-oauth/kimi-for-coding",
@@ -79,6 +86,17 @@ test("provider registry exposes configured API and OAuth model families", () => 
     assert.match(model.description, /DeepSeek V4/);
     assert.deepEqual(model.inputModalities, ["text"]);
   }
+  for (const slug of [
+    "chatgpt-login/gpt-5.6-luna",
+    "chatgpt-login/gpt-5.6-terra",
+    "chatgpt-login/gpt-5.6-sol",
+  ]) {
+    const model = MODEL_BY_SLUG.get(slug);
+    assert.equal(model.contextWindow, 272_000);
+    assert.match(model.displayName, /\(Personal\)/);
+    assert.equal(model.requestProfile, "chatgpt-login");
+    assert.deepEqual(model.inputModalities, ["text", "image"]);
+  }
 });
 
 test("deprecated DeepSeek aliases remain routable but stay out of the picker", () => {
@@ -104,4 +122,8 @@ test("LiteLLM configuration is generated from every registry route", () => {
   assert.match(rendered, /os\.environ\/CODEX_ROUTER_INTERNAL_KEY/);
   assert.match(rendered, /model: "anthropic\/anthropic-api-claude-opus-4-8"/);
   assert.doesNotMatch(rendered, /ANTHROPIC_API_KEY|DEEPSEEK_API_KEY|KIMI_API_KEY/);
+  assert.match(
+    rendered,
+    /model_name: "deepseek-v4-flash"[\s\S]*?use_chat_completions_api: false/,
+  );
 });

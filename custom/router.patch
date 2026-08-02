@@ -1,0 +1,1388 @@
+diff --git a/config/providers.json b/config/providers.json
+index 40d65a5..4b17e92 100644
+--- a/config/providers.json
++++ b/config/providers.json
+@@ -177,6 +177,13 @@
+         "prompt": "MiniMax Token Plan API key"
+       }
+     },
++    {
++      "id": "chatgpt-login",
++      "displayName": "Personal ChatGPT Login",
++      "kind": "oauth",
++      "ownedBy": "chatgpt",
++      "proxyBaseEnv": "CODEX_ROUTER_CHATGPT_LOGIN_FORWARD_BASE_URL"
++    },
+     {
+       "id": "groq",
+       "displayName": "Groq",
+@@ -505,7 +512,7 @@
+       "inputModalities": [
+         "text"
+       ],
+-      "requestProfile": "deepseek-thinking",
++      "requestProfile": "deepseek-responses",
+       "compHash": "deepseek-v4-flash-v1"
+     },
+     {
+@@ -867,6 +874,137 @@
+       ],
+       "requestProfile": "minimax-m3",
+       "compHash": "minimax-token-plan-minimax-m3-v1"
++    },
++    {
++      "slug": "chatgpt-login/gpt-5.6-luna",
++      "gatewayModel": "chatgpt-login-gpt-5-6-luna",
++      "upstreamModel": "gpt-5.6-luna",
++      "provider": "chatgpt-login",
++      "listed": true,
++      "displayName": "GPT-5.6 Luna (Personal)",
++      "description": "GPT-5.6 Luna using the Personal ChatGPT login.",
++      "priority": 31,
++      "defaultEffort": "medium",
++      "reasoningLevels": [
++        {
++          "effort": "low",
++          "description": "Fast responses with lighter reasoning"
++        },
++        {
++          "effort": "medium",
++          "description": "Balances speed and reasoning depth for everyday tasks"
++        },
++        {
++          "effort": "high",
++          "description": "Greater reasoning depth for complex problems"
++        },
++        {
++          "effort": "xhigh",
++          "description": "Extra high reasoning depth for complex problems"
++        },
++        {
++          "effort": "max",
++          "description": "Maximum reasoning depth for the hardest problems"
++        }
++      ],
++      "contextWindow": 272000,
++      "autoCompact": 258400,
++      "inputModalities": [
++        "text",
++        "image"
++      ],
++      "requestProfile": "chatgpt-login",
++      "compHash": "chatgpt-login-gpt-5-6-luna-v1"
++    },
++    {
++      "slug": "chatgpt-login/gpt-5.6-terra",
++      "gatewayModel": "chatgpt-login-gpt-5-6-terra",
++      "upstreamModel": "gpt-5.6-terra",
++      "provider": "chatgpt-login",
++      "listed": true,
++      "displayName": "GPT-5.6 Terra (Personal)",
++      "description": "GPT-5.6 Terra using the Personal ChatGPT login.",
++      "priority": 32,
++      "defaultEffort": "medium",
++      "reasoningLevels": [
++        {
++          "effort": "low",
++          "description": "Fast responses with lighter reasoning"
++        },
++        {
++          "effort": "medium",
++          "description": "Balances speed and reasoning depth for everyday tasks"
++        },
++        {
++          "effort": "high",
++          "description": "Greater reasoning depth for complex problems"
++        },
++        {
++          "effort": "xhigh",
++          "description": "Extra high reasoning depth for complex problems"
++        },
++        {
++          "effort": "max",
++          "description": "Maximum reasoning depth for the hardest problems"
++        },
++        {
++          "effort": "ultra",
++          "description": "Maximum reasoning with automatic task delegation"
++        }
++      ],
++      "contextWindow": 272000,
++      "autoCompact": 258400,
++      "inputModalities": [
++        "text",
++        "image"
++      ],
++      "requestProfile": "chatgpt-login",
++      "compHash": "chatgpt-login-gpt-5-6-terra-v1"
++    },
++    {
++      "slug": "chatgpt-login/gpt-5.6-sol",
++      "gatewayModel": "chatgpt-login-gpt-5-6-sol",
++      "upstreamModel": "gpt-5.6-sol",
++      "provider": "chatgpt-login",
++      "listed": true,
++      "displayName": "GPT-5.6 Sol (Personal)",
++      "description": "GPT-5.6 Sol using the Personal ChatGPT login.",
++      "priority": 33,
++      "defaultEffort": "low",
++      "reasoningLevels": [
++        {
++          "effort": "low",
++          "description": "Fast responses with lighter reasoning"
++        },
++        {
++          "effort": "medium",
++          "description": "Balances speed and reasoning depth for everyday tasks"
++        },
++        {
++          "effort": "high",
++          "description": "Greater reasoning depth for complex problems"
++        },
++        {
++          "effort": "xhigh",
++          "description": "Extra high reasoning depth for complex problems"
++        },
++        {
++          "effort": "max",
++          "description": "Maximum reasoning depth for the hardest problems"
++        },
++        {
++          "effort": "ultra",
++          "description": "Maximum reasoning with automatic task delegation"
++        }
++      ],
++      "contextWindow": 272000,
++      "autoCompact": 258400,
++      "inputModalities": [
++        "text",
++        "image"
++      ],
++      "requestProfile": "chatgpt-login",
++      "compHash": "chatgpt-login-gpt-5-6-sol-v1"
+     }
+   ]
+ }
+diff --git a/src/api-forwarder.mjs b/src/api-forwarder.mjs
+index 3798f35..4d5ccd2 100644
+--- a/src/api-forwarder.mjs
++++ b/src/api-forwarder.mjs
+@@ -57,6 +57,54 @@ function deepSeekEffort(value) {
+   return ["xhigh", "max", "ultra"].includes(value) ? "max" : "high";
+ }
+ 
++function normalizeDeepSeekResponsesInput(input) {
++  if (!Array.isArray(input)) return input;
++  const items = input.flatMap((item) => {
++    const emptyMessage =
++      item?.type === "message" &&
++      (item.content === undefined ||
++        item.content === "" ||
++        (Array.isArray(item.content) &&
++          (item.content.length === 0 ||
++            item.content.every((part) => part?.text === ""))));
++    if (
++      emptyMessage
++    ) {
++      return [];
++    }
++    if (item?.type !== "reasoning") return [item];
++    const { summary, encrypted_content, ...supported } = item;
++    return supported.content === undefined ? [] : [supported];
++  });
++  // DeepSeek's stateless Responses API requires function_call and
++  // function_call_output items to form one contiguous tool-call turn. Codex
++  // can inject developer context messages between those items; hoist those
++  // messages out of the turn so the upstream validator accepts the output IDs.
++  const output = [];
++  const deferredDeveloper = [];
++  let toolBlock = [];
++  const flushToolBlock = () => {
++    if (toolBlock.length) {
++      output.push(...toolBlock);
++      toolBlock = [];
++    }
++  };
++  for (const item of items) {
++    if (["function_call", "function_call_output", "web_search_call"].includes(item?.type)) {
++      toolBlock.push(item);
++      continue;
++    }
++    if (toolBlock.length && item?.type === "message" && item?.role === "developer") {
++      deferredDeveloper.push(item);
++      continue;
++    }
++    flushToolBlock();
++    output.push(item);
++  }
++  flushToolBlock();
++  return [...deferredDeveloper, ...output];
++}
++
+ // Strict chat-completions providers (e.g. MiniMax) reject a turn whose tool
+ // result messages do not immediately follow the assistant message carrying the
+ // matching tool_calls. When the upstream Responses-API history is translated to
+@@ -125,7 +173,11 @@ function normalizeBody(buffer, contentType, route) {
+     error.status = 400;
+     throw error;
+   }
+-  const expectedRoute = provider.protocol === "anthropic" ? "/messages" : "/chat/completions";
++  const expectedRoute = model.requestProfile === "deepseek-responses"
++    ? "/responses"
++    : provider.protocol === "anthropic"
++      ? "/messages"
++      : "/chat/completions";
+   if (route !== expectedRoute) {
+     const error = new Error(`Model ${model.gatewayModel} does not support ${route}.`);
+     error.status = 400;
+@@ -133,7 +185,16 @@ function normalizeBody(buffer, contentType, route) {
+   }
+ 
+   payload.model = model.upstreamModel;
+-  if (Array.isArray(payload.messages)) {
++  if (model.requestProfile === "deepseek-responses") {
++    payload.input = normalizeDeepSeekResponsesInput(payload.input);
++    delete payload.previous_response_id;
++    const reasoning = payload.reasoning && typeof payload.reasoning === "object"
++      ? { ...payload.reasoning }
++      : {};
++    reasoning.effort = deepSeekEffort(reasoning.effort || payload.reasoning_effort || "high");
++    payload.reasoning = reasoning;
++    delete payload.reasoning_effort;
++  } else if (Array.isArray(payload.messages)) {
+     payload.messages = coalesceAssistantMessages(payload.messages);
+   }
+   if (model.requestProfile === "kimi-k3") {
+@@ -265,7 +326,7 @@ async function handleRequest(request, response) {
+     localModels(response);
+     return;
+   }
+-  if (request.method !== "POST" || !["/chat/completions", "/messages"].includes(route)) {
++  if (request.method !== "POST" || !["/chat/completions", "/messages", "/responses"].includes(route)) {
+     writeJson(response, 404, {
+       error: { type: "proxy_route_not_found", message: "Unsupported API-provider route." },
+     });
+diff --git a/src/catalog.mjs b/src/catalog.mjs
+index 207f8a5..d0d50d3 100644
+--- a/src/catalog.mjs
++++ b/src/catalog.mjs
+@@ -160,7 +160,7 @@ export function routedModel(template, model) {
+     supports_search_tool: false,
+     supports_image_detail_original: false,
+     use_responses_lite: false,
+-    multi_agent_version: "v1",
++    multi_agent_version: "v2",
+   };
+   if (typeof next.base_instructions === "string") {
+     next.base_instructions = rewriteIdentity(next.base_instructions, model);
+diff --git a/src/chatgpt-login-session.mjs b/src/chatgpt-login-session.mjs
+new file mode 100644
+index 0000000..3f2afd3
+--- /dev/null
++++ b/src/chatgpt-login-session.mjs
+@@ -0,0 +1,183 @@
++import {
++  chmodSync,
++  mkdirSync,
++  readFileSync,
++  renameSync,
++  unlinkSync,
++  writeFileSync,
++} from "node:fs";
++import os from "node:os";
++import path from "node:path";
++
++import { protectPrivateFile } from "./file-security.mjs";
++import { VERSION } from "./version.mjs";
++
++const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
++const REFRESH_URL = "https://auth.openai.com/oauth/token";
++const REFRESH_THRESHOLD_MS = 10 * 60 * 1_000;
++const REFRESH_TIMEOUT_MS = 30_000;
++
++export const CHATGPT_LOGIN_HOME =
++  process.env.CODEX_ROUTER_CHATGPT_LOGIN_HOME || path.join(os.homedir(), ".codex-personal");
++export const CHATGPT_LOGIN_AUTH_PATH = path.join(CHATGPT_LOGIN_HOME, "auth.json");
++
++let refreshInFlight;
++
++function loginError(message) {
++  const error = new Error(message);
++  error.code = "oauth_unauthorized";
++  error.status = 401;
++  return error;
++}
++
++function readAuth() {
++  try {
++    return JSON.parse(readFileSync(CHATGPT_LOGIN_AUTH_PATH, "utf8"));
++  } catch {
++    return undefined;
++  }
++}
++
++function readSession() {
++  const auth = readAuth();
++  const tokens = auth?.tokens;
++  if (!auth || !tokens || typeof tokens.access_token !== "string" || !tokens.access_token) {
++    return undefined;
++  }
++  const lastRefresh = typeof auth.last_refresh === "string"
++    ? Date.parse(auth.last_refresh)
++    : Number.NaN;
++  return {
++    accessToken: tokens.access_token,
++    refreshToken: tokens.refresh_token,
++    accountId: tokens.account_id,
++    lastRefresh,
++  };
++}
++
++function writeRefreshed(payload, previous) {
++  const previousTokens = previous?.tokens || {};
++  const tokens = {
++    ...previousTokens,
++    id_token: payload.id_token ?? previousTokens.id_token,
++    access_token: payload.access_token,
++    refresh_token: payload.refresh_token ?? previousTokens.refresh_token,
++  };
++  const next = {
++    ...(previous || { auth_mode: "chatgpt" }),
++    tokens,
++    last_refresh: new Date().toISOString(),
++  };
++  mkdirSync(CHATGPT_LOGIN_HOME, { recursive: true, mode: 0o700 });
++  chmodSync(CHATGPT_LOGIN_HOME, 0o700);
++  const temporary = `${CHATGPT_LOGIN_AUTH_PATH}.tmp.${process.pid}`;
++  writeFileSync(temporary, `${JSON.stringify(next, null, 2)}\n`, {
++    encoding: "utf8",
++    mode: 0o600,
++  });
++  try {
++    protectPrivateFile(temporary);
++    renameSync(temporary, CHATGPT_LOGIN_AUTH_PATH);
++    protectPrivateFile(CHATGPT_LOGIN_AUTH_PATH);
++  } catch (error) {
++    try {
++      if (temporary) unlinkSync(temporary);
++    } catch {
++      // The original auth.json remains the source of truth.
++    }
++    throw error;
++  }
++}
++
++export function chatgptLoginStatus() {
++  const session = readSession();
++  return {
++    configured: Boolean(session),
++    home: CHATGPT_LOGIN_HOME,
++    ...(session?.accountId ? { accountId: session.accountId } : {}),
++  };
++}
++
++export async function refreshChatgptLogin({ fetchImpl = fetch } = {}) {
++  const session = readSession();
++  if (!session) {
++    throw loginError(
++      "Personal ChatGPT login is unavailable; run `mkdir -p ~/.codex-personal && CODEX_HOME=~/.codex-personal codex login`.",
++    );
++  }
++  if (typeof session.refreshToken !== "string" || !session.refreshToken) {
++    throw loginError(
++      "Personal ChatGPT refresh token is missing; run `CODEX_HOME=~/.codex-personal codex login` again.",
++    );
++  }
++  const response = await fetchImpl(REFRESH_URL, {
++    method: "POST",
++    headers: {
++      "Content-Type": "application/json",
++      "User-Agent": `codex-router/${VERSION}`,
++    },
++    body: JSON.stringify({
++      client_id: CLIENT_ID,
++      grant_type: "refresh_token",
++      refresh_token: session.refreshToken,
++    }),
++    signal: AbortSignal.timeout(REFRESH_TIMEOUT_MS),
++  });
++  const payload = await response.json().catch(() => ({}));
++  if (!response.ok || typeof payload?.access_token !== "string" || !payload.access_token) {
++    throw loginError(
++      "Personal ChatGPT login could not refresh; run `CODEX_HOME=~/.codex-personal codex login` again.",
++    );
++  }
++  writeRefreshed(payload, readAuth());
++  return readSession();
++}
++
++export async function ensureFreshChatgptLoginToken({ force = false, now = Date.now() } = {}) {
++  const initial = readSession();
++  if (!initial) {
++    throw loginError(
++      "Personal ChatGPT login is unavailable; run `mkdir -p ~/.codex-personal && CODEX_HOME=~/.codex-personal codex login`.",
++    );
++  }
++  if (
++    !force &&
++    Number.isFinite(initial.lastRefresh) &&
++    now - initial.lastRefresh < REFRESH_THRESHOLD_MS
++  ) {
++    return initial;
++  }
++
++  while (refreshInFlight) {
++    const session = await refreshInFlight;
++    if (!force || session.accessToken !== initial.accessToken) return session;
++  }
++
++  refreshInFlight = (async () => {
++    try {
++      await refreshChatgptLogin();
++    } catch (error) {
++      const current = readSession();
++      if (!force && current) return current;
++      throw error;
++    }
++    return readSession();
++  })();
++  try {
++    return await refreshInFlight;
++  } finally {
++    refreshInFlight = undefined;
++  }
++}
++
++export function chatgptLoginRequestHeaders(session, requestHeaders = {}) {
++  const headers = {
++    "Content-Type": "application/json",
++    "Accept-Encoding": "identity",
++    Authorization: `Bearer ${session.accessToken}`,
++    "ChatGPT-Account-Id": session.accountId,
++  };
++  const beta = requestHeaders["openai-beta"];
++  if (beta !== undefined) headers["openai-beta"] = beta;
++  return headers;
++}
+diff --git a/src/litellm-config.mjs b/src/litellm-config.mjs
+index 4fb6ce3..f6397dc 100644
+--- a/src/litellm-config.mjs
++++ b/src/litellm-config.mjs
+@@ -22,13 +22,14 @@ export function renderLiteLlmConfig() {
+     const translatedModel =
+       provider.kind === "oauth" ? model.upstreamModel : model.gatewayModel;
+     const protocol = provider.protocol === "anthropic" ? "anthropic" : "openai";
++    const useChatCompletionsApi = model.requestProfile !== "deepseek-responses";
+     lines.push(
+       `  - model_name: ${yamlString(model.gatewayModel)}`,
+       "    litellm_params:",
+       `      model: ${yamlString(`${protocol}/${translatedModel}`)}`,
+       `      api_base: ${yamlString(`os.environ/${apiBaseEnv}`)}`,
+       '      api_key: "os.environ/CODEX_ROUTER_INTERNAL_KEY"',
+-      "      use_chat_completions_api: true",
++      `      use_chat_completions_api: ${useChatCompletionsApi}`,
+       "",
+     );
+   }
+diff --git a/src/provider-selection.mjs b/src/provider-selection.mjs
+index 6170e3a..18ac288 100644
+--- a/src/provider-selection.mjs
++++ b/src/provider-selection.mjs
+@@ -14,6 +14,7 @@ import { PROVIDER_SELECTION_PATH, STATE_DIR, TARGET } from "./paths.mjs";
+ import { LISTED_MODELS, PROVIDERS } from "./model-registry.mjs";
+ import { kimiOAuthStatus } from "./oauth-status.mjs";
+ import { grokOAuthStatus } from "./grok-oauth-status.mjs";
++import { chatgptLoginStatus } from "./chatgpt-login-session.mjs";
+ import { credentialStatus } from "./provider-credentials.mjs";
+ 
+ const RETIRED_PROVIDER_ALIASES = new Map([["chatgpt-oauth", "grok-oauth"]]);
+@@ -45,6 +46,8 @@ export function configuredProviderIds() {
+         configured.push(provider.id);
+       } else if (provider.id === "grok-oauth" && grokOAuthStatus().configured) {
+         configured.push(provider.id);
++      } else if (provider.id === "chatgpt-login" && chatgptLoginStatus().configured) {
++        configured.push(provider.id);
+       }
+     } else if (credentialStatus(provider, { persistent: true }).configured) {
+       configured.push(provider.id);
+diff --git a/src/providers.mjs b/src/providers.mjs
+index bac4876..1d082e3 100644
+--- a/src/providers.mjs
++++ b/src/providers.mjs
+@@ -4,6 +4,10 @@ import path from "node:path";
+ import { PROVIDERS } from "./model-registry.mjs";
+ import { grokOAuthStatus } from "./grok-oauth-status.mjs";
+ import { kimiOAuthStatus } from "./oauth-status.mjs";
++import {
++  chatgptLoginStatus,
++  CHATGPT_LOGIN_HOME,
++} from "./chatgpt-login-session.mjs";
+ import { credentialStatus } from "./provider-credentials.mjs";
+ import {
+   disableProvider,
+@@ -20,7 +24,9 @@ function configured(provider) {
+   return provider.kind === "oauth"
+     ? provider.id === "kimi-oauth"
+       ? kimiOAuthStatus().configured
+-      : provider.id === "grok-oauth" && grokOAuthStatus().configured
++      : provider.id === "grok-oauth"
++        ? grokOAuthStatus().configured
++        : provider.id === "chatgpt-login" && chatgptLoginStatus().configured
+     : credentialStatus(provider, { persistent: true }).configured;
+ }
+ 
+@@ -58,7 +64,9 @@ function main() {
+     const setup = provider.kind === "oauth"
+       ? provider.id === "grok-oauth"
+         ? "run `grok login --oauth`"
+-        : "run `kimi login`"
++        : provider.id === "chatgpt-login"
++          ? `run \`CODEX_HOME=${CHATGPT_LOGIN_HOME} codex login\``
++          : "run `kimi login`"
+       : `run \`${targetCli(`provider-key ${provider.id} set`)}\``;
+     throw new Error(`${provider.displayName} is not configured; ${setup} first.`);
+   }
+diff --git a/src/response-usage.mjs b/src/response-usage.mjs
+index 7b772f6..558de0c 100644
+--- a/src/response-usage.mjs
++++ b/src/response-usage.mjs
+@@ -40,6 +40,8 @@ export class ResponseUsageTransform extends Transform {
+   #buffer = "";
+   #capturedBytes = 0;
+   #usage;
++  #responseId;
++  #outputItems = [];
+ 
+   constructor(contentType = "") {
+     super();
+@@ -80,6 +82,14 @@ export class ResponseUsageTransform extends Transform {
+     return this.#usage;
+   }
+ 
++  responseId() {
++    return this.#responseId;
++  }
++
++  outputItems() {
++    return this.#outputItems;
++  }
++
+   #consumeEventLines(flush = false) {
+     const lines = this.#buffer.split(/\r?\n/);
+     this.#buffer = flush ? "" : lines.pop() || "";
+@@ -98,5 +108,16 @@ export class ResponseUsageTransform extends Transform {
+   #observe(payload) {
+     const usage = tokenUsageFromPayload(payload);
+     if (usage) this.#usage = usage;
++    if (typeof payload?.id === "string") this.#responseId = payload.id;
++    if (payload?.type === "response.created" && typeof payload.response?.id === "string") {
++      this.#responseId = payload.response.id;
++    }
++    if (this.#eventStream) {
++      if (payload?.type === "response.output_item.done" && payload.item) {
++        this.#outputItems.push(payload.item);
++      }
++    } else if (Array.isArray(payload?.output)) {
++      this.#outputItems.push(...payload.output);
++    }
+   }
+ }
+diff --git a/src/router.mjs b/src/router.mjs
+index 99c77d7..023f603 100644
+--- a/src/router.mjs
++++ b/src/router.mjs
+@@ -24,10 +24,14 @@ import { MERGED_CATALOG_PATH, PORTS, loopback } from "./paths.mjs";
+ import { MODEL_BY_SLUG, PROVIDERS, providerForModel } from "./model-registry.mjs";
+ import { readNativeAliases } from "./native-alias.mjs";
+ import { readProviderSelection } from "./provider-selection.mjs";
+-import { ResponseUsageTransform } from "./response-usage.mjs";
++import { ResponseUsageTransform, tokenUsageFromPayload } from "./response-usage.mjs";
+ import { activityMetadataFromHeaders } from "./codex-session-names.mjs";
+ import { recordUsageEvent } from "./usage-events.mjs";
+ import { VERSION } from "./version.mjs";
++import {
++  chatgptLoginRequestHeaders,
++  ensureFreshChatgptLoginToken,
++} from "./chatgpt-login-session.mjs";
+ 
+ const LISTEN_HOST =
+   process.env.CODEX_ROUTER_HOST || process.env.KIMI_ROUTER_HOST || "127.0.0.1";
+@@ -42,6 +46,15 @@ const GATEWAY_BASE = (
+   process.env.KIMI_GATEWAY_BASE_URL ||
+   loopback(PORTS.gateway, "/v1")
+ ).replace(/\/+$/, "");
++const API_FORWARD_BASE = (
++  process.env.CODEX_ROUTER_API_FORWARD_BASE_URL ||
++  process.env.KIMI_API_FORWARD_BASE_URL ||
++  loopback(PORTS.api, "/v1")
++).replace(/\/+$/, "");
++const RESPONSES_HISTORY_LIMIT = Number(
++  process.env.CODEX_ROUTER_RESPONSES_HISTORY_LIMIT || 64,
++);
++const responsesHistory = new Map();
+ const OAUTH_HEALTH =
+   process.env.CODEX_ROUTER_OAUTH_HEALTH_URL ||
+   process.env.KIMI_OAUTH_HEALTH_URL ||
+@@ -242,6 +255,12 @@ function nativeTarget(pathname, search) {
+   return `${NATIVE_BASE}${withoutV1}${search}`;
+ }
+ 
++function routedTarget(route) {
++  return route?.requestProfile === "deepseek-responses"
++    ? API_FORWARD_BASE
++    : GATEWAY_BASE;
++}
++
+ function catalogModels() {
+   try {
+     const parsed = JSON.parse(readFileSync(CATALOG_PATH, "utf8"));
+@@ -310,13 +329,32 @@ function messageItem(text) {
+   };
+ }
+ 
++// DeepSeek-origin subagent messages can be stored with readable payload text
++// inside an `encrypted_content` content part (plus a header-only `input_text`
++// twin). Codex's compact task chokes on that shape. OpenAI-issued encrypted
++// content is opaque Fernet and must be left untouched; only rewrite readable
++// blobs back to plaintext.
++function sanitizeEncryptedContentParts(item) {
++  if (!item || typeof item !== "object" || !Array.isArray(item.content)) return item;
++  let changed = false;
++  const content = item.content.map((part) => {
++    if (part?.type !== "encrypted_content" || isOpaqueEncryptedContent(part.encrypted_content)) {
++      return part;
++    }
++    changed = true;
++    return { type: "input_text", text: String(part.encrypted_content) };
++  });
++  return changed ? { ...item, content } : item;
++}
++
+ function normalizeRoutedInput(input) {
+   if (!Array.isArray(input)) return input;
+   return input
+     .filter((item) => item?.type !== "compaction_trigger")
+     .map((item) => {
+-      if (item?.type !== "compaction") return item;
+-      const summary = decodeSummary(item.encrypted_content);
++      const cleaned = sanitizeEncryptedContentParts(item);
++      if (cleaned?.type !== "compaction") return cleaned;
++      const summary = decodeSummary(cleaned.encrypted_content);
+       return messageItem(
+         summary
+           ? `${SUMMARY_PREFIX}\n\n${summary}`
+@@ -325,6 +363,45 @@ function normalizeRoutedInput(input) {
+     });
+ }
+ 
++function statelessDeepSeekInput(payload, route) {
++  if (route?.requestProfile !== "deepseek-responses" || !Array.isArray(payload.input)) {
++    return undefined;
++  }
++  const previousId =
++    typeof payload.previous_response_id === "string"
++      ? payload.previous_response_id
++      : undefined;
++  const currentInput = normalizeRoutedInput(payload.input);
++  if (previousId) {
++    const prior = responsesHistory.get(previousId);
++    if (!prior) {
++      const error = new Error(
++        `Stateless Responses history for ${previousId} is unavailable. Continue the session from a recent checkpoint.`,
++      );
++      error.status = 400;
++      throw error;
++    }
++    return {
++      input: [...prior.input, ...(prior.output || []), ...currentInput],
++      instructions: payload.instructions ?? prior.instructions,
++    };
++  }
++  return { input: currentInput, instructions: payload.instructions };
++}
++
++function rememberDeepSeekResponsesInput(responseId, history, output) {
++  responsesHistory.set(responseId, {
++    input: history.input,
++    output,
++    instructions: history.instructions,
++  });
++  while (responsesHistory.size > RESPONSES_HISTORY_LIMIT) {
++    const oldest = responsesHistory.keys().next().value;
++    if (oldest === undefined) break;
++    responsesHistory.delete(oldest);
++  }
++}
++
+ // OpenAI-issued reasoning `encrypted_content` is an opaque token (Fernet-style,
+ // e.g. "gAAAAAB...") with no whitespace. Some local Responses providers (notably
+ // Ollama) mimic the reasoning-item shape but fill `encrypted_content` with the
+@@ -347,15 +424,47 @@ function sanitizeReasoningForNative(item) {
+ function normalizeNativeInput(input) {
+   if (!Array.isArray(input)) return input;
+   return input.map((item) => {
+-    if (item?.type === "reasoning") return sanitizeReasoningForNative(item);
+-    if (item?.type !== "compaction") return item;
+-    const summary = decodeSummary(item.encrypted_content);
++    const cleaned = sanitizeEncryptedContentParts(item);
++    if (cleaned?.type === "reasoning") return sanitizeReasoningForNative(cleaned);
++    if (cleaned?.type !== "compaction") return cleaned;
++    const summary = decodeSummary(cleaned.encrypted_content);
+     return summary === undefined
+-      ? item
++      ? cleaned
+       : messageItem(`${SUMMARY_PREFIX}\n\n${summary}`);
+   });
+ }
+ 
++function normalizeChatgptLoginInput(input) {
++  if (typeof input === "string") {
++    return [{ type: "message", role: "user", content: [{ type: "input_text", text: input }] }];
++  }
++  return normalizeNativeInput(input);
++}
++
++function completedChatgptLoginResponse(body) {
++  let completed;
++  const outputItems = [];
++  for (const line of body.toString("utf8").split(/\r?\n/)) {
++    if (!line.startsWith("data:")) continue;
++    const data = line.slice(5).trim();
++    if (!data || data === "[DONE]") continue;
++    try {
++      const event = JSON.parse(data);
++      if (event?.type === "response.completed" && event.response) {
++        completed = event.response;
++      } else if (event?.type === "response.output_item.done" && event.item) {
++        outputItems.push(event.item);
++      }
++    } catch {
++      // Keep scanning; malformed keepalive lines are not fatal.
++    }
++  }
++  if (completed && Array.isArray(completed.output) && completed.output.length === 0 && outputItems.length) {
++    completed.output = outputItems;
++  }
++  return completed;
++}
++
+ function extractUserMessages(input) {
+   if (!Array.isArray(input)) return [];
+   const messages = [];
+@@ -421,19 +530,21 @@ function extractResponseText(payload) {
+ 
+ async function summarize(payload, route, signal) {
+   const originalInput = Array.isArray(payload.input) ? payload.input : [];
++  const stateless = statelessDeepSeekInput(payload, route);
++  const expandedInput = stateless
++    ? [...stateless.input, messageItem(COMPACT_PROMPT)]
++    : [...normalizeRoutedInput(originalInput), messageItem(COMPACT_PROMPT)];
+   const body = {
+     ...payload,
+     model: route.gatewayModel,
+     stream: false,
+     tools: [],
+     tool_choice: "none",
+-    input: [
+-      ...normalizeRoutedInput(originalInput),
+-      messageItem(COMPACT_PROMPT),
+-    ],
++    input: expandedInput,
+   };
++  if (stateless?.instructions !== undefined) body.instructions = stateless.instructions;
+   delete body.previous_response_id;
+-  const upstream = await fetch(`${GATEWAY_BASE}/responses`, {
++  const upstream = await fetch(`${routedTarget(route)}/responses`, {
+     method: "POST",
+     headers: routedHeaders(),
+     body: JSON.stringify(body),
+@@ -594,7 +705,7 @@ async function handleResponses(request, response, requestUrl) {
+       }
+     });
+ 
+-    if (route && (compactV1 || compactV2)) {
++    if (route && route.requestProfile !== "chatgpt-login" && (compactV1 || compactV2)) {
+       await handleRoutedCompaction(response, payload, route, controller.signal, compactV2);
+       return;
+     }
+@@ -602,13 +713,41 @@ async function handleResponses(request, response, requestUrl) {
+     let target;
+     let headers;
+     let routedBody;
+-    if (route) {
++    let stateless;
++    if (route?.requestProfile === "chatgpt-login") {
++      let session;
++      try {
++        session = await ensureFreshChatgptLoginToken();
++      } catch (error) {
++        writeJson(response, error.status || 401, {
++          error: {
++            type: error.code || "oauth_unauthorized",
++            message: error instanceof Error ? error.message : String(error),
++          },
++        });
++        activity.finish(response.statusCode);
++        return;
++      }
++      const routed = { ...payload, model: route.upstreamModel };
++      routed.input = normalizeChatgptLoginInput(payload.input);
++      routed.store = false;
++      routed.stream = true;
++      if (!compactV1) delete routed.previous_response_id;
++      target = nativeTarget(requestUrl.pathname, requestUrl.search);
++      headers = chatgptLoginRequestHeaders(session, request.headers);
++      routedBody = Buffer.from(JSON.stringify(routed), "utf8");
++    } else if (route) {
++      stateless = statelessDeepSeekInput(payload, route);
+       const routed = {
+         ...payload,
+         model: route.gatewayModel,
+-        input: normalizeRoutedInput(payload.input),
++        input: stateless ? stateless.input : normalizeRoutedInput(payload.input),
+       };
+-      target = `${GATEWAY_BASE}/responses`;
++      if (stateless) {
++        delete routed.previous_response_id;
++        if (stateless.instructions !== undefined) routed.instructions = stateless.instructions;
++      }
++      target = `${routedTarget(route)}/responses`;
+       headers = routedHeaders();
+       routedBody = Buffer.from(JSON.stringify(routed), "utf8");
+     } else {
+@@ -628,11 +767,44 @@ async function handleResponses(request, response, requestUrl) {
+       body: routedBody,
+       signal: controller.signal,
+     });
++    if (route?.requestProfile === "chatgpt-login" && payload.stream !== true) {
++      const bytes = Buffer.from(await upstream.arrayBuffer());
++      const completed = completedChatgptLoginResponse(bytes);
++      if (!upstream.ok || !completed) {
++        writeJson(response, upstream.status || 502, {
++          error: {
++            type: "upstream_error",
++            message: completed?.error?.message || "Personal ChatGPT backend returned no completed response.",
++          },
++        });
++      } else {
++        writeJson(response, 200, completed);
++      }
++      const usage = tokenUsageFromPayload(completed);
++      recordUsageEvent({
++        model: route?.slug || requestedModel,
++        provider: route?.provider || "openai",
++        status: upstream.status,
++        durationMs: Date.now() - startedAt,
++        ...usage,
++      });
++      if (!QUIET) {
++        console.error(
++          `[codex-router] model=${requestedModel || "unknown"} provider=${route?.provider || "openai"} status=${upstream.status}`,
++        );
++      }
++      activity.finish(response.statusCode);
++      return;
++    }
+     const usageTransform = route
+       ? new ResponseUsageTransform(upstream.headers.get("content-type") || "")
+       : undefined;
+     await pipeResponse(upstream, response, HOP_BY_HOP_HEADERS, usageTransform);
+     const usage = usageTransform?.tokenUsage();
++    const responseId = usageTransform?.responseId();
++    if (route && stateless && upstream.ok && responseId) {
++      rememberDeepSeekResponsesInput(responseId, stateless, usageTransform?.outputItems() || []);
++    }
+     recordUsageEvent({
+       model: route?.slug || requestedModel,
+       provider: route?.provider || "openai",
+diff --git a/test/chatgpt-login-session.test.mjs b/test/chatgpt-login-session.test.mjs
+new file mode 100644
+index 0000000..84a5bbe
+--- /dev/null
++++ b/test/chatgpt-login-session.test.mjs
+@@ -0,0 +1,63 @@
++import assert from "node:assert/strict";
++import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import test from "node:test";
++
++const home = mkdtempSync(path.join(os.tmpdir(), "chatgpt-login-"));
++process.env.CODEX_ROUTER_CHATGPT_LOGIN_HOME = home;
++
++const {
++  chatgptLoginRequestHeaders,
++  chatgptLoginStatus,
++  CHATGPT_LOGIN_AUTH_PATH,
++  ensureFreshChatgptLoginToken,
++} = await import("../src/chatgpt-login-session.mjs");
++
++function writeAuth(tokens, lastRefresh) {
++  writeFileSync(
++    CHATGPT_LOGIN_AUTH_PATH,
++    `${JSON.stringify({ auth_mode: "chatgpt", tokens, last_refresh: lastRefresh }, null, 2)}\n`,
++  );
++}
++
++test("reports a configured Personal login and builds account headers", async () => {
++  writeAuth(
++    { access_token: "acc-token", refresh_token: "ref-token", account_id: "acc-1" },
++    new Date().toISOString(),
++  );
++  assert.equal(chatgptLoginStatus().configured, true);
++  assert.equal(chatgptLoginStatus().accountId, "acc-1");
++  const session = await ensureFreshChatgptLoginToken();
++  const headers = chatgptLoginRequestHeaders(session, { "openai-beta": "responses=v1" });
++  assert.equal(headers.Authorization, "Bearer acc-token");
++  assert.equal(headers["ChatGPT-Account-Id"], "acc-1");
++  assert.equal(headers["openai-beta"], "responses=v1");
++});
++
++test("refreshes expired Personal tokens and persists them", async () => {
++  writeAuth(
++    { access_token: "old-token", refresh_token: "rotating-token", account_id: "acc-1" },
++    new Date(Date.now() - 20 * 60 * 1_000).toISOString(),
++  );
++  const originalFetch = globalThis.fetch;
++  globalThis.fetch = async () => ({
++    ok: true,
++    status: 200,
++    json: async () => ({
++      access_token: "new-token",
++      refresh_token: "new-refresh",
++      id_token: "new-id",
++    }),
++  });
++  try {
++    await ensureFreshChatgptLoginToken({ force: true });
++  } finally {
++    globalThis.fetch = originalFetch;
++  }
++  const auth = JSON.parse(readFileSync(CHATGPT_LOGIN_AUTH_PATH, "utf8"));
++  assert.equal(auth.tokens.access_token, "new-token");
++  assert.equal(auth.tokens.refresh_token, "new-refresh");
++  assert.equal(auth.tokens.account_id, "acc-1");
++  assert.equal((await ensureFreshChatgptLoginToken()).accessToken, "new-token");
++});
+diff --git a/test/registry.test.mjs b/test/registry.test.mjs
+index f3b0b9d..dd2ae97 100644
+--- a/test/registry.test.mjs
++++ b/test/registry.test.mjs
+@@ -32,6 +32,9 @@ test("provider registry exposes configured API and OAuth model families", () =>
+       "ollama-cloud/minimax-m3",
+       "ollama-cloud/deepseek-v4-pro",
+       "minimax-token-plan/minimax-m3",
++      "chatgpt-login/gpt-5.6-luna",
++      "chatgpt-login/gpt-5.6-terra",
++      "chatgpt-login/gpt-5.6-sol",
+     ],
+   );
+   assert.equal(PROVIDERS.get("deepseek").baseUrl, "https://api.deepseek.com");
+@@ -48,6 +51,10 @@ test("provider registry exposes configured API and OAuth model families", () =>
+   assert.equal(PROVIDERS.get("grok-api").baseUrl, "https://api.x.ai/v1");
+   assert.equal(PROVIDERS.get("grok-oauth").proxyBaseEnv, "GROK_OAUTH_FORWARD_BASE_URL");
+   assert.equal(PROVIDERS.get("anthropic-api").protocol, "anthropic");
++  assert.equal(
++    PROVIDERS.get("chatgpt-login").proxyBaseEnv,
++    "CODEX_ROUTER_CHATGPT_LOGIN_FORWARD_BASE_URL",
++  );
+   for (const slug of [
+     "kimi-oauth/kimi-for-coding-highspeed",
+     "kimi-oauth/kimi-for-coding",
+@@ -79,6 +86,17 @@ test("provider registry exposes configured API and OAuth model families", () =>
+     assert.match(model.description, /DeepSeek V4/);
+     assert.deepEqual(model.inputModalities, ["text"]);
+   }
++  for (const slug of [
++    "chatgpt-login/gpt-5.6-luna",
++    "chatgpt-login/gpt-5.6-terra",
++    "chatgpt-login/gpt-5.6-sol",
++  ]) {
++    const model = MODEL_BY_SLUG.get(slug);
++    assert.equal(model.contextWindow, 272_000);
++    assert.match(model.displayName, /\(Personal\)/);
++    assert.equal(model.requestProfile, "chatgpt-login");
++    assert.deepEqual(model.inputModalities, ["text", "image"]);
++  }
+ });
+ 
+ test("deprecated DeepSeek aliases remain routable but stay out of the picker", () => {
+@@ -104,4 +122,8 @@ test("LiteLLM configuration is generated from every registry route", () => {
+   assert.match(rendered, /os\.environ\/CODEX_ROUTER_INTERNAL_KEY/);
+   assert.match(rendered, /model: "anthropic\/anthropic-api-claude-opus-4-8"/);
+   assert.doesNotMatch(rendered, /ANTHROPIC_API_KEY|DEEPSEEK_API_KEY|KIMI_API_KEY/);
++  assert.match(
++    rendered,
++    /model_name: "deepseek-v4-flash"[\s\S]*?use_chat_completions_api: false/,
++  );
+ });
+diff --git a/test/response-usage.test.mjs b/test/response-usage.test.mjs
+index 7e9b59b..e3bbd29 100644
+--- a/test/response-usage.test.mjs
++++ b/test/response-usage.test.mjs
+@@ -33,12 +33,18 @@ test("normalizes Responses and Chat Completions token usage", () => {
+ 
+ test("captures final SSE usage without changing streamed bytes", async () => {
+   const body = [
++    "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_created\"}}\n\n",
+     "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
++    "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"pwd\"}}\n\n",
+     "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":21,\"output_tokens\":8}}}\n\n",
+     "data: [DONE]\n\n",
+   ];
+   const transform = new ResponseUsageTransform("text/event-stream; charset=utf-8");
+   assert.equal(await passThrough(transform, body), body.join(""));
++  assert.equal(transform.responseId(), "resp_created");
++  assert.deepEqual(transform.outputItems(), [
++    { type: "function_call", call_id: "call_1", name: "pwd" },
++  ]);
+   assert.deepEqual(transform.tokenUsage(), {
+     inputTokens: 21,
+     outputTokens: 8,
+@@ -49,10 +55,15 @@ test("captures final SSE usage without changing streamed bytes", async () => {
+ test("captures JSON usage without changing the response", async () => {
+   const body = JSON.stringify({
+     id: "response-test",
++    output: [{ type: "function_call", call_id: "call_1", name: "pwd" }],
+     usage: { input_tokens: 31, output_tokens: 11, total_tokens: 42 },
+   });
+   const transform = new ResponseUsageTransform("application/json");
+   assert.equal(await passThrough(transform, [body]), body);
++  assert.equal(transform.responseId(), "response-test");
++  assert.deepEqual(transform.outputItems(), [
++    { type: "function_call", call_id: "call_1", name: "pwd" },
++  ]);
+   assert.deepEqual(transform.tokenUsage(), {
+     inputTokens: 31,
+     outputTokens: 11,
+diff --git a/test/routing.test.mjs b/test/routing.test.mjs
+index 7ce0ddb..412af85 100644
+--- a/test/routing.test.mjs
++++ b/test/routing.test.mjs
+@@ -182,6 +182,7 @@ test("router requires the configured path capability before any model route", as
+   const router = run("router.mjs", {
+     CODEX_ROUTER_PORT: String(routerPort),
+     CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
++    CODEX_ROUTER_API_FORWARD_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+     CODEX_ROUTER_OAUTH_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
+     CODEX_ROUTER_API_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
+     CODEX_ROUTER_GATEWAY_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
+@@ -488,6 +489,7 @@ test("router preserves native auth and isolates every external route", async ()
+     CODEX_ROUTER_PORT: String(routerPort),
+     CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${native.port}/backend-api/codex`,
+     CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
++    CODEX_ROUTER_API_FORWARD_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+     CODEX_ROUTER_QUIET: "1",
+   });
+ 
+@@ -549,6 +551,95 @@ test("router preserves native auth and isolates every external route", async ()
+   }
+ });
+ 
++test("router replays full stateless history for DeepSeek Responses", async () => {
++  const gatewayRequests = [];
++  const gateway = await mockServer(async (request, response) => {
++    if (request.method === "GET" && request.url === "/health") {
++      json(response, 200, { ok: true });
++      return;
++    }
++    const body = await bodyJson(request);
++    gatewayRequests.push({ url: request.url, headers: request.headers, body });
++    const responseNumber = gatewayRequests.length;
++    json(response, 200, {
++      id: `resp_${responseNumber}`,
++      object: "response",
++      output:
++        responseNumber === 1
++          ? [
++              {
++                type: "function_call",
++                call_id: "call_1",
++                name: "pwd",
++                arguments: "{}",
++              },
++            ]
++          : [],
++      usage: { input_tokens: 1, output_tokens: 1 },
++    });
++  });
++  const routerPort = await openPort();
++  const router = run("router.mjs", {
++    CODEX_ROUTER_PORT: String(routerPort),
++    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
++    CODEX_ROUTER_API_FORWARD_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
++    CODEX_ROUTER_OAUTH_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
++    CODEX_ROUTER_API_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
++    CODEX_ROUTER_GATEWAY_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
++    CODEX_ROUTER_QUIET: "1",
++  });
++
++  try {
++    await waitFor(`${routerBase(routerPort)}/models`, router);
++    const headers = {
++      Authorization: "Bearer codex-caller-auth",
++      "Content-Type": "application/json",
++    };
++    const first = await fetch(`${routerBase(routerPort)}/responses`, {
++      method: "POST",
++      headers,
++      body: JSON.stringify({
++        model: "deepseek/deepseek-v4-flash",
++        instructions: "system prompt",
++        input: [
++          {
++            type: "message",
++            role: "user",
++            content: [{ type: "input_text", text: "hello" }],
++          },
++        ],
++      }),
++    });
++    assert.equal(first.status, 200);
++
++    const second = await fetch(`${routerBase(routerPort)}/responses`, {
++      method: "POST",
++      headers,
++      body: JSON.stringify({
++        model: "deepseek/deepseek-v4-flash",
++        previous_response_id: "resp_1",
++        input: [
++          { type: "function_call_output", call_id: "call_1", output: "pwd" },
++        ],
++      }),
++    });
++    assert.equal(second.status, 200);
++    assert.equal(gatewayRequests.length, 2);
++    assert.equal(gatewayRequests[0].body.previous_response_id, undefined);
++    assert.equal(gatewayRequests[0].body.input.length, 1);
++    assert.equal(gatewayRequests[1].body.previous_response_id, undefined);
++    assert.deepEqual(
++      gatewayRequests[1].body.input.map((item) => item.type),
++      ["message", "function_call", "function_call_output"],
++    );
++    assert.equal(gatewayRequests[1].body.input[1].call_id, "call_1");
++    assert.equal(gatewayRequests[1].body.instructions, "system prompt");
++  } finally {
++    await stopChild(router);
++    await closeServer(gateway.server);
++  }
++});
++
+ test("router sends standalone image requests only to the native OpenAI backend", async () => {
+   const nativeRequests = [];
+   const native = await mockServer(async (request, response) => {
+@@ -881,7 +972,7 @@ test("API forwarder health omits disabled API providers", async () => {
+   }
+ });
+ 
+-test("API forwarder supports all DeepSeek V4 models and normalizes thinking", async () => {
++test("API forwarder routes DeepSeek Pro through Chat Completions", async () => {
+   const upstreamRequests = [];
+   const upstream = await mockServer(async (request, response) => {
+     upstreamRequests.push({ headers: request.headers, body: await bodyJson(request) });
+@@ -899,38 +990,174 @@ test("API forwarder supports all DeepSeek V4 models and normalizes thinking", as
+     await waitFor(`http://127.0.0.1:${forwarderPort}/health`, forwarder, {
+       Authorization: `Bearer ${INTERNAL_KEY}`,
+     });
+-    for (const [gatewayModel, upstreamModel, effort] of [
+-      ["deepseek-v4-flash", "deepseek-v4-flash", "high"],
+-      ["deepseek-v4-pro", "deepseek-v4-pro", "max"],
+-    ]) {
+-      const response = await fetch(
+-        `http://127.0.0.1:${forwarderPort}/v1/chat/completions`,
+-        {
+-          method: "POST",
+-          headers: {
+-            Authorization: `Bearer ${INTERNAL_KEY}`,
+-            "ChatGPT-Account-Id": "must-not-forward",
+-            "X-Codex-Installation-Id": "must-not-forward",
+-            "Content-Type": "application/json",
+-          },
+-          body: JSON.stringify({
+-            model: gatewayModel,
+-            reasoning_effort: effort === "max" ? "xhigh" : "low",
+-            temperature: 0.7,
+-            messages: [{ role: "user", content: "test" }],
+-          }),
++    const response = await fetch(
++      `http://127.0.0.1:${forwarderPort}/v1/chat/completions`,
++      {
++        method: "POST",
++        headers: {
++          Authorization: `Bearer ${INTERNAL_KEY}`,
++          "ChatGPT-Account-Id": "must-not-forward",
++          "X-Codex-Installation-Id": "must-not-forward",
++          "Content-Type": "application/json",
+         },
+-      );
+-      assert.equal(response.status, 200);
+-      const request = upstreamRequests.at(-1);
+-      assert.equal(request.headers.authorization, "Bearer TEST_DEEPSEEK_API_KEY");
+-      assert.equal(request.headers["chatgpt-account-id"], undefined);
+-      assert.equal(request.headers["x-codex-installation-id"], undefined);
+-      assert.equal(request.body.model, upstreamModel);
+-      assert.deepEqual(request.body.thinking, { type: "enabled" });
+-      assert.equal(request.body.reasoning_effort, effort);
+-      assert.equal(request.body.temperature, undefined);
+-    }
++        body: JSON.stringify({
++          model: "deepseek-v4-pro",
++          reasoning_effort: "xhigh",
++          temperature: 0.7,
++          messages: [{ role: "user", content: "test" }],
++        }),
++      },
++    );
++    assert.equal(response.status, 200);
++    const request = upstreamRequests.at(-1);
++    assert.equal(request.headers.authorization, "Bearer TEST_DEEPSEEK_API_KEY");
++    assert.equal(request.headers["chatgpt-account-id"], undefined);
++    assert.equal(request.headers["x-codex-installation-id"], undefined);
++    assert.equal(request.body.model, "deepseek-v4-pro");
++    assert.deepEqual(request.body.thinking, { type: "enabled" });
++    assert.equal(request.body.reasoning_effort, "max");
++    assert.equal(request.body.temperature, undefined);
++  } finally {
++    await stopChild(forwarder);
++    await closeServer(upstream.server);
++  }
++});
++
++test("API forwarder routes DeepSeek Flash through native Responses", async () => {
++  const upstreamRequests = [];
++  const upstream = await mockServer(async (request, response) => {
++    upstreamRequests.push({ headers: request.headers, body: await bodyJson(request) });
++    json(response, 200, { id: "resp_test", output: [] });
++  });
++  const forwarderPort = await openPort();
++  const forwarder = run("api-forwarder.mjs", {
++    CODEX_ROUTER_API_PORT: String(forwarderPort),
++    DEEPSEEK_API_BASE_URL: `http://127.0.0.1:${upstream.port}`,
++    DEEPSEEK_API_KEY: "TEST_DEEPSEEK_API_KEY",
++    CODEX_ROUTER_QUIET: "1",
++  });
++
++  try {
++    await waitFor(`http://127.0.0.1:${forwarderPort}/health`, forwarder, {
++      Authorization: `Bearer ${INTERNAL_KEY}`,
++    });
++    const response = await fetch(
++      `http://127.0.0.1:${forwarderPort}/v1/responses`,
++      {
++        method: "POST",
++        headers: {
++          Authorization: `Bearer ${INTERNAL_KEY}`,
++          "Content-Type": "application/json",
++        },
++        body: JSON.stringify({
++          model: "deepseek-v4-flash",
++          previous_response_id: "unsupported",
++          reasoning_effort: "xhigh",
++          input: [
++            { type: "message", role: "user", content: [{ type: "input_text", text: "test" }] },
++            { type: "reasoning", encrypted_content: "unsupported" },
++            { type: "function_call", call_id: "call_1", name: "pwd", arguments: "{}" },
++            {
++              type: "message",
++              role: "developer",
++              content: [{ type: "input_text", text: "" }],
++            },
++            { type: "function_call_output", call_id: "call_1", output: "done" },
++          ],
++        }),
++      },
++    );
++    assert.equal(response.status, 200);
++    const request = upstreamRequests[0];
++    assert.equal(request.headers.authorization, "Bearer TEST_DEEPSEEK_API_KEY");
++    assert.equal(request.body.model, "deepseek-v4-flash");
++    assert.equal(request.body.previous_response_id, undefined);
++    assert.deepEqual(request.body.reasoning, { effort: "max" });
++    assert.equal(request.body.input.length, 3);
++    assert.equal(request.body.input[1].type, "function_call");
++  } finally {
++    await stopChild(forwarder);
++    await closeServer(upstream.server);
++  }
++});
++
++test("API forwarder keeps DeepSeek tool-call turns contiguous", async () => {
++  const upstreamRequests = [];
++  const upstream = await mockServer(async (request, response) => {
++    upstreamRequests.push({ headers: request.headers, body: await bodyJson(request) });
++    json(response, 200, { id: "resp_test", output: [] });
++  });
++  const forwarderPort = await openPort();
++  const forwarder = run("api-forwarder.mjs", {
++    CODEX_ROUTER_API_PORT: String(forwarderPort),
++    DEEPSEEK_API_BASE_URL: `http://127.0.0.1:${upstream.port}`,
++    DEEPSEEK_API_KEY: "TEST_DEEPSEEK_API_KEY",
++    CODEX_ROUTER_QUIET: "1",
++  });
++
++  try {
++    await waitFor(`http://127.0.0.1:${forwarderPort}/health`, forwarder, {
++      Authorization: `Bearer ${INTERNAL_KEY}`,
++    });
++    const response = await fetch(
++      `http://127.0.0.1:${forwarderPort}/v1/responses`,
++      {
++        method: "POST",
++        headers: {
++          Authorization: `Bearer ${INTERNAL_KEY}`,
++          "Content-Type": "application/json",
++        },
++        body: JSON.stringify({
++          model: "deepseek-v4-flash",
++          input: [
++            {
++              type: "message",
++              role: "assistant",
++              content: [{ type: "output_text", text: "running" }],
++            },
++            { type: "function_call", call_id: "call_1", name: "pwd", arguments: "{}" },
++            {
++              type: "message",
++              role: "developer",
++              content: [{ type: "input_text", text: "<context_guidance>" }],
++            },
++            { type: "function_call", call_id: "call_2", name: "echo", arguments: "{}" },
++            { type: "function_call_output", call_id: "call_1", output: "ok" },
++            {
++              type: "message",
++              role: "developer",
++              content: [{ type: "input_text", text: "" }],
++            },
++            { type: "function_call_output", call_id: "call_2", output: "ok" },
++            {
++              type: "message",
++              role: "user",
++              content: [{ type: "input_text", text: "next" }],
++            },
++          ],
++        }),
++      },
++    );
++    assert.equal(response.status, 200);
++    const input = upstreamRequests[0].body.input;
++    assert.deepEqual(
++      input.map((item) => item.type),
++      [
++        "message",
++        "message",
++        "function_call",
++        "function_call",
++        "function_call_output",
++        "function_call_output",
++        "message",
++      ],
++    );
++    assert.equal(input[0].role, "developer");
++    assert.deepEqual(
++      input.slice(2, 6).map((item) => item.call_id),
++      ["call_1", "call_2", "call_1", "call_2"],
++    );
++    assert.equal(input.at(-1).role, "user");
+   } finally {
+     await stopChild(forwarder);
+     await closeServer(upstream.server);
