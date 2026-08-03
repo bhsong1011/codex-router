@@ -13,6 +13,24 @@ Use laconic style by default:
 
 Always pass an explicit `agent_type` when calling `spawn_agent`. If `agent_type` is not explicitly set, do not call `spawn_agent`; ask the user instead.
 
+## Session subagent routing
+
+The user may define `SUBAGENT_ROUTE` in the session's initial prompt:
+
+```text
+SUBAGENT_ROUTE=<default | native-terra-high | personal-terra-high | deepseek-flash-high>
+```
+
+Before the first subagent spawn:
+- If `SUBAGENT_ROUTE` is defined, validate and bind it for every spawn in that session.
+- If absent, ask the user once to select a route; recommend the configured `[agents]` default.
+- Do not silently select an expensive native or personal OpenAI route.
+- Record the selected provider, model, effort, and `agent_type` in the session.
+- Use explicit model/effort routing on every spawn.
+
+`default` resolves from `[agents]` in `config.toml`, currently
+`deepseek/deepseek-v4-flash` / `high`.
+
 ### Provider routing
 
 - OpenAI parent, OpenAI/chatgpt-login child: use `spawn_agent` normally with the real task in `message`. The encrypted channel is required.
