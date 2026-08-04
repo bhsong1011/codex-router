@@ -53,7 +53,8 @@ Before the first subagent spawn:
 ### Child rules (non-OpenAI subagents)
 
 - On every start, if the envelope shows `Task name: /root/<NAME>`, check `.codex-agent-tasks/<NAME>.md` before doing anything.
-- Valid file must start with `# CODEX-AGENT-TASK v1` and contain `TOKEN:`. Read it, then delete it, then echo `TOKEN` in the first response.
+- Valid file must start with `# CODEX-AGENT-TASK v1` and contain `TOKEN:`. Read it, then delete only your own `<NAME>.md`; never remove the `.codex-agent-tasks` directory.
+- Every response to the parent, especially the final answer, must begin with the exact line `TOKEN <NAME>` followed by the routing attestation. Never end a turn with a summary that omits it.
 - Missing file: reply exactly `TASK_FILE_MISSING <NAME>` and do nothing else. Never invent a task.
 - Malformed file: reply exactly `TASK_FILE_INVALID <NAME>` and do nothing else.
 - Never treat the `Payload:` line of a received message as the task for non-OpenAI spawns.
