@@ -80,17 +80,60 @@ function normalizeDeepSeekResponsesInput(input) {
   // function_call_output items to form one contiguous tool-call turn. Codex
   // can inject developer context messages between those items; hoist those
   // messages out of the turn so the upstream validator accepts the output IDs.
+  // Codex can also deliver a pending tool result after the user message that
+  // interrupted it (crash/resume replay); hoist that later result as well so
+  // the turn stays contiguous.
+  const toolItemTypes = new Set([
+    "function_call",
+    "function_call_output",
+    "web_search_call",
+    "web_search_call_output",
+  ]);
+  const outputsByCallId = new Map();
+  for (const item of items) {
+    if (item?.type === "function_call_output" && item.call_id) {
+      outputsByCallId.set(item.call_id, item);
+    }
+  }
   const output = [];
   const deferredDeveloper = [];
+  const hoistedCallIds = new Set();
+  const droppedCallIds = new Set();
   let toolBlock = [];
   const flushToolBlock = () => {
-    if (toolBlock.length) {
-      output.push(...toolBlock);
-      toolBlock = [];
+    if (!toolBlock.length) return;
+    const openCalls = toolBlock.filter(
+      (item) =>
+        item.type === "function_call" &&
+        !toolBlock.some(
+          (other) =>
+            other.type === "function_call_output" && other.call_id === item.call_id,
+        ),
+    );
+    for (const call of openCalls) {
+      const result = outputsByCallId.get(call.call_id);
+      if (result) {
+        toolBlock.push(result);
+        hoistedCallIds.add(call.call_id);
+      } else {
+        droppedCallIds.add(call.call_id);
+      }
     }
+    output.push(
+      ...toolBlock.filter(
+        (item) => item.type !== "function_call" || !droppedCallIds.has(item.call_id),
+      ),
+    );
+    toolBlock = [];
   };
   for (const item of items) {
-    if (["function_call", "function_call_output", "web_search_call"].includes(item?.type)) {
+    if (
+      item?.type === "function_call_output" &&
+      (hoistedCallIds.has(item.call_id) || droppedCallIds.has(item.call_id))
+    ) {
+      continue;
+    }
+    if (toolItemTypes.has(item?.type)) {
       toolBlock.push(item);
       continue;
     }

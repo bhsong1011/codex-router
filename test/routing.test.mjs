@@ -1164,6 +1164,93 @@ test("API forwarder keeps DeepSeek tool-call turns contiguous", async () => {
   }
 });
 
+test("API forwarder pairs a tool call with a result delivered after an interrupting user message", async () => {
+  const upstreamRequests = [];
+  const upstream = await mockServer(async (request, response) => {
+    upstreamRequests.push({ headers: request.headers, body: await bodyJson(request) });
+    json(response, 200, { id: "resp_test", output: [] });
+  });
+  const forwarderPort = await openPort();
+  const forwarder = run("api-forwarder.mjs", {
+    CODEX_ROUTER_API_PORT: String(forwarderPort),
+    DEEPSEEK_API_BASE_URL: `http://127.0.0.1:${upstream.port}`,
+    DEEPSEEK_API_KEY: "TEST_DEEPSEEK_API_KEY",
+    CODEX_ROUTER_QUIET: "1",
+  });
+
+  try {
+    await waitFor(`http://127.0.0.1:${forwarderPort}/health`, forwarder, {
+      Authorization: `Bearer ${INTERNAL_KEY}`,
+    });
+    const response = await fetch(
+      `http://127.0.0.1:${forwarderPort}/v1/responses`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${INTERNAL_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "deepseek-v4-flash",
+          input: [
+            {
+              type: "message",
+              role: "user",
+              content: [{ type: "input_text", text: "run review" }],
+            },
+            {
+              type: "function_call",
+              call_id: "call_1",
+              name: "wait_agent",
+              arguments: "{}",
+            },
+            {
+              type: "message",
+              role: "user",
+              content: [{ type: "input_text", text: "system crashed, are you there?" }],
+            },
+            {
+              type: "message",
+              role: "assistant",
+              content: [{ type: "output_text", text: "checking" }],
+            },
+            {
+              type: "function_call_output",
+              call_id: "call_1",
+              output: '{"message":"Wait completed.","timed_out":false}',
+            },
+            {
+              type: "message",
+              role: "user",
+              content: [{ type: "input_text", text: "next" }],
+            },
+          ],
+        }),
+      },
+    );
+    assert.equal(response.status, 200);
+    const input = upstreamRequests[0].body.input;
+    assert.deepEqual(
+      input.map((item) => item.type),
+      [
+        "message",
+        "function_call",
+        "function_call_output",
+        "message",
+        "message",
+        "message",
+      ],
+    );
+    assert.equal(input[1].call_id, "call_1");
+    assert.equal(input[2].call_id, "call_1");
+    assert.equal(input[3].role, "user");
+    assert.equal(input[3].content[0].text, "system crashed, are you there?");
+  } finally {
+    await stopChild(forwarder);
+    await closeServer(upstream.server);
+  }
+});
+
 test("API forwarder coalesces consecutive assistant messages so tool results follow tool calls", async () => {
   const upstreamRequests = [];
   const upstream = await mockServer(async (request, response) => {
