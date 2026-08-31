@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "models": [
+    {
+      "slug": "chatgpt-login/gpt-5.6-luna",
+      "gatewayModel": "chatgpt-login-gpt-5-6-luna",
+      "upstreamModel": "gpt-5.6-luna",
+      "provider": "chatgpt-login",
+      "listed": true,
+      "displayName": "GPT-5.6 Luna (Personal)",
+      "description": "GPT-5.6 Luna using the Personal ChatGPT login.",
+      "priority": 31,
+      "defaultEffort": "medium",
+      "reasoningLevels": [
+        { "effort": "low", "description": "Fast responses with lighter reasoning" },
+        { "effort": "medium", "description": "Balances speed and reasoning depth for everyday tasks" },
+        { "effort": "high", "description": "Greater reasoning depth for complex problems" },
+        { "effort": "xhigh", "description": "Extra high reasoning depth for complex problems" },
+        { "effort": "max", "description": "Maximum reasoning depth for the hardest problems" }
+      ],
+      "contextWindow": 272000,
+      "autoCompact": 258400,
+      "inputModalities": ["text", "image"],
+      "requestProfile": "chatgpt-login",
+      "compHash": "chatgpt-login-gpt-5-6-luna-v1"
+    }
+  ]
+}

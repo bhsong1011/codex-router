@@ -27,6 +27,7 @@ test("automatic selection-only setup exposes only configured providers", () => {
         env: {
           ...process.env,
           CODEX_HOME: codexHome,
+          CODEX_ROUTER_CHATGPT_LOGIN_HOME: path.join(testRoot, "codex-personal"),
           CODEX_ROUTER_STATE_DIR: stateDir,
           KIMI_CODE_HOME: path.join(testRoot, "kimi-code"),
           GROK_AUTH_PATH: path.join(testRoot, "grok", "auth.json"),
@@ -73,6 +74,7 @@ test("--no-provider --no-discovery writes an empty selection and the discovery m
         env: {
           ...process.env,
           CODEX_HOME: codexHome,
+          CODEX_ROUTER_CHATGPT_LOGIN_HOME: path.join(testRoot, "codex-personal"),
           CODEX_ROUTER_STATE_DIR: stateDir,
           KIMI_CODE_HOME: path.join(testRoot, "kimi-code"),
           GROK_AUTH_PATH: path.join(testRoot, "grok", "auth.json"),
@@ -120,6 +122,7 @@ test("re-running setup without the idle flags clears the discovery marker", () =
         env: {
           ...process.env,
           CODEX_HOME: codexHome,
+          CODEX_ROUTER_CHATGPT_LOGIN_HOME: path.join(testRoot, "codex-personal"),
           CODEX_ROUTER_STATE_DIR: stateDir,
           KIMI_CODE_HOME: path.join(testRoot, "kimi-code"),
           GROK_AUTH_PATH: path.join(testRoot, "grok", "auth.json"),
@@ -155,6 +158,7 @@ test("ensure-configured does not auto-select anonymous providers", () => {
         env: {
           ...process.env,
           CODEX_HOME: path.join(testRoot, "codex"),
+          CODEX_ROUTER_CHATGPT_LOGIN_HOME: path.join(testRoot, "codex-personal"),
           CODEX_ROUTER_STATE_DIR: stateDir,
           KIMI_CODE_HOME: path.join(testRoot, "kimi-code"),
           GROK_AUTH_PATH: path.join(testRoot, "grok", "auth.json"),
@@ -198,6 +202,7 @@ test("ensure-configured accepts an explicitly empty selection as idle", () => {
         env: {
           ...process.env,
           CODEX_HOME: path.join(testRoot, "codex"),
+          CODEX_ROUTER_CHATGPT_LOGIN_HOME: path.join(testRoot, "codex-personal"),
           CODEX_ROUTER_STATE_DIR: stateDir,
           KIMI_CODE_HOME: path.join(testRoot, "kimi-code"),
           GROK_AUTH_PATH: path.join(testRoot, "grok", "auth.json"),
@@ -227,6 +232,7 @@ test("configured setup mode also excludes anonymous providers by default", () =>
         env: {
           ...process.env,
           CODEX_HOME: path.join(testRoot, "codex"),
+          CODEX_ROUTER_CHATGPT_LOGIN_HOME: path.join(testRoot, "codex-personal"),
           CODEX_ROUTER_STATE_DIR: stateDir,
           KIMI_CODE_HOME: path.join(testRoot, "kimi-code"),
           GROK_AUTH_PATH: path.join(testRoot, "grok", "auth.json"),

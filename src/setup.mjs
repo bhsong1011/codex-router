@@ -6,6 +6,7 @@ import path from "node:path";
 import { detectLegacyInstallations, applyKnownMigrations, rollbackLatestMigration } from "./legacy-migration.mjs";
 import { grokOAuthStatus } from "./grok-oauth-status.mjs";
 import { antigravityOAuthStatus } from "./antigravity-oauth-status.mjs";
+import { chatgptLoginStatus } from "./chatgpt-login-session.mjs";
 import { LISTED_MODELS, PROVIDERS, providerNeedsNoKey } from "./model-registry.mjs";
 import { ensureNodeDependencies, isNodeDependencyFailure } from "./node-dependency-install.mjs";
 import { effectiveVisibleModels, setModelSelection } from "./model-picker-state.mjs";
@@ -215,6 +216,7 @@ function providerConfigured(provider) {
     if (provider.id === "kimi-oauth") return kimiOAuthStatus().configured;
     if (provider.id === "grok-oauth") return grokOAuthStatus().configured;
     if (provider.id === "antigravity-oauth") return antigravityOAuthStatus().configured;
+    if (provider.id === "chatgpt-login") return chatgptLoginStatus().configured;
     return false;
   }
   return providerNeedsNoKey(provider)
@@ -320,6 +322,9 @@ function run(command, commandArgs, options = {}) {
 }
 
 function oauthSetupHint(provider) {
+  if (provider.id === "chatgpt-login") {
+    return "run `CODEX_HOME=~/.codex-personal codex login`";
+  }
   if (provider.id === "grok-oauth") return "run `grok login --oauth`";
   if (provider.id === "antigravity-oauth") {
     const command = process.platform === "win32"
@@ -346,6 +351,15 @@ async function configureProvider(provider) {
       }
       const { signInAntigravity } = await import("./antigravity-oauth-onboarding.mjs");
       await signInAntigravity();
+      if (!providerConfigured(provider)) {
+        throw incomplete(`${provider.displayName} sign-in did not produce a usable credential.`);
+      }
+      return;
+    }
+    if (provider.id === "chatgpt-login") {
+      if (!confirm("Run `CODEX_HOME=~/.codex-personal codex login` in a terminal, then continue?")) {
+        throw incomplete(`${provider.displayName} sign-in was cancelled.`);
+      }
       if (!providerConfigured(provider)) {
         throw incomplete(`${provider.displayName} sign-in did not produce a usable credential.`);
       }

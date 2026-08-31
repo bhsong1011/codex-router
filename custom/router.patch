@@ -1,0 +1,450 @@
+diff --git a/src/catalog.mjs b/src/catalog.mjs
+index 222cba8..eb75f58 100644
+--- a/src/catalog.mjs
++++ b/src/catalog.mjs
+@@ -768,6 +768,7 @@ function writeAnnouncedAt(announcedAt) {
+ function pickerProviderGroup(provider) {
+   const value = String(provider || "");
+   if (value === "antigravity-oauth") return { rank: 0, key: "antigravity" };
++  if (value === "chatgpt-login") return { rank: 0, key: "personal" };
+   if (value === "deepseek") return { rank: 1, key: "deepseek" };
+   // The opencode family shares one stored key: `opencode-go` and its variants
+   // (`opencode-go-messages`, `opencode-go-responses`, `opencode-zen`). Group
+diff --git a/src/provider-onboarding.mjs b/src/provider-onboarding.mjs
+index 5011e8a..7cda959 100644
+--- a/src/provider-onboarding.mjs
++++ b/src/provider-onboarding.mjs
+@@ -12,6 +12,7 @@ import { devinCliStatus } from "./devin-cli-status.mjs";
+ import { grokOAuthStatus } from "./grok-oauth-status.mjs";
+ import { antigravityOAuthStatus } from "./antigravity-oauth-status.mjs";
+ import { removeAntigravityToken } from "./antigravity-oauth-session.mjs";
++import { CHATGPT_LOGIN_HOME, chatgptLoginStatus } from "./chatgpt-login-session.mjs";
+ import { KIMI_CLI_NPM_PACKAGE } from "./kimi-oauth-onboarding.mjs";
+ import { MODELS, PROVIDERS, providerNeedsNoKey } from "./model-registry.mjs";
+ import {
+@@ -94,6 +95,7 @@ function oauthConfigured(providerId) {
+   if (providerId === "kimi-oauth") return kimiOAuthStatus().configured;
+   if (providerId === "grok-oauth") return grokOAuthStatus().configured;
+   if (providerId === "antigravity-oauth") return antigravityOAuthStatus().configured;
++  if (providerId === "chatgpt-login") return chatgptLoginStatus().configured;
+   if (providerId === "devin-cli") return devinCliStatus().configured;
+   return false;
+ }
+@@ -127,6 +129,21 @@ export function providerOnboardingSnapshot() {
+             ...(catalogSources.length ? { catalogSources } : {}),
+           };
+         }
++        if (provider.id === "chatgpt-login") {
++          const status = chatgptLoginStatus();
++          const configured = status.configured;
++          return {
++            id: provider.id,
++            displayName: provider.displayName,
++            kind: "oauth",
++            credentialLabel: "Personal ChatGPT login",
++            configured,
++            cliInstalled: true,
++            cliRunnable: true,
++            action: configured ? "ready" : "login",
++            ...(catalogSources.length ? { catalogSources } : {}),
++          };
++        }
+         const cliPath = oauthCliPath(provider.id);
+         const cli = provider.id === "grok-oauth"
+           ? grokCliPreflight({ executable: cliPath })
+@@ -248,6 +265,33 @@ export async function loginOauthProvider(providerId) {
+     }
+     return;
+   }
++  if (providerId === "chatgpt-login") {
++    const codexCli = commandPath("codex");
++    if (!codexCli) throw new Error("Install the Codex CLI before signing in.");
++    const login = spawnableCommand(codexCli, ["login"]);
++    const result = spawnSync(login.command, login.args, {
++      ...login.options,
++      encoding: "utf8",
++      env: { ...spawnEnvironment(), CODEX_HOME: CHATGPT_LOGIN_HOME },
++      timeout: LOGIN_TIMEOUT_MS,
++    });
++    if (result.signal === "SIGTERM") {
++      throw new Error(
++        "Codex login did not finish within 10 minutes. Run `CODEX_HOME=~/.codex-personal codex login` in a terminal.",
++      );
++    }
++    if (result.error || result.status !== 0) {
++      throw new Error(
++        `Personal ChatGPT sign-in was cancelled or did not complete. ${installFailureDetail(result)}`.trim(),
++      );
++    }
++    if (!oauthConfigured(providerId)) {
++      throw new Error(
++        "Sign-in finished without a usable Personal ChatGPT session. Please try again.",
++      );
++    }
++    return;
++  }
+   const executable = oauthCliPath(providerId);
+   if (!executable) throw new Error("Install the provider CLI before signing in.");
+   if (providerId === "grok-oauth") {
+diff --git a/src/provider-selection.mjs b/src/provider-selection.mjs
+index 609608a..47b6837 100644
+--- a/src/provider-selection.mjs
++++ b/src/provider-selection.mjs
+@@ -23,6 +23,7 @@ import { targetCli } from "./target-integration.mjs";
+ import { kimiOAuthStatus } from "./oauth-status.mjs";
+ import { grokOAuthStatus } from "./grok-oauth-status.mjs";
+ import { antigravityOAuthStatus } from "./antigravity-oauth-status.mjs";
++import { chatgptLoginStatus } from "./chatgpt-login-session.mjs";
+ import { devinCliStatus } from "./devin-cli-status.mjs";
+ import {
+   effectiveProviderCredentialStatus,
+@@ -108,6 +109,8 @@ export function configuredProviderIds() {
+         configured.push(provider.id);
+       } else if (provider.id === "antigravity-oauth" && antigravityOAuthStatus().configured) {
+         configured.push(provider.id);
++      } else if (provider.id === "chatgpt-login" && chatgptLoginStatus().configured) {
++        configured.push(provider.id);
+       } else if (provider.id === "devin-cli" && devinCliStatus().configured) {
+         configured.push(provider.id);
+       }
+diff --git a/src/providers.mjs b/src/providers.mjs
+index b525dac..092915a 100644
+--- a/src/providers.mjs
++++ b/src/providers.mjs
+@@ -5,6 +5,7 @@ import { PROVIDERS, providerNeedsNoKey } from "./model-registry.mjs";
+ import { devinCliStatus } from "./devin-cli-status.mjs";
+ import { grokOAuthStatus } from "./grok-oauth-status.mjs";
+ import { antigravityOAuthStatus } from "./antigravity-oauth-status.mjs";
++import { chatgptLoginStatus } from "./chatgpt-login-session.mjs";
+ import { kimiOAuthStatus } from "./oauth-status.mjs";
+ import {
+   effectiveProviderCredentialStatus,
+@@ -79,6 +80,10 @@ const SIGN_IN_STATUS = Object.freeze({
+     status: antigravityOAuthStatus,
+     setup: `run \`${providersCommand("login", "antigravity-oauth")}\``,
+   },
++  "chatgpt-login": {
++    status: chatgptLoginStatus,
++    setup: "run `CODEX_HOME=~/.codex-personal codex login`",
++  },
+   "devin-cli": { status: devinCliStatus, setup: "run `devin auth login`" },
+ });
+ 
+diff --git a/src/request-profiles.mjs b/src/request-profiles.mjs
+index 16f91c8..54df89d 100644
+--- a/src/request-profiles.mjs
++++ b/src/request-profiles.mjs
+@@ -5,6 +5,7 @@ export const REQUEST_PROFILES = Object.freeze([
+   "anthropic-reasoning",
+   "antigravity",
+   "auto-tool-choice",
++  "chatgpt-login",
+   "clinepass",
+   "codex-encrypted-schema",
+   "deepseek-nonthinking",
+diff --git a/src/router.mjs b/src/router.mjs
+index 82e4dcc..de6370d 100644
+--- a/src/router.mjs
++++ b/src/router.mjs
+@@ -72,6 +72,10 @@ import {
+ import { createHealthCache } from "./health-cache.mjs";
+ import { discoveryDisabled } from "./discovery-mode.mjs";
+ import { readNativeAliases } from "./native-alias.mjs";
++import {
++  chatgptLoginRequestHeaders,
++  ensureFreshChatgptLoginToken,
++} from "./chatgpt-login-session.mjs";
+ import { nativeContextVariantBase } from "./native-context-variants.mjs";
+ import { readNativeRedirect } from "./native-redirect.mjs";
+ import {
+@@ -2185,6 +2189,48 @@ function normalizeNativeInput(
+   });
+ }
+ 
++function normalizeChatgptLoginInput(input) {
++  if (typeof input === "string") {
++    return [
++      {
++        type: "message",
++        role: "user",
++        content: [{ type: "input_text", text: input }],
++      },
++    ];
++  }
++  return normalizeNativeInput(input);
++}
++
++function completedChatgptLoginResponse(body) {
++  let completed;
++  const outputItems = [];
++  for (const line of body.toString("utf8").split(/\r?\n/)) {
++    if (!line.startsWith("data:")) continue;
++    const data = line.slice(5).trim();
++    if (!data || data === "[DONE]") continue;
++    try {
++      const event = JSON.parse(data);
++      if (event?.type === "response.completed" && event.response) {
++        completed = event.response;
++      } else if (event?.type === "response.output_item.done" && event.item) {
++        outputItems.push(event.item);
++      }
++    } catch {
++      // Keep scanning; malformed keepalive lines are not fatal.
++    }
++  }
++  if (
++    completed &&
++    Array.isArray(completed.output) &&
++    completed.output.length === 0 &&
++    outputItems.length
++  ) {
++    completed.output = outputItems;
++  }
++  return completed;
++}
++
+ function extractUserMessages(input) {
+   if (!Array.isArray(input)) return [];
+   const messages = [];
+@@ -3482,7 +3528,7 @@ async function handleResponses(request, response, requestUrl) {
+       Array.isArray(payload.input) &&
+       payload.input.at(-1)?.type === "compaction_trigger";
+ 
+-    if (route && (compactV1 || compactV2)) {
++    if (route && route.requestProfile !== "chatgpt-login" && (compactV1 || compactV2)) {
+       const compaction = await handleRoutedCompaction(
+         request,
+         response,
+@@ -3552,7 +3598,32 @@ async function handleResponses(request, response, requestUrl) {
+         ...activityMetadataFromHeaders(request.headers),
+       });
+     };
+-    if (route) {
++    if (route?.requestProfile === "chatgpt-login") {
++      let session;
++      try {
++        session = await ensureFreshChatgptLoginToken();
++      } catch (error) {
++        writeJson(response, error.status || 401, {
++          error: {
++            type: error.code || "oauth_unauthorized",
++            message: error instanceof Error ? error.message : String(error),
++          },
++        });
++        activity.finish(response.statusCode);
++        return;
++      }
++      const routed = { ...payload, model: route.upstreamModel };
++      routed.input = normalizeChatgptLoginInput(payload.input);
++      routed.store = false;
++      routed.stream = true;
++      if (!compactV1) delete routed.previous_response_id;
++      target = nativeTarget(requestUrl.pathname, requestUrl.search);
++      headers = chatgptLoginRequestHeaders(session, request.headers);
++      routedBody = await compressedNativeBody(
++        Buffer.from(JSON.stringify(routed), "utf8"),
++        headers,
++      );
++    } else if (route) {
+       // Resolve the selected route's search contract once, before encrypted
+       // handoff normalization or any other external work. A later failover may
+       // not reintroduce ambient search that this route never advertised.
+@@ -3712,7 +3783,9 @@ async function handleResponses(request, response, requestUrl) {
+     // live capability contract as every fallback. This catches unsupported
+     // search history and sidecar changes after normalization before any
+     // provider-bound bytes leave the router.
+-    if (route) assertRoutedSearchContract(route, builtSearchMode, searchContract);
++    if (route && route.requestProfile !== "chatgpt-login") {
++      assertRoutedSearchContract(route, builtSearchMode, searchContract);
++    }
+     let { response: upstream, retries } = await fetchWithRetry(
+       target,
+       {
+@@ -3738,6 +3811,48 @@ async function handleResponses(request, response, requestUrl) {
+     // routed turn that means the full router -> litellm -> api-forwarder ->
+     // provider path, so a stall here is the provider's, not the router's.
+     upstreamLatencyMs = Date.now() - startedAt;
++    if (route?.requestProfile === "chatgpt-login") {
++      if (payload.stream !== true) {
++        const bytes = Buffer.from(await upstream.arrayBuffer());
++        const completed = completedChatgptLoginResponse(bytes);
++        if (!upstream.ok || !completed) {
++          writeJson(response, upstream.status || 502, {
++            error: {
++              type: "upstream_error",
++              message:
++                completed?.error?.message ||
++                "Personal ChatGPT backend returned no completed response.",
++            },
++          });
++        } else {
++          writeJson(response, 200, completed);
++        }
++        const usage = tokenUsageFromPayload(completed);
++        recordUsageEvent({
++          model: route.slug,
++          provider: canonicalProviderId(route.provider),
++          status: upstream.status,
++          durationMs: Date.now() - startedAt,
++          ...usage,
++        });
++        activity.finish(response.statusCode);
++        return;
++      }
++      const usageTransform = new ResponseUsageTransform(
++        upstream.headers.get("content-type") || "",
++      );
++      await pipeResponse(upstream, response, HOP_BY_HOP_HEADERS, usageTransform);
++      const usage = usageTransform.tokenUsage();
++      recordUsageEvent({
++        model: route.slug,
++        provider: canonicalProviderId(route.provider),
++        status: upstream.status,
++        durationMs: Date.now() - startedAt,
++        ...usage,
++      });
++      activity.finish(response.statusCode);
++      return;
++    }
+     // The body of a failed routed attempt, read once: the failover classifier
+     // and the error translation below both need it, and it can only be read
+     // once. Nothing is relayed either way, so reading it is free.
+diff --git a/src/setup.mjs b/src/setup.mjs
+index b9185be..b014a08 100644
+--- a/src/setup.mjs
++++ b/src/setup.mjs
+@@ -6,6 +6,7 @@ import path from "node:path";
+ import { detectLegacyInstallations, applyKnownMigrations, rollbackLatestMigration } from "./legacy-migration.mjs";
+ import { grokOAuthStatus } from "./grok-oauth-status.mjs";
+ import { antigravityOAuthStatus } from "./antigravity-oauth-status.mjs";
++import { chatgptLoginStatus } from "./chatgpt-login-session.mjs";
+ import { LISTED_MODELS, PROVIDERS, providerNeedsNoKey } from "./model-registry.mjs";
+ import { ensureNodeDependencies, isNodeDependencyFailure } from "./node-dependency-install.mjs";
+ import { effectiveVisibleModels, setModelSelection } from "./model-picker-state.mjs";
+@@ -215,6 +216,7 @@ function providerConfigured(provider) {
+     if (provider.id === "kimi-oauth") return kimiOAuthStatus().configured;
+     if (provider.id === "grok-oauth") return grokOAuthStatus().configured;
+     if (provider.id === "antigravity-oauth") return antigravityOAuthStatus().configured;
++    if (provider.id === "chatgpt-login") return chatgptLoginStatus().configured;
+     return false;
+   }
+   return providerNeedsNoKey(provider)
+@@ -320,6 +322,9 @@ function run(command, commandArgs, options = {}) {
+ }
+ 
+ function oauthSetupHint(provider) {
++  if (provider.id === "chatgpt-login") {
++    return "run `CODEX_HOME=~/.codex-personal codex login`";
++  }
+   if (provider.id === "grok-oauth") return "run `grok login --oauth`";
+   if (provider.id === "antigravity-oauth") {
+     const command = process.platform === "win32"
+@@ -351,6 +356,15 @@ async function configureProvider(provider) {
+       }
+       return;
+     }
++    if (provider.id === "chatgpt-login") {
++      if (!confirm("Run `CODEX_HOME=~/.codex-personal codex login` in a terminal, then continue?")) {
++        throw incomplete(`${provider.displayName} sign-in was cancelled.`);
++      }
++      if (!providerConfigured(provider)) {
++        throw incomplete(`${provider.displayName} sign-in did not produce a usable credential.`);
++      }
++      return;
++    }
+     let cli = oauthCliPath(provider.id);
+     if (!cli) {
+       if (!confirm(`Install the official ${provider.displayName} CLI with npm now?`)) {
+diff --git a/test/provider-catalogs.test.mjs b/test/provider-catalogs.test.mjs
+index 27d82f7..0559981 100644
+--- a/test/provider-catalogs.test.mjs
++++ b/test/provider-catalogs.test.mjs
+@@ -11,8 +11,8 @@ import {
+ 
+ test("every selectable provider remains a canonical UI family", () => {
+   const canonical = [...PROVIDERS.values()].filter((provider) => !provider.variantOf);
+-  assert.equal(canonical.length, 40);
+-  assert.equal(PROVIDERS.size, 45);
++  assert.equal(canonical.length, 41);
++  assert.equal(PROVIDERS.size, 46);
+ });
+ 
+ test("catalog capability comes from backend provider definitions", () => {
+diff --git a/test/provider-selection.test.mjs b/test/provider-selection.test.mjs
+index 71f51e1..d007b30 100644
+--- a/test/provider-selection.test.mjs
++++ b/test/provider-selection.test.mjs
+@@ -10,6 +10,7 @@ process.env.CODEX_ROUTER_STATE_DIR = path.join(testRoot, "state");
+ process.env.KIMI_CODE_HOME = path.join(testRoot, "kimi-code");
+ process.env.GROK_AUTH_PATH = path.join(testRoot, "grok", "auth.json");
+ process.env.DEVIN_CREDENTIALS_PATH = path.join(testRoot, "devin", "credentials.toml");
++process.env.CODEX_ROUTER_CHATGPT_LOGIN_HOME = path.join(testRoot, "codex-personal");
+ const { PROVIDERS } = await import("../src/model-registry.mjs");
+ // Clearing every registry-declared credential variable keeps the "no provider
+ // is configured yet" assertions deterministic on a developer machine that has
+diff --git a/test/registry.test.mjs b/test/registry.test.mjs
+index 1b95189..1981c59 100644
+--- a/test/registry.test.mjs
++++ b/test/registry.test.mjs
+@@ -39,6 +39,9 @@ test("provider registry exposes configured API and OAuth model families", () =>
+       "antigravity-oauth/gemini-3.5-flash",
+       "antigravity-oauth/gemini-3.6-flash",
+       "antigravity-oauth/gemini-3.7-flash",
++      "chatgpt-login/gpt-5.6-luna",
++      "chatgpt-login/gpt-5.6-sol",
++      "chatgpt-login/gpt-5.6-terra",
+       "clinepass/deepseek-v4-flash",
+       "clinepass/deepseek-v4-pro",
+       "clinepass/glm-5.2",
+diff --git a/test/setup.test.mjs b/test/setup.test.mjs
+index fa89cfa..5577f94 100644
+--- a/test/setup.test.mjs
++++ b/test/setup.test.mjs
+@@ -27,6 +27,7 @@ test("automatic selection-only setup exposes only configured providers", () => {
+         env: {
+           ...process.env,
+           CODEX_HOME: codexHome,
++          CODEX_ROUTER_CHATGPT_LOGIN_HOME: path.join(testRoot, "codex-personal"),
+           CODEX_ROUTER_STATE_DIR: stateDir,
+           KIMI_CODE_HOME: path.join(testRoot, "kimi-code"),
+           GROK_AUTH_PATH: path.join(testRoot, "grok", "auth.json"),
+@@ -73,6 +74,7 @@ test("--no-provider --no-discovery writes an empty selection and the discovery m
+         env: {
+           ...process.env,
+           CODEX_HOME: codexHome,
++          CODEX_ROUTER_CHATGPT_LOGIN_HOME: path.join(testRoot, "codex-personal"),
+           CODEX_ROUTER_STATE_DIR: stateDir,
+           KIMI_CODE_HOME: path.join(testRoot, "kimi-code"),
+           GROK_AUTH_PATH: path.join(testRoot, "grok", "auth.json"),
+@@ -120,6 +122,7 @@ test("re-running setup without the idle flags clears the discovery marker", () =
+         env: {
+           ...process.env,
+           CODEX_HOME: codexHome,
++          CODEX_ROUTER_CHATGPT_LOGIN_HOME: path.join(testRoot, "codex-personal"),
+           CODEX_ROUTER_STATE_DIR: stateDir,
+           KIMI_CODE_HOME: path.join(testRoot, "kimi-code"),
+           GROK_AUTH_PATH: path.join(testRoot, "grok", "auth.json"),
+@@ -155,6 +158,7 @@ test("ensure-configured does not auto-select anonymous providers", () => {
+         env: {
+           ...process.env,
+           CODEX_HOME: path.join(testRoot, "codex"),
++          CODEX_ROUTER_CHATGPT_LOGIN_HOME: path.join(testRoot, "codex-personal"),
+           CODEX_ROUTER_STATE_DIR: stateDir,
+           KIMI_CODE_HOME: path.join(testRoot, "kimi-code"),
+           GROK_AUTH_PATH: path.join(testRoot, "grok", "auth.json"),
+@@ -198,6 +202,7 @@ test("ensure-configured accepts an explicitly empty selection as idle", () => {
+         env: {
+           ...process.env,
+           CODEX_HOME: path.join(testRoot, "codex"),
++          CODEX_ROUTER_CHATGPT_LOGIN_HOME: path.join(testRoot, "codex-personal"),
+           CODEX_ROUTER_STATE_DIR: stateDir,
+           KIMI_CODE_HOME: path.join(testRoot, "kimi-code"),
+           GROK_AUTH_PATH: path.join(testRoot, "grok", "auth.json"),
+@@ -227,6 +232,7 @@ test("configured setup mode also excludes anonymous providers by default", () =>
+         env: {
+           ...process.env,
+           CODEX_HOME: path.join(testRoot, "codex"),
++          CODEX_ROUTER_CHATGPT_LOGIN_HOME: path.join(testRoot, "codex-personal"),
+           CODEX_ROUTER_STATE_DIR: stateDir,
+           KIMI_CODE_HOME: path.join(testRoot, "kimi-code"),
+           GROK_AUTH_PATH: path.join(testRoot, "grok", "auth.json"),

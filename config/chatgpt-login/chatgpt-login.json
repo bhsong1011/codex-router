@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "providers": [
+    {
+      "id": "chatgpt-login",
+      "displayName": "Personal ChatGPT Login",
+      "kind": "oauth",
+      "ownedBy": "chatgpt",
+      "proxyBaseEnv": "CODEX_ROUTER_CHATGPT_LOGIN_FORWARD_BASE_URL"
+    }
+  ]
+}

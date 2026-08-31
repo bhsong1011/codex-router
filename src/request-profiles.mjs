@@ -5,6 +5,7 @@ export const REQUEST_PROFILES = Object.freeze([
   "anthropic-reasoning",
   "antigravity",
   "auto-tool-choice",
+  "chatgpt-login",
   "clinepass",
   "codex-encrypted-schema",
   "deepseek-nonthinking",

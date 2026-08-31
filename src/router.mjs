@@ -72,6 +72,10 @@ import {
 import { createHealthCache } from "./health-cache.mjs";
 import { discoveryDisabled } from "./discovery-mode.mjs";
 import { readNativeAliases } from "./native-alias.mjs";
+import {
+  chatgptLoginRequestHeaders,
+  ensureFreshChatgptLoginToken,
+} from "./chatgpt-login-session.mjs";
 import { nativeContextVariantBase } from "./native-context-variants.mjs";
 import { readNativeRedirect } from "./native-redirect.mjs";
 import {
@@ -2185,6 +2189,48 @@ function normalizeNativeInput(
   });
 }
 
+function normalizeChatgptLoginInput(input) {
+  if (typeof input === "string") {
+    return [
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: input }],
+      },
+    ];
+  }
+  return normalizeNativeInput(input);
+}
+
+function completedChatgptLoginResponse(body) {
+  let completed;
+  const outputItems = [];
+  for (const line of body.toString("utf8").split(/\r?\n/)) {
+    if (!line.startsWith("data:")) continue;
+    const data = line.slice(5).trim();
+    if (!data || data === "[DONE]") continue;
+    try {
+      const event = JSON.parse(data);
+      if (event?.type === "response.completed" && event.response) {
+        completed = event.response;
+      } else if (event?.type === "response.output_item.done" && event.item) {
+        outputItems.push(event.item);
+      }
+    } catch {
+      // Keep scanning; malformed keepalive lines are not fatal.
+    }
+  }
+  if (
+    completed &&
+    Array.isArray(completed.output) &&
+    completed.output.length === 0 &&
+    outputItems.length
+  ) {
+    completed.output = outputItems;
+  }
+  return completed;
+}
+
 function extractUserMessages(input) {
   if (!Array.isArray(input)) return [];
   const messages = [];
@@ -3482,7 +3528,7 @@ async function handleResponses(request, response, requestUrl) {
       Array.isArray(payload.input) &&
       payload.input.at(-1)?.type === "compaction_trigger";
 
-    if (route && (compactV1 || compactV2)) {
+    if (route && route.requestProfile !== "chatgpt-login" && (compactV1 || compactV2)) {
       const compaction = await handleRoutedCompaction(
         request,
         response,
@@ -3552,7 +3598,32 @@ async function handleResponses(request, response, requestUrl) {
         ...activityMetadataFromHeaders(request.headers),
       });
     };
-    if (route) {
+    if (route?.requestProfile === "chatgpt-login") {
+      let session;
+      try {
+        session = await ensureFreshChatgptLoginToken();
+      } catch (error) {
+        writeJson(response, error.status || 401, {
+          error: {
+            type: error.code || "oauth_unauthorized",
+            message: error instanceof Error ? error.message : String(error),
+          },
+        });
+        activity.finish(response.statusCode);
+        return;
+      }
+      const routed = { ...payload, model: route.upstreamModel };
+      routed.input = normalizeChatgptLoginInput(payload.input);
+      routed.store = false;
+      routed.stream = true;
+      if (!compactV1) delete routed.previous_response_id;
+      target = nativeTarget(requestUrl.pathname, requestUrl.search);
+      headers = chatgptLoginRequestHeaders(session, request.headers);
+      routedBody = await compressedNativeBody(
+        Buffer.from(JSON.stringify(routed), "utf8"),
+        headers,
+      );
+    } else if (route) {
       // Resolve the selected route's search contract once, before encrypted
       // handoff normalization or any other external work. A later failover may
       // not reintroduce ambient search that this route never advertised.
@@ -3712,7 +3783,9 @@ async function handleResponses(request, response, requestUrl) {
     // live capability contract as every fallback. This catches unsupported
     // search history and sidecar changes after normalization before any
     // provider-bound bytes leave the router.
-    if (route) assertRoutedSearchContract(route, builtSearchMode, searchContract);
+    if (route && route.requestProfile !== "chatgpt-login") {
+      assertRoutedSearchContract(route, builtSearchMode, searchContract);
+    }
     let { response: upstream, retries } = await fetchWithRetry(
       target,
       {
@@ -3738,6 +3811,48 @@ async function handleResponses(request, response, requestUrl) {
     // routed turn that means the full router -> litellm -> api-forwarder ->
     // provider path, so a stall here is the provider's, not the router's.
     upstreamLatencyMs = Date.now() - startedAt;
+    if (route?.requestProfile === "chatgpt-login") {
+      if (payload.stream !== true) {
+        const bytes = Buffer.from(await upstream.arrayBuffer());
+        const completed = completedChatgptLoginResponse(bytes);
+        if (!upstream.ok || !completed) {
+          writeJson(response, upstream.status || 502, {
+            error: {
+              type: "upstream_error",
+              message:
+                completed?.error?.message ||
+                "Personal ChatGPT backend returned no completed response.",
+            },
+          });
+        } else {
+          writeJson(response, 200, completed);
+        }
+        const usage = tokenUsageFromPayload(completed);
+        recordUsageEvent({
+          model: route.slug,
+          provider: canonicalProviderId(route.provider),
+          status: upstream.status,
+          durationMs: Date.now() - startedAt,
+          ...usage,
+        });
+        activity.finish(response.statusCode);
+        return;
+      }
+      const usageTransform = new ResponseUsageTransform(
+        upstream.headers.get("content-type") || "",
+      );
+      await pipeResponse(upstream, response, HOP_BY_HOP_HEADERS, usageTransform);
+      const usage = usageTransform.tokenUsage();
+      recordUsageEvent({
+        model: route.slug,
+        provider: canonicalProviderId(route.provider),
+        status: upstream.status,
+        durationMs: Date.now() - startedAt,
+        ...usage,
+      });
+      activity.finish(response.statusCode);
+      return;
+    }
     // The body of a failed routed attempt, read once: the failover classifier
     // and the error translation below both need it, and it can only be read
     // once. Nothing is relayed either way, so reading it is free.

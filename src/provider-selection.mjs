@@ -23,6 +23,7 @@ import { targetCli } from "./target-integration.mjs";
 import { kimiOAuthStatus } from "./oauth-status.mjs";
 import { grokOAuthStatus } from "./grok-oauth-status.mjs";
 import { antigravityOAuthStatus } from "./antigravity-oauth-status.mjs";
+import { chatgptLoginStatus } from "./chatgpt-login-session.mjs";
 import { devinCliStatus } from "./devin-cli-status.mjs";
 import {
   effectiveProviderCredentialStatus,
@@ -107,6 +108,8 @@ export function configuredProviderIds() {
       } else if (provider.id === "grok-oauth" && grokOAuthStatus().configured) {
         configured.push(provider.id);
       } else if (provider.id === "antigravity-oauth" && antigravityOAuthStatus().configured) {
+        configured.push(provider.id);
+      } else if (provider.id === "chatgpt-login" && chatgptLoginStatus().configured) {
         configured.push(provider.id);
       } else if (provider.id === "devin-cli" && devinCliStatus().configured) {
         configured.push(provider.id);

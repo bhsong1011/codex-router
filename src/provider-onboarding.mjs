@@ -12,6 +12,7 @@ import { devinCliStatus } from "./devin-cli-status.mjs";
 import { grokOAuthStatus } from "./grok-oauth-status.mjs";
 import { antigravityOAuthStatus } from "./antigravity-oauth-status.mjs";
 import { removeAntigravityToken } from "./antigravity-oauth-session.mjs";
+import { CHATGPT_LOGIN_HOME, chatgptLoginStatus } from "./chatgpt-login-session.mjs";
 import { KIMI_CLI_NPM_PACKAGE } from "./kimi-oauth-onboarding.mjs";
 import { MODELS, PROVIDERS, providerNeedsNoKey } from "./model-registry.mjs";
 import {
@@ -94,6 +95,7 @@ function oauthConfigured(providerId) {
   if (providerId === "kimi-oauth") return kimiOAuthStatus().configured;
   if (providerId === "grok-oauth") return grokOAuthStatus().configured;
   if (providerId === "antigravity-oauth") return antigravityOAuthStatus().configured;
+  if (providerId === "chatgpt-login") return chatgptLoginStatus().configured;
   if (providerId === "devin-cli") return devinCliStatus().configured;
   return false;
 }
@@ -121,6 +123,21 @@ export function providerOnboardingSnapshot() {
             // A rejected or damaged session is not configured, but its
             // router-managed file must remain removable from every UI.
             disconnectable: status.credentialPresent,
+            cliInstalled: true,
+            cliRunnable: true,
+            action: configured ? "ready" : "login",
+            ...(catalogSources.length ? { catalogSources } : {}),
+          };
+        }
+        if (provider.id === "chatgpt-login") {
+          const status = chatgptLoginStatus();
+          const configured = status.configured;
+          return {
+            id: provider.id,
+            displayName: provider.displayName,
+            kind: "oauth",
+            credentialLabel: "Personal ChatGPT login",
+            configured,
             cliInstalled: true,
             cliRunnable: true,
             action: configured ? "ready" : "login",
@@ -245,6 +262,33 @@ export async function loginOauthProvider(providerId) {
     }
     if (providerCatalogSources(providerId).length) {
       await forgetProviderCatalogFamilyCache(providerId);
+    }
+    return;
+  }
+  if (providerId === "chatgpt-login") {
+    const codexCli = commandPath("codex");
+    if (!codexCli) throw new Error("Install the Codex CLI before signing in.");
+    const login = spawnableCommand(codexCli, ["login"]);
+    const result = spawnSync(login.command, login.args, {
+      ...login.options,
+      encoding: "utf8",
+      env: { ...spawnEnvironment(), CODEX_HOME: CHATGPT_LOGIN_HOME },
+      timeout: LOGIN_TIMEOUT_MS,
+    });
+    if (result.signal === "SIGTERM") {
+      throw new Error(
+        "Codex login did not finish within 10 minutes. Run `CODEX_HOME=~/.codex-personal codex login` in a terminal.",
+      );
+    }
+    if (result.error || result.status !== 0) {
+      throw new Error(
+        `Personal ChatGPT sign-in was cancelled or did not complete. ${installFailureDetail(result)}`.trim(),
+      );
+    }
+    if (!oauthConfigured(providerId)) {
+      throw new Error(
+        "Sign-in finished without a usable Personal ChatGPT session. Please try again.",
+      );
     }
     return;
   }

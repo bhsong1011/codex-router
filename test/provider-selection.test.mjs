@@ -10,6 +10,7 @@ process.env.CODEX_ROUTER_STATE_DIR = path.join(testRoot, "state");
 process.env.KIMI_CODE_HOME = path.join(testRoot, "kimi-code");
 process.env.GROK_AUTH_PATH = path.join(testRoot, "grok", "auth.json");
 process.env.DEVIN_CREDENTIALS_PATH = path.join(testRoot, "devin", "credentials.toml");
+process.env.CODEX_ROUTER_CHATGPT_LOGIN_HOME = path.join(testRoot, "codex-personal");
 const { PROVIDERS } = await import("../src/model-registry.mjs");
 // Clearing every registry-declared credential variable keeps the "no provider
 // is configured yet" assertions deterministic on a developer machine that has

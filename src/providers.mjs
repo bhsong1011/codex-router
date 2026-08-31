@@ -5,6 +5,7 @@ import { PROVIDERS, providerNeedsNoKey } from "./model-registry.mjs";
 import { devinCliStatus } from "./devin-cli-status.mjs";
 import { grokOAuthStatus } from "./grok-oauth-status.mjs";
 import { antigravityOAuthStatus } from "./antigravity-oauth-status.mjs";
+import { chatgptLoginStatus } from "./chatgpt-login-session.mjs";
 import { kimiOAuthStatus } from "./oauth-status.mjs";
 import {
   effectiveProviderCredentialStatus,
@@ -78,6 +79,10 @@ const SIGN_IN_STATUS = Object.freeze({
   "antigravity-oauth": {
     status: antigravityOAuthStatus,
     setup: `run \`${providersCommand("login", "antigravity-oauth")}\``,
+  },
+  "chatgpt-login": {
+    status: chatgptLoginStatus,
+    setup: "run `CODEX_HOME=~/.codex-personal codex login`",
   },
   "devin-cli": { status: devinCliStatus, setup: "run `devin auth login`" },
 });
