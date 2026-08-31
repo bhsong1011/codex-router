@@ -21,15 +21,29 @@ function rewrittenBlock(parsed, event) {
   return lines.join(parsed.newline);
 }
 
+function syntheticBlock(type, event, parsed) {
+  const hasEventLine = parsed.lines.some((line) => line.startsWith("event:"));
+  const lines = hasEventLine ? [`event: ${type}`] : [];
+  lines.push(`data: ${JSON.stringify({ type, ...event })}`);
+  return lines.join(parsed.newline);
+}
+
 // DeepSeek's chat-completions translation can surface the full reasoning chain
-// as plaintext `reasoning_text` (and the desktop can show any reasoning stream
-// as an internal-thinking block). Drop every reasoning-related event so the
-// app sees only normal messages and tool calls.
+// as plaintext `reasoning_text`. OpenAI instead streams an opaque reasoning
+// item with a short summary, which the desktop renders as a collapsed
+// "Thinking" panel. Rewrite DeepSeek reasoning to that shape: no visible
+// content, one summary item.
 export class DeepseekReasoningCollapseSseTransform extends Transform {
   constructor() {
     super();
     this.decoder = new StringDecoder("utf8");
     this.buffer = "";
+    this.seq = 0;
+    this.reasoningId = undefined;
+    this.summaryText = "";
+    this.sawSummary = false;
+    this.started = false;
+    this.reasoningClosed = false;
   }
 
   _transform(chunk, _encoding, callback) {
@@ -59,27 +73,84 @@ export class DeepseekReasoningCollapseSseTransform extends Transform {
   handleEvent(parsed) {
     const { event } = parsed;
     const type = event?.type;
+    if (type === "response.output_item.added" && event?.item?.type === "reasoning") {
+      this.started = true;
+      this.reasoningId = event.item.id;
+      this.push(rewrittenBlock(parsed, {
+        ...event,
+        item: { ...event.item, summary: [], content: undefined },
+      }) + parsed.separator);
+      this.push(syntheticBlock("response.reasoning_summary_part.added", {
+        item_id: this.reasoningId,
+        output_index: 0,
+        summary_index: 0,
+        part: { type: "summary_text", text: "" },
+      }, parsed) + parsed.separator);
+      return;
+    }
     if (
       type === "response.content_part.done" &&
       event?.part?.type === "reasoning_text"
     ) {
+      this.closeReasoning(parsed);
+      return;
+    }
+    if (type === "response.reasoning_summary_text.delta") {
+      this.ensureStarted(parsed);
+      if (typeof event.delta === "string" && event.delta) {
+        this.sawSummary = true;
+        this.summaryText += event.delta;
+      }
+      this.push(syntheticBlock("response.reasoning_summary_text.delta", {
+        item_id: this.reasoningId,
+        output_index: 0,
+        summary_index: 0,
+        delta: event.delta,
+      }, parsed) + parsed.separator);
+      return;
+    }
+    if (type === "response.reasoning_text.delta") {
+      this.ensureStarted(parsed);
+      const delta = typeof event.delta === "string" ? event.delta : event.part?.text ?? "";
+      if (delta && !this.sawSummary) this.summaryText += delta;
       return;
     }
     if (
-      type?.startsWith("response.reasoning_text.") ||
-      type?.startsWith("response.reasoning_summary_") ||
-      type?.startsWith("response.reasoning_summary_part.")
+      type === "response.reasoning_summary_part.added" ||
+      type === "response.reasoning_summary_part.done" ||
+      type === "response.reasoning_summary_text.done" ||
+      type === "response.reasoning_text.done"
     ) {
       return;
     }
-    if (
-      (type === "response.output_item.added" || type === "response.output_item.done") &&
-      event?.item?.type === "reasoning"
-    ) {
+    if (type === "response.output_item.done" && event?.item?.type === "reasoning") {
+      if (!this.started) {
+        this.started = true;
+        this.reasoningId = event.item.id;
+      }
+      if (!this.sawSummary && Array.isArray(event.item.summary)) {
+        this.summaryText ||= event.item.summary
+          .filter((part) => part?.type === "summary_text" && typeof part.text === "string")
+          .map((part) => part.text)
+          .join("");
+      }
+      this.closeReasoning(parsed);
       return;
     }
     if (type === "response.completed" && Array.isArray(event?.response?.output)) {
-      const output = event.response.output.filter((item) => item?.type !== "reasoning");
+      if (this.started && !this.reasoningClosed) this.closeReasoning(parsed);
+      const output = event.response.output.map((item) => {
+        if (item?.type !== "reasoning") return item;
+        return {
+          ...item,
+          content: undefined,
+          summary: (Array.isArray(item.summary) && item.summary.length > 0
+            ? item.summary
+            : this.summaryText
+              ? [{ type: "summary_text", text: this.summaryText }]
+              : []),
+        };
+      });
       if (output.length !== event.response.output.length) {
         this.push(rewrittenBlock(parsed, {
           ...event,
@@ -89,6 +160,57 @@ export class DeepseekReasoningCollapseSseTransform extends Transform {
       }
     }
     this.push(parsed.raw + parsed.separator);
+  }
+
+  ensureStarted(parsed) {
+    if (this.started) return;
+    this.started = true;
+    this.seq += 1;
+    this.reasoningId = `rs_collapse_${Date.now()}_${this.seq}`;
+    this.push(syntheticBlock("response.output_item.added", {
+      output_index: 0,
+      item: {
+        id: this.reasoningId,
+        type: "reasoning",
+        status: "in_progress",
+        summary: [],
+        content: undefined,
+      },
+    }, parsed) + parsed.separator);
+    this.push(syntheticBlock("response.reasoning_summary_part.added", {
+      item_id: this.reasoningId,
+      output_index: 0,
+      summary_index: 0,
+      part: { type: "summary_text", text: "" },
+    }, parsed) + parsed.separator);
+  }
+
+  closeReasoning(parsed) {
+    if (!this.started || this.reasoningClosed) return;
+    this.reasoningClosed = true;
+    const text = this.summaryText;
+    const template = parsed ?? { lines: ["data: {}"], dataLineIndex: 0, newline: "\n" };
+    this.push(syntheticBlock("response.reasoning_summary_text.done", {
+      item_id: this.reasoningId,
+      output_index: 0,
+      summary_index: 0,
+      text,
+    }, template) + (parsed ? parsed.separator : ""));
+    this.push(syntheticBlock("response.reasoning_summary_part.done", {
+      item_id: this.reasoningId,
+      output_index: 0,
+      summary_index: 0,
+      part: { type: "summary_text", text },
+    }, template) + (parsed ? parsed.separator : ""));
+    this.push(syntheticBlock("response.output_item.done", {
+      output_index: 0,
+      item: {
+        id: this.reasoningId,
+        type: "reasoning",
+        status: "completed",
+        summary: text ? [{ type: "summary_text", text }] : [],
+      },
+    }, template) + (parsed ? parsed.separator : ""));
   }
 }
 
@@ -109,7 +231,24 @@ class DeepseekReasoningCollapseJsonTransform extends Transform {
     try {
       const payload = JSON.parse(this.body);
       if (Array.isArray(payload?.output)) {
-        payload.output = payload.output.filter((item) => item?.type !== "reasoning");
+        payload.output = payload.output.map((item) => {
+          if (item?.type !== "reasoning") return item;
+          const text = Array.isArray(item.content)
+            ? item.content
+                .filter((part) =>
+                  (part?.type === "reasoning_text" || part?.type === "output_text") &&
+                  typeof part.text === "string",
+                )
+                .map((part) => part.text)
+                .join("")
+            : "";
+          const summary = Array.isArray(item.summary) && item.summary.length > 0
+            ? item.summary
+            : text
+              ? [{ type: "summary_text", text }]
+              : [];
+          return { ...item, content: undefined, summary };
+        });
       }
       this.push(JSON.stringify(payload));
     } catch {

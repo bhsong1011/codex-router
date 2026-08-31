@@ -16,16 +16,15 @@ function collect(transform, input) {
   });
 }
 
-test("DeepSeek reasoning collapse strips all reasoning from the stream", async () => {
+test("DeepSeek reasoning collapse emits a summary-only reasoning item", async () => {
   const input = [
     'data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_1","type":"message","role":"assistant","status":"in_progress","content":[]}}\n\n',
     'data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_a","output_index":0,"delta":"We"}\n\n',
     'data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_b","output_index":0,"delta":" need answer"}\n\n',
     'data: {"type":"response.content_part.done","item_id":"msg_1","output_index":0,"content_index":0,"part":{"type":"reasoning_text","reasoning":"We need answer to the user."}}\n\n',
-    'data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_1","type":"reasoning","status":"completed","summary":[{"type":"summary_text","text":"We need answer"}],"content":[]}}\n\n',
     'data: {"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"OK"}\n\n',
     'data: {"type":"response.output_item.done","output_index":0,"item":{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"OK"}]}}\n\n',
-    'data: {"type":"response.completed","response":{"id":"resp_1","output":[{"type":"reasoning","summary":[]},{"type":"message","content":[]}]}}\n\n',
+    'data: {"type":"response.completed","response":{"id":"resp_1","output":[{"type":"message","content":[]}]}}\n\n',
     "data: [DONE]\n\n",
   ].join("");
 
@@ -37,9 +36,11 @@ test("DeepSeek reasoning collapse strips all reasoning from the stream", async (
     input,
   );
 
-  assert.ok(!output.includes("reasoning"));
+  assert.ok(!output.includes('"type":"reasoning_text"'));
   assert.ok(!output.includes('"reasoning":"We need answer to the user."'));
-  assert.ok(!output.includes('"type":"reasoning"'));
+  assert.match(output, /"type":"reasoning"/);
+  assert.match(output, /"type":"summary_text"/);
+  assert.match(output, /"text":"We need answer"/);
   assert.ok(output.includes('"delta":"OK"'));
   assert.ok(output.includes('"type":"message"'));
 });
