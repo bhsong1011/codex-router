@@ -21,34 +21,10 @@ function rewrittenBlock(parsed, event) {
   return lines.join(parsed.newline);
 }
 
-function reasoningText(item) {
-  if (!Array.isArray(item?.content)) return "";
-  return item.content
-    .filter(
-      (part) =>
-        (part?.type === "reasoning_text" || part?.type === "output_text") &&
-        typeof part.text === "string",
-    )
-    .map((part) => part.text)
-    .join("");
-}
-
-function collapseReasoningItem(item) {
-  if (item?.type !== "reasoning") return item;
-  const text = reasoningText(item);
-  if (!text && Array.isArray(item.summary)) return item;
-  const summary = Array.isArray(item.summary) && item.summary.length > 0
-    ? item.summary
-    : text
-      ? [{ type: "summary_text", text }]
-      : [];
-  return { ...item, content: undefined, summary };
-}
-
 // DeepSeek's chat-completions translation can surface the full reasoning chain
-// as plaintext `reasoning_text`. OpenAI keeps reasoning opaque and only streams
-// a summary, so the desktop collapses it. Strip the plaintext reasoning events
-// and leave whatever summary the upstream stream already carries untouched.
+// as plaintext `reasoning_text` (and the desktop can show any reasoning stream
+// as an internal-thinking block). Drop every reasoning-related event so the
+// app sees only normal messages and tool calls.
 export class DeepseekReasoningCollapseSseTransform extends Transform {
   constructor() {
     super();
@@ -89,22 +65,22 @@ export class DeepseekReasoningCollapseSseTransform extends Transform {
     ) {
       return;
     }
-    if (type === "response.reasoning_text.delta" || type === "response.reasoning_text.done") {
+    if (
+      type?.startsWith("response.reasoning_text.") ||
+      type?.startsWith("response.reasoning_summary_") ||
+      type?.startsWith("response.reasoning_summary_part.")
+    ) {
       return;
     }
     if (
       (type === "response.output_item.added" || type === "response.output_item.done") &&
       event?.item?.type === "reasoning"
     ) {
-      const collapsed = collapseReasoningItem(event.item);
-      if (collapsed !== event.item) {
-        this.push(rewrittenBlock(parsed, { ...event, item: collapsed }) + parsed.separator);
-        return;
-      }
+      return;
     }
     if (type === "response.completed" && Array.isArray(event?.response?.output)) {
-      const output = event.response.output.map(collapseReasoningItem);
-      if (output.some((item, index) => item !== event.response.output[index])) {
+      const output = event.response.output.filter((item) => item?.type !== "reasoning");
+      if (output.length !== event.response.output.length) {
         this.push(rewrittenBlock(parsed, {
           ...event,
           response: { ...event.response, output },
@@ -133,7 +109,7 @@ class DeepseekReasoningCollapseJsonTransform extends Transform {
     try {
       const payload = JSON.parse(this.body);
       if (Array.isArray(payload?.output)) {
-        payload.output = payload.output.map(collapseReasoningItem);
+        payload.output = payload.output.filter((item) => item?.type !== "reasoning");
       }
       this.push(JSON.stringify(payload));
     } catch {

@@ -8668,18 +8668,9 @@ test("router normalizes direct DeepSeek's live reasoning bridge and removes its 
     const reasoningEvents = events.filter(
       (event) => (event.item_id ?? event.item?.id) === terminalReasoning.id,
     );
-    assert.deepEqual(
-      reasoningEvents.map((event) => [event.type, event.output_index]),
-      [
-        ["response.output_item.added", 0],
-        ["response.reasoning_summary_part.added", 0],
-        ["response.reasoning_summary_text.delta", 0],
-        ["response.reasoning_summary_text.delta", 0],
-        ["response.reasoning_summary_text.done", 0],
-        ["response.reasoning_summary_part.done", 0],
-        ["response.output_item.done", 0],
-      ],
-    );
+    // The fork strips DeepSeek reasoning entirely so the desktop never shows an
+    // internal-thinking block; only normal messages and tool calls remain.
+    assert.deepEqual(reasoningEvents, []);
     const toolEvents = events.filter(
       (event) => (event.item_id ?? event.item?.id) === functionCall.id,
     );
@@ -8692,7 +8683,7 @@ test("router normalizes direct DeepSeek's live reasoning bridge and removes its 
     );
     assert.deepEqual(
       events.find((event) => event.type === "response.completed").response.output,
-      [normalizedReasoning, functionCall],
+      [functionCall],
     );
   } finally {
     await stopChild(router);
