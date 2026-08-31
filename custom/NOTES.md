@@ -23,9 +23,10 @@ routing with `ChatGPT-Account-Id`.
 
 DeepSeek also gets a fork-local reasoning collapse: the chat-completions
 translation can stream plaintext `reasoning_text`, which the desktop persists
-and would otherwise surface as an expanded internal-thinking block.
-`src/deepseek-reasoning-collapse.mjs` strips that content and keeps the
-summary events.
+and would otherwise surface as an internal-thinking block.
+`src/deepseek-reasoning-collapse.mjs` strips all reasoning events (content,
+summaries, and reasoning output items), so only normal messages and tool calls
+reach the desktop.
 
 ## Why v2 and not v1
 
