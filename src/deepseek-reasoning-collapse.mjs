@@ -24,7 +24,11 @@ function rewrittenBlock(parsed, event) {
 function reasoningText(item) {
   if (!Array.isArray(item?.content)) return "";
   return item.content
-    .filter((part) => part?.type === "reasoning_text" && typeof part.text === "string")
+    .filter(
+      (part) =>
+        (part?.type === "reasoning_text" || part?.type === "output_text") &&
+        typeof part.text === "string",
+    )
     .map((part) => part.text)
     .join("");
 }
@@ -95,6 +99,16 @@ export class DeepseekReasoningCollapseSseTransform extends Transform {
       const collapsed = collapseReasoningItem(event.item);
       if (collapsed !== event.item) {
         this.push(rewrittenBlock(parsed, { ...event, item: collapsed }) + parsed.separator);
+        return;
+      }
+    }
+    if (type === "response.completed" && Array.isArray(event?.response?.output)) {
+      const output = event.response.output.map(collapseReasoningItem);
+      if (output.some((item, index) => item !== event.response.output[index])) {
+        this.push(rewrittenBlock(parsed, {
+          ...event,
+          response: { ...event.response, output },
+        }) + parsed.separator);
         return;
       }
     }
