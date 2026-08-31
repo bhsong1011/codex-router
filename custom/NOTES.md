@@ -21,6 +21,12 @@ The remaining fork-local router change is the `chatgpt-login` Personal
 provider: token refresh from `~/.codex-personal/auth.json` and native backend
 routing with `ChatGPT-Account-Id`.
 
+DeepSeek also gets a fork-local reasoning collapse: the chat-completions
+translation can stream plaintext `reasoning_text`, which the desktop persists
+and would otherwise surface as an expanded internal-thinking block.
+`src/deepseek-reasoning-collapse.mjs` strips that content and keeps the
+summary events.
+
 ## Why v2 and not v1
 
 OpenAI `gpt-5.6` models run the v2 multi-agent runtime natively. V2 marks

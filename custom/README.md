@@ -8,6 +8,9 @@ upstream `main` (`43deff5`).
 
 - `chatgpt-login` provider: OAuth refresh and `ChatGPT-Account-Id` routing for
   accounts that only expose Codex through ChatGPT login, not the API.
+- `deepseek-reasoning-collapse.mjs`: rewrites DeepSeek's plaintext
+  `reasoning_text` into summary-only reasoning items, so the desktop shows the
+  collapsed reasoning panel like OpenAI instead of the full chain.
 - Direct DeepSeek models, interrupted tool-call repair, and encrypted-content
   sanitization now ship upstream; the older fork-local versions were dropped
   after replaying the failure against upstream (see `custom/NOTES.md`).
