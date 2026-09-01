@@ -21,12 +21,28 @@ The remaining fork-local router change is the `chatgpt-login` Personal
 provider: token refresh from `~/.codex-personal/auth.json` and native backend
 routing with `ChatGPT-Account-Id`.
 
-DeepSeek also gets a fork-local reasoning collapse: the chat-completions
-translation can stream plaintext `reasoning_text`, which the desktop persists
-and would otherwise surface as an internal-thinking block.
-`src/deepseek-reasoning-collapse.mjs` strips all reasoning events (content,
-summaries, and reasoning output items), so only normal messages and tool calls
-reach the desktop.
+DeepSeek also gets a fork-local reasoning adapter. The chat-completions
+translation can stream plaintext `reasoning_text`, and it can emit planning
+text as an ordinary assistant message immediately after a `function_call`.
+`src/deepseek-reasoning-collapse.mjs` converts both forms into Responses-style
+collapsed reasoning summaries. It preserves the original opaque reasoning
+content for DeepSeek follow-up requests. The next ordinary answer remains
+visible; it is not reclassified.
+
+Current Codex desktop already renders a reasoning item's `summary` as collapsed
+thinking. No desktop renderer patch is required. Existing task history is
+immutable; only new DeepSeek tasks show the corrected presentation.
+
+Routed providers intentionally use HTTP Responses streaming
+(`supports_websockets = false`). The router's WebSocket edge can lose a tool
+result during continuation replay, producing LiteLLM's "No tool output found"
+error followed by a client reconnect. Native OpenAI is unaffected.
+
+Desktop-created tasks begin with a synthetic, call-id-less
+`codex_app` `create_thread` or `send_message_to_thread` output containing a
+`<codex_delegation>` envelope. It is not a valid tool-result history entry.
+`normalizeRoutedInput` converts that envelope to normal user input before any
+routed provider sees it. Real tool outputs retain their `call_id`.
 
 ## Why v2 and not v1
 

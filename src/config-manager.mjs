@@ -617,7 +617,7 @@ function managedSignedProviderBlock(providerId, baseUrl) {
     // the provider half enabled; the catalog's supports_search_tool field is
     // the per-model gate.
     "supports_standalone_web_search = true",
-    "supports_websockets = true",
+    "supports_websockets = false",
     signedProviderEndMarker,
   ].join("\n");
 }
@@ -634,7 +634,7 @@ function managedLoginFreeProviderBlock(providerId, baseUrl) {
     'wire_api = "responses"',
     "requires_openai_auth = false",
     "supports_standalone_web_search = true",
-    "supports_websockets = true",
+    "supports_websockets = false",
     managedCallerAuthBlock(providerId),
     signedProviderEndMarker,
   ].join("\n");

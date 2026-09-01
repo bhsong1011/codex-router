@@ -1370,6 +1370,82 @@ test("router relays encrypted Codex subagent payloads before external routing", 
   }
 });
 
+test("router converts synthetic codex_app delegation outputs to user input", async () => {
+  const gatewayRequests = [];
+  const gateway = await mockServer(async (request, response) => {
+    gatewayRequests.push(await bodyJson(request));
+    json(response, 200, { id: "resp_delegation", output: [] });
+  });
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_QUIET: "1",
+  });
+  const delegation =
+    "<codex_delegation>\n" +
+    "  <source_thread_id>source-thread</source_thread_id>\n" +
+    "  <input>Continue the task.</input>\n" +
+    "</codex_delegation>";
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const response = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "deepseek/deepseek-v4-flash",
+        stream: false,
+        input: [
+          {
+            type: "function_call_output",
+            name: "create_thread",
+            namespace: "codex_app",
+            output: delegation,
+          },
+          {
+            type: "function_call_output",
+            name: "send_message_to_thread",
+            namespace: "codex_app",
+            output: delegation,
+          },
+          {
+            type: "function_call_output",
+            name: "exec_command",
+            namespace: "functions",
+            call_id: "call_real_tool",
+            output: "real tool output",
+          },
+        ],
+      }),
+    });
+
+    assert.equal(response.status, 200, await response.text());
+    assert.deepEqual(gatewayRequests[0].input, [
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: delegation }],
+      },
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: delegation }],
+      },
+      {
+        type: "function_call_output",
+        name: "exec_command",
+        namespace: "functions",
+        call_id: "call_real_tool",
+        output: "real tool output",
+      },
+    ]);
+  } finally {
+    await stopChild(router);
+    await closeServer(gateway.server);
+  }
+});
+
 test("router fails closed when an encrypted subagent payload cannot be relayed", async () => {
   const native = await mockServer(async (_request, response) => {
     json(response, 401, { error: { message: "native sign-in required" } });

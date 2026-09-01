@@ -1249,6 +1249,17 @@ function messageItem(text) {
   };
 }
 
+function syntheticCodexDelegation(item) {
+  return (
+    item?.type === "function_call_output" &&
+    !item.call_id &&
+    item.namespace === "codex_app" &&
+    ["create_thread", "send_message_to_thread"].includes(item.name) &&
+    typeof item.output === "string" &&
+    item.output.startsWith("<codex_delegation>")
+  );
+}
+
 function normalizeRoutedInput(input) {
   if (!Array.isArray(input)) return input;
   return input
@@ -1257,6 +1268,7 @@ function normalizeRoutedInput(input) {
       if (item?.type !== "compaction") return item;
       return messageItem(renderCompactionValue(item.encrypted_content));
     })
+    .map((item) => (syntheticCodexDelegation(item) ? messageItem(item.output) : item))
     .map((item) => {
       // LiteLLM rejects messages whose text content is empty; Codex emits
       // such filler assistant messages around tool calls. Strip empty text
