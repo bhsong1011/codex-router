@@ -1056,7 +1056,7 @@ class ResponsesWebSocketPeer {
       }
       if (!String(upstream.headers.get("content-type") || "").toLowerCase().includes("text/event-stream")) {
         const body = await readResponseBody(upstream, {
-          maxBytes: this.options.maxErrorBytes,
+          maxBytes: this.options.maxContinuationBytes,
           signal: controller.signal,
         });
         if (await this.relayCompletedJsonResponse(body, fullRequest, upstream)) return;

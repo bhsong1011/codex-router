@@ -1071,6 +1071,32 @@ test("relays a completed JSON Responses object when the internal endpoint does n
   peer.close();
 });
 
+test("relays a completed JSON response larger than the error-body limit", async (t) => {
+  const { server, port } = await startServer(async (request, response) => {
+    for await (const _chunk of request) {}
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      id: "resp-large-json",
+      object: "response",
+      status: "completed",
+      output: [{
+        id: "msg-large-json",
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "x".repeat(2_048) }],
+      }],
+    }));
+  }, { maxErrorBytes: 1_024, maxContinuationBytes: 8_192 });
+  t.after(() => server.close());
+
+  const { peer } = await connect(port);
+  peer.sendJson(createRequest());
+  assert.equal((await peer.nextJson()).type, "response.created");
+  assert.equal((await peer.nextJson()).type, "response.output_item.done");
+  assert.equal((await peer.nextJson()).type, "response.completed");
+  peer.close();
+});
+
 test("accepts fragmented text and closes on unmasked or oversized frames", async (t) => {
   const { server, port } = await startServer(
     async (request, response) => {
