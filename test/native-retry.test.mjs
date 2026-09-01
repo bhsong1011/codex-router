@@ -147,6 +147,39 @@ function stateDirectory() {
   return mkdtempSync(path.join(os.tmpdir(), "native-retry-state-"));
 }
 
+test("a native stream preserves the caller's SSE accept header", async () => {
+  let accept;
+  const native = await mockServer(async (request, response) => {
+    accept = request.headers.accept;
+    await readBody(request);
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.end('data: {"type":"response.completed","response":{"id":"resp_1","output":[]}}\n\ndata: [DONE]\n\n');
+  });
+  const stateDir = stateDirectory();
+  const routerPort = await openPort();
+  const router = startRouter({ nativePort: native.port, routerPort, stateDir });
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const result = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer caller",
+        Accept: "text/event-stream",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ ...largeNativeTurn(), stream: true }),
+    });
+
+    assert.equal(result.status, 200);
+    assert.equal(accept, "text/event-stream");
+  } finally {
+    await stopChild(router);
+    await closeServer(native.server);
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 // The reported failure: ChatGPT's edge answers a native turn with a 503 whose
 // body says the connection reset *before headers*. Nothing was relayed, so the
 // router can send it again and the caller never learns it happened.

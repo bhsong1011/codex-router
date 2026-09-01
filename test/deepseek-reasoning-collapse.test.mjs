@@ -53,6 +53,7 @@ test("DeepSeek reasoning collapse emits a summary while preserving replay conten
   assert.match(output, /"text":"We need answer"/);
   assert.ok(output.includes('"delta":"OK"'));
   assert.ok(output.includes('"type":"message"'));
+  assert.ok(output.includes('"phase":"final_answer"'));
 });
 
 test("DeepSeek JSON responses preserve reasoning content for a follow-up", async () => {
@@ -74,7 +75,7 @@ test("DeepSeek JSON responses preserve reasoning content for a follow-up", async
   assert.deepEqual(item.summary, [{ type: "summary_text", text: "opaque replay payload" }]);
 });
 
-test("DeepSeek tool-call commentary becomes collapsed reasoning", async () => {
+test("DeepSeek suppresses post-tool commentary", async () => {
   const commentary = "I will verify the repository state, then apply the approved revert.";
   const input = [
     'data: {"type":"response.output_item.added","output_index":0,"item":{"id":"call_1","type":"function_call","name":"exec_command","arguments":"{}"}}\n\n',
@@ -97,13 +98,6 @@ test("DeepSeek tool-call commentary becomes collapsed reasoning", async () => {
   const completed = outputEvents.find((event) => event.type === "response.completed");
 
   assert.ok(
-    outputEvents.some(
-      (event) =>
-        event.type === "response.reasoning_summary_text.delta" &&
-        event.delta === commentary,
-    ),
-  );
-  assert.ok(
     !outputEvents.some(
       (event) =>
         event.type === "response.output_text.delta" &&
@@ -113,10 +107,61 @@ test("DeepSeek tool-call commentary becomes collapsed reasoning", async () => {
   assert.ok(
     !completed.response.output.some((item) => item.id === "msg_1"),
   );
+  assert.ok(!outputEvents.some(
+    (event) => event.type === "response.reasoning_summary_text.delta" && event.delta === commentary,
+  ));
   assert.ok(completed.response.output.some((item) => item.id === "call_1"));
 });
 
-test("DeepSeek keeps the later answer visible after tool-call commentary", async () => {
+test("DeepSeek suppresses pre-tool commentary", async () => {
+  const commentary = "I will verify the repository state before changing anything.";
+  const input = [
+    'data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_1","type":"message","role":"assistant","status":"in_progress","content":[]}}\n\n',
+    `data: ${JSON.stringify({ type: "response.output_text.delta", item_id: "msg_1", output_index: 0, content_index: 0, delta: commentary })}\n\n`,
+    `data: ${JSON.stringify({ type: "response.output_item.done", output_index: 0, item: { id: "msg_1", type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: commentary }] } })}\n\n`,
+    'data: {"type":"response.output_item.added","output_index":1,"item":{"id":"call_1","type":"function_call","name":"exec_command","arguments":"{}"}}\n\n',
+    `data: ${JSON.stringify({ type: "response.completed", response: { id: "resp_1", output: [{ id: "msg_1", type: "message", content: [{ type: "output_text", text: commentary }] }, { id: "call_1", type: "function_call", name: "exec_command", arguments: "{}" }] } })}\n\n`,
+    "data: [DONE]\n\n",
+  ].join("");
+
+  const outputEvents = events(await collect(
+    deepseekReasoningCollapseTransform({ id: "deepseek" }, "text/event-stream"),
+    input,
+  ));
+  const completed = outputEvents.find((event) => event.type === "response.completed");
+
+  assert.ok(!outputEvents.some(
+    (event) => event.type === "response.output_text.delta" && event.delta === commentary,
+  ));
+  assert.ok(!outputEvents.some(
+    (event) => event.type === "response.reasoning_summary_text.delta" && event.delta === commentary,
+  ));
+  assert.ok(!completed.response.output.some((item) => item.id === "msg_1"));
+});
+
+test("DeepSeek releases an oversized deferred message unchanged", async () => {
+  const commentary = "x".repeat(65 * 1024);
+  const input = [
+    'data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_1","type":"message","role":"assistant","status":"in_progress","content":[]}}\n\n',
+    `data: ${JSON.stringify({ type: "response.output_text.delta", item_id: "msg_1", output_index: 0, content_index: 0, delta: commentary })}\n\n`,
+    'data: {"type":"response.output_item.added","output_index":1,"item":{"id":"call_1","type":"function_call","name":"exec_command","arguments":"{}"}}\n\n',
+    "data: [DONE]\n\n",
+  ].join("");
+
+  const outputEvents = events(await collect(
+    deepseekReasoningCollapseTransform({ id: "deepseek" }, "text/event-stream"),
+    input,
+  ));
+
+  assert.ok(outputEvents.some(
+    (event) => event.type === "response.output_text.delta" && event.delta === commentary,
+  ));
+  assert.ok(!outputEvents.some(
+    (event) => event.type === "response.reasoning_summary_text.delta" && event.delta === commentary,
+  ));
+});
+
+test("DeepSeek keeps the later answer visible after suppressed tool commentary", async () => {
   const commentary = "I will inspect the file.";
   const answer = "The file is valid.";
   const input = [
@@ -135,10 +180,8 @@ test("DeepSeek keeps the later answer visible after tool-call commentary", async
     input,
   ));
 
-  assert.ok(outputEvents.some(
-    (event) =>
-      event.type === "response.reasoning_summary_text.delta" &&
-      event.delta === commentary,
+  assert.ok(!outputEvents.some(
+    (event) => event.type === "response.reasoning_summary_text.delta" && event.delta === commentary,
   ));
   assert.ok(outputEvents.some(
     (event) =>
@@ -146,6 +189,49 @@ test("DeepSeek keeps the later answer visible after tool-call commentary", async
       event.item_id === "msg_answer" &&
       event.delta === answer,
   ));
+});
+
+test("DeepSeek suppresses post-custom-tool commentary", async () => {
+  const commentary = "I will run the command now.";
+  const input = [
+    'data: {"type":"response.output_item.added","output_index":0,"item":{"id":"call_1","type":"custom_tool_call","name":"exec_command","input":"{}"}}\n\n',
+    'data: {"type":"response.output_item.added","output_index":1,"item":{"id":"msg_1","type":"message","role":"assistant","status":"in_progress","content":[]}}\n\n',
+    `data: ${JSON.stringify({ type: "response.output_text.delta", item_id: "msg_1", output_index: 1, content_index: 0, delta: commentary })}\n\n`,
+    `data: ${JSON.stringify({ type: "response.output_item.done", output_index: 1, item: { id: "msg_1", type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: commentary }] } })}\n\n`,
+    `data: ${JSON.stringify({ type: "response.completed", response: { id: "resp_1", output: [{ id: "call_1", type: "custom_tool_call", name: "exec_command", input: "{}" }, { id: "msg_1", type: "message", content: [{ type: "output_text", text: commentary }] }] } })}\n\n`,
+    "data: [DONE]\n\n",
+  ].join("");
+
+  const outputEvents = events(await collect(
+    deepseekReasoningCollapseTransform({ id: "deepseek" }, "text/event-stream"),
+    input,
+  ));
+  const completed = outputEvents.find((event) => event.type === "response.completed");
+  assert.ok(!outputEvents.some(
+    (event) => event.type === "response.output_text.delta" && event.delta === commentary,
+  ));
+  assert.ok(!completed.response.output.some((item) => item.id === "msg_1"));
+});
+
+test("DeepSeek adds an empty reasoning item before a tool turn", async () => {
+  const input = [
+    'data: {"type":"response.output_item.added","output_index":0,"item":{"id":"call_1","type":"custom_tool_call","name":"exec_command","input":"{}"}}\n\n',
+    `data: ${JSON.stringify({ type: "response.completed", response: { id: "resp_1", output: [{ id: "call_1", type: "custom_tool_call", name: "exec_command", input: "{}" }] } })}\n\n`,
+    "data: [DONE]\n\n",
+  ].join("");
+
+  const outputEvents = events(await collect(
+    deepseekReasoningCollapseTransform({ id: "deepseek" }, "text/event-stream"),
+    input,
+  ));
+  const added = outputEvents.find(
+    (event) => event.type === "response.output_item.added" && event.item?.type === "reasoning",
+  );
+  const completed = outputEvents.find((event) => event.type === "response.completed");
+
+  assert.deepEqual(added.item.summary, []);
+  assert.deepEqual(completed.response.output[0].summary, []);
+  assert.equal(completed.response.output[0].type, "reasoning");
 });
 
 test("reasoning collapse leaves other providers alone", () => {

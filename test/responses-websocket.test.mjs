@@ -1042,6 +1042,35 @@ test("turns malformed internal SSE into a bounded WebSocket error", async (t) =>
   peer.close();
 });
 
+test("relays a completed JSON Responses object when the internal endpoint does not stream", async (t) => {
+  const { server, port } = await startServer(async (request, response) => {
+    for await (const _chunk of request) {}
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      id: "resp-json",
+      object: "response",
+      status: "completed",
+      output: [{
+        id: "msg-json",
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "done" }],
+      }],
+      usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+    }));
+  });
+  t.after(() => server.close());
+
+  const { peer } = await connect(port);
+  peer.sendJson(createRequest());
+  assert.equal((await peer.nextJson()).type, "response.created");
+  assert.equal((await peer.nextJson()).type, "response.output_item.done");
+  const completed = await peer.nextJson();
+  assert.equal(completed.type, "response.completed");
+  assert.equal(completed.response.id, "resp-json");
+  peer.close();
+});
+
 test("accepts fragmented text and closes on unmasked or oversized frames", async (t) => {
   const { server, port } = await startServer(
     async (request, response) => {

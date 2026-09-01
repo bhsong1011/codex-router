@@ -718,6 +718,61 @@ class ResponsesWebSocketPeer {
     });
   }
 
+  async relayCompletedJsonResponse(body, fullRequest, upstream) {
+    let completed;
+    try {
+      completed = JSON.parse(body.toString("utf8"));
+    } catch {
+      return false;
+    }
+    if (
+      !completed ||
+      typeof completed !== "object" ||
+      Array.isArray(completed) ||
+      completed.object !== "response" ||
+      completed.status !== "completed" ||
+      typeof completed.id !== "string" ||
+      !Array.isArray(completed.output)
+    ) {
+      return false;
+    }
+    if (!(await sendSuccessfulResponseHeaders(this, upstream))) return true;
+    if (!(await this.sendJsonWithBackpressure({
+      type: "response.created",
+      response: { id: completed.id },
+    }))) return true;
+
+    let outputItemsBytes = 0;
+    let continuationOverflow = false;
+    for (const [output_index, item] of completed.output.entries()) {
+      const itemBytes = Buffer.byteLength(JSON.stringify(item), "utf8");
+      if (outputItemsBytes + itemBytes <= this.options.maxContinuationBytes) {
+        outputItemsBytes += itemBytes;
+      } else {
+        continuationOverflow = true;
+      }
+      if (!(await this.sendJsonWithBackpressure({
+        type: "response.output_item.done",
+        output_index,
+        item,
+      }))) return true;
+    }
+    if (!(await this.sendJsonWithBackpressure({
+      type: "response.completed",
+      response: completed,
+    }))) return true;
+    this.continuations.clear();
+    if (!continuationOverflow) {
+      const continuation = continuationState(
+        fullRequest.input,
+        completed.output,
+        this.options.maxContinuationBytes,
+      );
+      if (continuation) this.continuations.set(completed.id, continuation);
+    }
+    return true;
+  }
+
   fail(code, reason) {
     if (this.closed) return;
     if (!this.closeSent) {
@@ -1000,10 +1055,11 @@ class ResponsesWebSocketPeer {
         this.turnState = { value: responseTurnState, turnId: currentTurnId };
       }
       if (!String(upstream.headers.get("content-type") || "").toLowerCase().includes("text/event-stream")) {
-        await readResponseBody(upstream, {
+        const body = await readResponseBody(upstream, {
           maxBytes: this.options.maxErrorBytes,
           signal: controller.signal,
         });
+        if (await this.relayCompletedJsonResponse(body, fullRequest, upstream)) return;
         this.sendError(502, {
           type: "local_router_protocol_error",
           message: "The internal Responses endpoint returned a non-streaming response.",

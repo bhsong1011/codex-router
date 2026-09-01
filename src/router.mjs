@@ -497,6 +497,7 @@ function beginRequestActivity({ request, response, controller } = {}) {
 }
 
 const FORWARD_HEADERS = new Set([
+  "accept",
   "authorization",
   "chatgpt-account-id",
   "openai-beta",

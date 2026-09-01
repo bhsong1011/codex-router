@@ -1,6 +1,8 @@
 import { Transform } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 
+const MAX_DEFERRED_MESSAGE_BYTES = 64 * 1024;
+
 function eventBlock(block) {
   const newline = block.includes("\r\n") ? "\r\n" : "\n";
   const lines = block.split(/\r?\n/);
@@ -50,6 +52,12 @@ function reasoningText(content) {
     .join("");
 }
 
+function finalAnswerMessage(item) {
+  return item?.type === "message"
+    ? { ...item, phase: "final_answer" }
+    : item;
+}
+
 // DeepSeek's chat-completions translation can surface the full reasoning chain
 // as plaintext `reasoning_text`. Keep the opaque payload for DeepSeek's
 // required follow-up replay, while adding a summary the desktop renders in a
@@ -67,7 +75,9 @@ export class DeepseekReasoningCollapseSseTransform extends Transform {
     this.sawSummary = false;
     this.started = false;
     this.reasoningClosed = false;
+    this.emptyToolReasoning = undefined;
     this.toolCommentaryPending = false;
+    this.deferredMessages = [];
     this.messages = new Map();
   }
 
@@ -92,13 +102,19 @@ export class DeepseekReasoningCollapseSseTransform extends Transform {
       if (parsed) this.handleEvent({ ...parsed, raw: this.buffer, separator: "" });
       else this.push(this.buffer);
     }
+    this.flushDeferredMessages();
     callback();
   }
 
   handleEvent(parsed) {
     const { event } = parsed;
     const type = event?.type;
-    if (type === "response.output_item.added" && event?.item?.type === "function_call") {
+    if (
+      type === "response.output_item.added" &&
+      ["function_call", "custom_tool_call"].includes(event?.item?.type)
+    ) {
+      this.discardDeferredMessages();
+      this.startEmptyToolReasoning(parsed, event.output_index ?? 0);
       this.toolCommentaryPending = true;
       this.push(parsed.raw + parsed.separator);
       return;
@@ -123,10 +139,20 @@ export class DeepseekReasoningCollapseSseTransform extends Transform {
       const state = this.messageState(event.item.id);
       if (this.toolCommentaryPending && state) {
         this.toolCommentaryPending = false;
-        this.startToolCommentary(parsed, state, event);
+        state.suppressed = true;
         return;
       }
-      this.push(parsed.raw + parsed.separator);
+      this.flushDeferredMessages();
+      state.deferred = {
+        blocks: [rewrittenBlock(parsed, {
+          ...event,
+          item: finalAnswerMessage(event.item),
+        }) + parsed.separator],
+        bytes: Buffer.byteLength(parsed.raw + parsed.separator),
+        outputIndex: event.output_index ?? 0,
+        text: "",
+      };
+      this.deferredMessages.push(state);
       return;
     }
     if (type === "response.output_text.delta" && typeof event?.delta === "string") {
@@ -135,45 +161,53 @@ export class DeepseekReasoningCollapseSseTransform extends Transform {
         this.push(parsed.raw + parsed.separator);
         return;
       }
-      if (state.commentary) {
-        this.appendToolCommentary(parsed, state, event.delta);
+      if (state.deferred) {
+        this.appendDeferredMessage(state, parsed, event.delta);
         return;
       }
+      if (state.suppressed) return;
       this.push(parsed.raw + parsed.separator);
       return;
     }
     if (type === "response.output_text.done") {
       const state = this.messages.get(event?.item_id);
-      if (state?.commentary) {
-        this.appendToolCommentary(parsed, state, event.text);
-        this.closeToolCommentary(parsed, state);
+      if (state?.deferred) {
+        this.appendDeferredMessage(state, parsed, event.text);
         return;
       }
+      if (state?.suppressed) return;
     }
     if (type === "response.content_part.done" && event?.part?.type === "output_text") {
       const state = this.messages.get(event?.item_id);
-      if (state?.commentary) {
-        this.appendToolCommentary(parsed, state, event.part.text);
-        this.closeToolCommentary(parsed, state);
+      if (state?.deferred) {
+        this.appendDeferredMessage(state, parsed, event.part.text);
         return;
       }
+      if (state?.suppressed) return;
     }
-    if (type === "response.output_item.done" && event?.item?.type === "function_call") {
+    if (
+      type === "response.output_item.done" &&
+      ["function_call", "custom_tool_call"].includes(event?.item?.type)
+    ) {
+      this.discardDeferredMessages();
+      this.startEmptyToolReasoning(parsed, event.output_index ?? 0);
       this.toolCommentaryPending = true;
       this.push(parsed.raw + parsed.separator);
       return;
     }
     if (type === "response.output_item.done" && event?.item?.type === "message") {
       const state = this.messages.get(event.item.id);
-      if (state?.commentary) {
-        this.appendToolCommentary(
-          parsed,
-          state,
-          outputText(event.item.content),
-        );
-        this.closeToolCommentary(parsed, state);
+      if (state?.deferred) {
+        this.appendDeferredMessage(state, {
+          ...parsed,
+          raw: rewrittenBlock(parsed, {
+            ...event,
+            item: finalAnswerMessage(event.item),
+          }),
+        }, outputText(event.item.content));
         return;
       }
+      if (state?.suppressed) return;
     }
     if (
       type === "response.content_part.done" &&
@@ -234,27 +268,31 @@ export class DeepseekReasoningCollapseSseTransform extends Transform {
       return;
     }
     if (type === "response.completed" && Array.isArray(event?.response?.output)) {
+      this.flushDeferredMessages();
       if (this.started && !this.reasoningClosed) this.closeReasoning(parsed);
-      const output = event.response.output.map((item) => {
+      let changed = false;
+      const sourceOutput = this.emptyToolReasoning
+        ? [this.emptyToolReasoning, ...event.response.output]
+        : event.response.output;
+      const output = sourceOutput.flatMap((item) => {
+        const state = this.messages.get(item?.id);
+        if (state?.suppressed) {
+          changed = true;
+          return [];
+        }
         if (item?.type === "reasoning") {
-          return {
+          return [{
             ...item,
             summary: (Array.isArray(item.summary) && item.summary.length > 0
               ? item.summary
               : this.summaryText
                 ? [{ type: "summary_text", text: this.summaryText }]
                 : []),
-          };
+          }];
         }
-        const state = this.messages.get(item?.id);
-        if (state?.commentary) {
-          this.appendToolCommentary(parsed, state, outputText(item.content));
-          this.closeToolCommentary(parsed, state);
-          return this.toolCommentaryItem(state);
-        }
-        return item;
+        return [finalAnswerMessage(item)];
       });
-      if (output.some((item, index) => item !== event.response.output[index])) {
+      if (changed || output.some((item, index) => item !== event.response.output[index])) {
         this.push(rewrittenBlock(parsed, {
           ...event,
           response: { ...event.response, output },
@@ -292,86 +330,62 @@ export class DeepseekReasoningCollapseSseTransform extends Transform {
     if (typeof id !== "string" || !id) return undefined;
     let state = this.messages.get(id);
     if (!state) {
-      state = { commentary: undefined };
+      state = { deferred: undefined, suppressed: false };
       this.messages.set(id, state);
     }
     return state;
   }
 
-  startToolCommentary(parsed, state, event) {
-    this.seq += 1;
-    state.commentary = {
-      id: `rs_commentary_${Date.now()}_${this.seq}`,
-      outputIndex: event.output_index ?? 0,
-      text: "",
-      closed: false,
-    };
-    const commentary = state.commentary;
-    this.push(syntheticBlock("response.output_item.added", {
-      output_index: commentary.outputIndex,
-      item: {
-        id: commentary.id,
-        type: "reasoning",
-        status: "in_progress",
-        summary: [],
-        content: undefined,
-      },
-    }, parsed) + parsed.separator);
-    this.push(syntheticBlock("response.reasoning_summary_part.added", {
-      item_id: commentary.id,
-      output_index: commentary.outputIndex,
-      summary_index: 0,
-      part: { type: "summary_text", text: "" },
-    }, parsed) + parsed.separator);
-  }
-
-  appendToolCommentary(parsed, state, text) {
-    const commentary = state?.commentary;
-    if (!commentary || commentary.closed || typeof text !== "string" || !text) return;
-    const delta = commentary.text && text.startsWith(commentary.text)
-      ? text.slice(commentary.text.length)
+  appendDeferredMessage(state, parsed, text) {
+    const deferred = state?.deferred;
+    if (!deferred) return;
+    const block = parsed.raw + parsed.separator;
+    deferred.blocks.push(block);
+    deferred.bytes += Buffer.byteLength(block);
+    if (deferred.bytes > MAX_DEFERRED_MESSAGE_BYTES) {
+      this.flushDeferredMessages();
+      return;
+    }
+    if (typeof text !== "string" || !text) return;
+    deferred.text += deferred.text && text.startsWith(deferred.text)
+      ? text.slice(deferred.text.length)
       : text;
-    if (!delta) return;
-    commentary.text += delta;
-    this.push(syntheticBlock("response.reasoning_summary_text.delta", {
-      item_id: commentary.id,
-      output_index: commentary.outputIndex,
-      summary_index: 0,
-      delta,
-    }, parsed) + parsed.separator);
   }
 
-  toolCommentaryItem(state) {
-    const commentary = state.commentary;
-    return {
-      id: commentary.id,
+  flushDeferredMessages() {
+    for (const state of this.deferredMessages.splice(0)) {
+      const deferred = state.deferred;
+      if (!deferred) continue;
+      state.deferred = undefined;
+      this.push(deferred.blocks.join(""));
+    }
+  }
+
+  discardDeferredMessages() {
+    for (const state of this.deferredMessages.splice(0)) {
+      if (!state.deferred) continue;
+      state.deferred = undefined;
+      state.suppressed = true;
+    }
+  }
+
+  startEmptyToolReasoning(parsed, outputIndex) {
+    if (this.started || this.emptyToolReasoning) return;
+    this.seq += 1;
+    const item = {
+      id: `rs_tool_${Date.now()}_${this.seq}`,
       type: "reasoning",
       status: "completed",
-      summary: commentary.text
-        ? [{ type: "summary_text", text: commentary.text }]
-        : [],
+      summary: [],
+      content: [],
     };
-  }
-
-  closeToolCommentary(parsed, state) {
-    const commentary = state?.commentary;
-    if (!commentary || commentary.closed) return;
-    commentary.closed = true;
-    const item = this.toolCommentaryItem(state);
-    this.push(syntheticBlock("response.reasoning_summary_text.done", {
-      item_id: commentary.id,
-      output_index: commentary.outputIndex,
-      summary_index: 0,
-      text: commentary.text,
-    }, parsed) + parsed.separator);
-    this.push(syntheticBlock("response.reasoning_summary_part.done", {
-      item_id: commentary.id,
-      output_index: commentary.outputIndex,
-      summary_index: 0,
-      part: { type: "summary_text", text: commentary.text },
+    this.emptyToolReasoning = item;
+    this.push(syntheticBlock("response.output_item.added", {
+      output_index: outputIndex,
+      item: { ...item, status: "in_progress" },
     }, parsed) + parsed.separator);
     this.push(syntheticBlock("response.output_item.done", {
-      output_index: commentary.outputIndex,
+      output_index: outputIndex,
       item,
     }, parsed) + parsed.separator);
   }
@@ -428,7 +442,7 @@ class DeepseekReasoningCollapseJsonTransform extends Transform {
       const payload = JSON.parse(this.body);
       if (Array.isArray(payload?.output)) {
         payload.output = payload.output.map((item) => {
-          if (item?.type !== "reasoning") return item;
+          if (item?.type !== "reasoning") return finalAnswerMessage(item);
           const text = Array.isArray(item.content)
             ? item.content
                 .filter((part) =>
