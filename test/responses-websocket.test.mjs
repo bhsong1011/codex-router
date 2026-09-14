@@ -600,6 +600,55 @@ test("prewarms locally and reconstructs incremental turns without losing history
   peer.close();
 });
 
+test("keeps streamed output items when the terminal envelope reports an empty output", async (t) => {
+  const bodies = [];
+  const assistant = {
+    type: "function_call",
+    id: "fc_empty_output",
+    call_id: "call_empty_output",
+    name: "shell",
+    arguments: "{}",
+  };
+  const { server, port } = await startServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    bodies.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+    const id = `resp-empty-${bodies.length}`;
+    sse(response, [
+      { type: "response.created", response: { id } },
+      { type: "response.output_item.done", output_index: 0, item: assistant },
+      // The ChatGPT-login backend terminates a tool-call turn with an empty
+      // output array; the item above is the only copy of the call.
+      { type: "response.completed", response: { id, output: [], usage: {} } },
+    ]);
+  });
+  t.after(() => server.close());
+  const { peer } = await connect(port);
+  t.after(() => peer.socket.destroy());
+
+  const initial = createRequest();
+  peer.sendJson(initial);
+  const created = await peer.nextJson();
+  assert.equal(created.type, "response.created");
+  assert.equal((await peer.nextJson()).type, "response.output_item.done");
+  assert.equal((await peer.nextJson()).type, "response.completed");
+
+  const toolResult = {
+    type: "function_call_output",
+    call_id: assistant.call_id,
+    output: "done",
+  };
+  peer.sendJson(createRequest({
+    previous_response_id: created.response.id,
+    input: [toolResult],
+  }));
+  assert.equal((await peer.nextJson()).type, "response.created");
+  assert.equal((await peer.nextJson()).type, "response.output_item.done");
+  assert.equal((await peer.nextJson()).type, "response.completed");
+  assert.deepEqual(bodies[1].input, [...initial.input, assistant, toolResult]);
+  peer.close();
+});
+
 test("wraps HTTP failures and serializes requests on a reused connection", async (t) => {
   let calls = 0;
   let active = 0;
@@ -1068,6 +1117,47 @@ test("relays a completed JSON Responses object when the internal endpoint does n
   const completed = await peer.nextJson();
   assert.equal(completed.type, "response.completed");
   assert.equal(completed.response.id, "resp-json");
+  peer.close();
+});
+
+test("relays SSE when the internal endpoint mislabels its content type", async (t) => {
+  const { server, port } = await startServer(async (request, response) => {
+    for await (const _chunk of request) {}
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end([
+      { type: "response.created", response: { id: "resp-mislabeled-sse" } },
+      { type: "response.completed", response: { id: "resp-mislabeled-sse", usage: {} } },
+    ].map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(""));
+  });
+  t.after(() => server.close());
+
+  const { peer } = await connect(port);
+  peer.sendJson(createRequest());
+  assert.equal((await peer.nextJson()).type, "response.created");
+  assert.equal((await peer.nextJson()).type, "response.completed");
+  peer.close();
+});
+
+test("relays an incomplete JSON Responses object instead of returning a protocol 502", async (t) => {
+  const { server, port } = await startServer(async (request, response) => {
+    for await (const _chunk of request) {}
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      id: "resp-incomplete-json",
+      object: "response",
+      status: "incomplete",
+      incomplete_details: { reason: "max_output_tokens" },
+      output: [],
+    }));
+  });
+  t.after(() => server.close());
+
+  const { peer } = await connect(port);
+  peer.sendJson(createRequest());
+  assert.equal((await peer.nextJson()).type, "response.created");
+  const terminal = await peer.nextJson();
+  assert.equal(terminal.type, "response.incomplete");
+  assert.equal(terminal.response.id, "resp-incomplete-json");
   peer.close();
 });
 

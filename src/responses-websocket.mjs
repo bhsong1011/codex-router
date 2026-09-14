@@ -587,6 +587,38 @@ function errorShape(body, fallback) {
   };
 }
 
+function nonStreamingResponseDiagnostic(body, headers) {
+  const contentType = headers.get("content-type") || undefined;
+  const contentEncoding = headers.get("content-encoding") || undefined;
+  const prefix = body.subarray(0, 16).toString("hex");
+  try {
+    const value = JSON.parse(body.toString("utf8"));
+    return JSON.stringify({
+      bytes: body.length,
+      content_type: contentType,
+      content_encoding: contentEncoding,
+      prefix_hex: prefix,
+      object: typeof value?.object === "string" ? value.object : undefined,
+      status: typeof value?.status === "string" ? value.status : undefined,
+      output_items: Array.isArray(value?.output) ? value.output.length : undefined,
+      error_type: typeof value?.error?.type === "string" ? value.error.type : undefined,
+      error_code: typeof value?.error?.code === "string" ? value.error.code : undefined,
+    });
+  } catch {
+    return JSON.stringify({
+      bytes: body.length,
+      content_type: contentType,
+      content_encoding: contentEncoding,
+      prefix_hex: prefix,
+      invalid_json: true,
+    });
+  }
+}
+
+function looksLikeSse(body) {
+  return /^(?:\uFEFF)?\s*(?:event|data):/.test(body.subarray(0, 128).toString("utf8"));
+}
+
 async function relaySse(body, onEvent, { signal, maxEventBytes }) {
   if (!body) throw new Error("The internal Responses endpoint returned no stream.");
   const reader = body.getReader();
@@ -719,32 +751,32 @@ class ResponsesWebSocketPeer {
   }
 
   async relayCompletedJsonResponse(body, fullRequest, upstream) {
-    let completed;
+    let response;
     try {
-      completed = JSON.parse(body.toString("utf8"));
+      response = JSON.parse(body.toString("utf8"));
     } catch {
       return false;
     }
     if (
-      !completed ||
-      typeof completed !== "object" ||
-      Array.isArray(completed) ||
-      completed.object !== "response" ||
-      completed.status !== "completed" ||
-      typeof completed.id !== "string" ||
-      !Array.isArray(completed.output)
+      !response ||
+      typeof response !== "object" ||
+      Array.isArray(response) ||
+      response.object !== "response" ||
+      !["completed", "incomplete", "failed"].includes(response.status) ||
+      typeof response.id !== "string" ||
+      !Array.isArray(response.output)
     ) {
       return false;
     }
     if (!(await sendSuccessfulResponseHeaders(this, upstream))) return true;
     if (!(await this.sendJsonWithBackpressure({
       type: "response.created",
-      response: { id: completed.id },
+      response: { id: response.id },
     }))) return true;
 
     let outputItemsBytes = 0;
     let continuationOverflow = false;
-    for (const [output_index, item] of completed.output.entries()) {
+    for (const [output_index, item] of response.output.entries()) {
       const itemBytes = Buffer.byteLength(JSON.stringify(item), "utf8");
       if (outputItemsBytes + itemBytes <= this.options.maxContinuationBytes) {
         outputItemsBytes += itemBytes;
@@ -758,17 +790,17 @@ class ResponsesWebSocketPeer {
       }))) return true;
     }
     if (!(await this.sendJsonWithBackpressure({
-      type: "response.completed",
-      response: completed,
+      type: `response.${response.status}`,
+      response,
     }))) return true;
     this.continuations.clear();
-    if (!continuationOverflow) {
+    if (response.status === "completed" && !continuationOverflow) {
       const continuation = continuationState(
         fullRequest.input,
-        completed.output,
+        response.output,
         this.options.maxContinuationBytes,
       );
-      if (continuation) this.continuations.set(completed.id, continuation);
+      if (continuation) this.continuations.set(response.id, continuation);
     }
     return true;
   }
@@ -1054,17 +1086,28 @@ class ResponsesWebSocketPeer {
       ) {
         this.turnState = { value: responseTurnState, turnId: currentTurnId };
       }
+      let sseBody = upstream.body;
       if (!String(upstream.headers.get("content-type") || "").toLowerCase().includes("text/event-stream")) {
         const body = await readResponseBody(upstream, {
           maxBytes: this.options.maxContinuationBytes,
           signal: controller.signal,
         });
         if (await this.relayCompletedJsonResponse(body, fullRequest, upstream)) return;
-        this.sendError(502, {
-          type: "local_router_protocol_error",
-          message: "The internal Responses endpoint returned a non-streaming response.",
-        });
-        return;
+        if (looksLikeSse(body)) {
+          sseBody = new Response(body).body;
+        } else {
+          console.error(
+            `[codex-router] unhandled non-streaming Responses response ${nonStreamingResponseDiagnostic(
+              body,
+              upstream.headers,
+            )}`,
+          );
+          this.sendError(502, {
+            type: "local_router_protocol_error",
+            message: "The internal Responses endpoint returned a non-streaming response.",
+          });
+          return;
+        }
       }
       if (!(await sendSuccessfulResponseHeaders(this, upstream))) return;
       const outputItems = [];
@@ -1074,7 +1117,7 @@ class ResponsesWebSocketPeer {
       let terminalFailure = false;
       let terminalSeen = false;
       await relaySse(
-        upstream.body,
+        sseBody,
         async (data) => {
           let event;
           try {
@@ -1118,7 +1161,15 @@ class ResponsesWebSocketPeer {
         },
       );
       if (completed?.id && !terminalFailure) {
-        const output = Array.isArray(completed.output) ? completed.output : outputItems;
+        // A provider may report `output: []` on the terminal envelope while
+        // still having streamed the items as `response.output_item.done`; the
+        // ChatGPT-login backend does this on every tool-call turn. Preferring
+        // the empty array would persist a continuation whose tool call is
+        // missing, and the next turn's function_call_output is then rejected
+        // with "No tool call found for function call output with call_id ...".
+        const output = Array.isArray(completed.output) && completed.output.length > 0
+          ? completed.output
+          : outputItems;
         this.continuations.clear();
         const continuation = !continuationOverflow
           ? continuationState(
