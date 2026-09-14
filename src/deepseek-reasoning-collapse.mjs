@@ -136,23 +136,7 @@ export class DeepseekReasoningCollapseSseTransform extends Transform {
       return;
     }
     if (type === "response.output_item.added" && event?.item?.type === "message") {
-      const state = this.messageState(event.item.id);
-      if (this.toolCommentaryPending && state) {
-        this.toolCommentaryPending = false;
-        state.suppressed = true;
-        return;
-      }
-      this.flushDeferredMessages();
-      state.deferred = {
-        blocks: [rewrittenBlock(parsed, {
-          ...event,
-          item: finalAnswerMessage(event.item),
-        }) + parsed.separator],
-        bytes: Buffer.byteLength(parsed.raw + parsed.separator),
-        outputIndex: event.output_index ?? 0,
-        text: "",
-      };
-      this.deferredMessages.push(state);
+      this.startMessage(parsed, event.item, event.output_index ?? 0);
       return;
     }
     if (type === "response.output_text.delta" && typeof event?.delta === "string") {
@@ -161,12 +145,27 @@ export class DeepseekReasoningCollapseSseTransform extends Transform {
         this.push(parsed.raw + parsed.separator);
         return;
       }
+      if (!state.deferred && !state.suppressed) this.startMessage(parsed, {
+        id: event.item_id,
+        type: "message",
+        role: "assistant",
+        status: "in_progress",
+        content: [],
+      }, event.output_index ?? 0);
+      if (state.suppressed) return;
+      const delta = this.nextMessageDelta(state, event.delta);
+      if (!delta) return;
+      const normalized = delta === event.delta
+        ? parsed
+        : {
+            ...parsed,
+            raw: rewrittenBlock(parsed, { ...event, delta }),
+          };
       if (state.deferred) {
-        this.appendDeferredMessage(state, parsed, event.delta);
+        this.appendDeferredMessage(state, normalized, delta);
         return;
       }
-      if (state.suppressed) return;
-      this.push(parsed.raw + parsed.separator);
+      this.push(normalized.raw + normalized.separator);
       return;
     }
     if (type === "response.output_text.done") {
@@ -196,7 +195,10 @@ export class DeepseekReasoningCollapseSseTransform extends Transform {
       return;
     }
     if (type === "response.output_item.done" && event?.item?.type === "message") {
-      const state = this.messages.get(event.item.id);
+      const state = this.messageState(event.item.id);
+      if (!state.deferred && !state.suppressed) {
+        this.startMessage(parsed, event.item, event.output_index ?? 0);
+      }
       if (state?.deferred) {
         this.appendDeferredMessage(state, {
           ...parsed,
@@ -208,6 +210,11 @@ export class DeepseekReasoningCollapseSseTransform extends Transform {
         return;
       }
       if (state?.suppressed) return;
+      this.push(rewrittenBlock(parsed, {
+        ...event,
+        item: finalAnswerMessage(event.item),
+      }) + parsed.separator);
+      return;
     }
     if (
       type === "response.content_part.done" &&
@@ -330,9 +337,48 @@ export class DeepseekReasoningCollapseSseTransform extends Transform {
     if (typeof id !== "string" || !id) return undefined;
     let state = this.messages.get(id);
     if (!state) {
-      state = { deferred: undefined, suppressed: false };
+      state = { deferred: undefined, suppressed: false, emittedText: "" };
       this.messages.set(id, state);
     }
+    return state;
+  }
+
+  nextMessageDelta(state, text) {
+    if (!text) return "";
+    const prior = state.emittedText;
+    const delta = prior && text.startsWith(prior) ? text.slice(prior.length) : text;
+    state.emittedText += delta;
+    return delta;
+  }
+
+  startMessage(parsed, item, outputIndex) {
+    const state = this.messageState(item?.id);
+    if (!state || state.deferred || state.suppressed) return state;
+    if (this.toolCommentaryPending) {
+      this.toolCommentaryPending = false;
+      state.suppressed = true;
+      return state;
+    }
+    this.flushDeferredMessages();
+    const event = parsed.event?.type === "response.output_item.added"
+      ? { ...parsed.event, item: finalAnswerMessage(item) }
+      : {
+          output_index: outputIndex,
+          item: finalAnswerMessage({
+            ...item,
+            status: "in_progress",
+            content: [],
+          }),
+        };
+    const block = parsed.event?.type === "response.output_item.added"
+      ? rewrittenBlock(parsed, event)
+      : syntheticBlock("response.output_item.added", event, parsed);
+    state.deferred = {
+      blocks: [block + parsed.separator],
+      bytes: Buffer.byteLength(block + parsed.separator),
+      outputIndex,
+    };
+    this.deferredMessages.push(state);
     return state;
   }
 
@@ -346,10 +392,6 @@ export class DeepseekReasoningCollapseSseTransform extends Transform {
       this.flushDeferredMessages();
       return;
     }
-    if (typeof text !== "string" || !text) return;
-    deferred.text += deferred.text && text.startsWith(deferred.text)
-      ? text.slice(deferred.text.length)
-      : text;
   }
 
   flushDeferredMessages() {

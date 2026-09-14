@@ -113,6 +113,31 @@ test("DeepSeek suppresses post-tool commentary", async () => {
   assert.ok(completed.response.output.some((item) => item.id === "call_1"));
 });
 
+test("DeepSeek suppresses post-tool commentary without an added event", async () => {
+  const commentary = "I will inspect the running container first.";
+  const input = [
+    'data: {"type":"response.output_item.added","output_index":0,"item":{"id":"call_1","type":"function_call","name":"exec_command","arguments":"{}"}}\n\n',
+    `data: ${JSON.stringify({ type: "response.output_text.delta", item_id: "msg_1", output_index: 1, content_index: 0, delta: commentary })}\n\n`,
+    `data: ${JSON.stringify({ type: "response.output_item.done", output_index: 1, item: { id: "msg_1", type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: commentary }] } })}\n\n`,
+    `data: ${JSON.stringify({ type: "response.completed", response: { id: "resp_1", output: [{ id: "call_1", type: "function_call", name: "exec_command", arguments: "{}" }, { id: "msg_1", type: "message", content: [{ type: "output_text", text: commentary }] }] } })}\n\n`,
+    "data: [DONE]\n\n",
+  ].join("");
+
+  const outputEvents = events(await collect(
+    deepseekReasoningCollapseTransform({ id: "deepseek" }, "text/event-stream"),
+    input,
+  ));
+  const completed = outputEvents.find((event) => event.type === "response.completed");
+
+  assert.ok(!outputEvents.some(
+    (event) => event.type === "response.output_text.delta" && event.delta === commentary,
+  ));
+  assert.ok(!outputEvents.some(
+    (event) => event.type === "response.output_item.done" && event.item?.id === "msg_1",
+  ));
+  assert.ok(!completed.response.output.some((item) => item.id === "msg_1"));
+});
+
 test("DeepSeek suppresses pre-tool commentary", async () => {
   const commentary = "I will verify the repository state before changing anything.";
   const input = [
@@ -189,6 +214,50 @@ test("DeepSeek keeps the later answer visible after suppressed tool commentary",
       event.item_id === "msg_answer" &&
       event.delta === answer,
   ));
+});
+
+test("DeepSeek marks a final message when the provider omits its added event", async () => {
+  const input = [
+    `data: ${JSON.stringify({ type: "response.output_text.delta", item_id: "msg_answer", output_index: 0, delta: "done" })}\n\n`,
+    `data: ${JSON.stringify({ type: "response.output_item.done", output_index: 0, item: { id: "msg_answer", type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: "done" }] } })}\n\n`,
+    "data: [DONE]\n\n",
+  ].join("");
+
+  const outputEvents = events(await collect(
+    deepseekReasoningCollapseTransform({ id: "deepseek" }, "text/event-stream"),
+    input,
+  ));
+  const added = outputEvents.find((event) => event.type === "response.output_item.added");
+  const done = outputEvents.find((event) => event.type === "response.output_item.done");
+
+  assert.equal(added.item.id, "msg_answer");
+  assert.equal(added.item.phase, "final_answer");
+  assert.equal(done.item.phase, "final_answer");
+});
+
+test("DeepSeek converts cumulative text deltas into incremental deltas", async () => {
+  const input = [
+    'data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_1","type":"message","role":"assistant","status":"in_progress","content":[]}}\n\n',
+    'data: {"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"delta":"I found the requirements."}\n\n',
+    'data: {"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"delta":"I found the requirements. Next I will compare versions."}\n\n',
+    'data: {"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"delta":"I found the requirements. Next I will compare versions. Then report."}\n\n',
+    'data: {"type":"response.output_item.done","output_index":0,"item":{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"I found the requirements. Next I will compare versions. Then report."}]}}\n\n',
+    'data: {"type":"response.completed","response":{"id":"resp_1","output":[{"id":"msg_1","type":"message","content":[]}]}}\n\n',
+  ].join("");
+
+  const outputEvents = events(await collect(
+    deepseekReasoningCollapseTransform({ id: "deepseek" }, "text/event-stream"),
+    input,
+  ));
+  const deltas = outputEvents
+    .filter((event) => event.type === "response.output_text.delta")
+    .map((event) => event.delta);
+
+  assert.deepEqual(deltas, [
+    "I found the requirements.",
+    " Next I will compare versions.",
+    " Then report.",
+  ]);
 });
 
 test("DeepSeek suppresses post-custom-tool commentary", async () => {
