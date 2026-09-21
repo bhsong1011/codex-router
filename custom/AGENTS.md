@@ -47,6 +47,25 @@ the intended role and its requirements in the task text instead. This avoids
 the Codex generic-agent path that can create a DeepSeek child without
 delivering its task payload.
 
+### DeepSeek progress contract
+
+Give every DeepSeek child one bounded deliverable with explicit files, an
+expected verification command, and a success criterion.
+
+- Before a build, test, or research phase likely to take more than a few
+  minutes, emit a concise visible checkpoint: files inspected, current
+  hypothesis or finding, next command, and any blocker. Do not expose private
+  reasoning.
+- Do not spend a long opaque reasoning phase before the first observable
+  inspection or action.
+- A parent treats the UI thinking indicator as liveness only. Evidence of
+  progress is a checkpoint, tool result, file diff, running process, test
+  result, or final answer.
+- If a child has no checkpoint after a short bounded wait, request a status
+  checkpoint. For OpenAI-parent to DeepSeek-child communication, recreate the
+  child task file with a new token first; for DeepSeek-parent children, send
+  the request as the normal task message.
+
 ### Provider routing
 
 - OpenAI parent, OpenAI/chatgpt-login child: use `spawn_agent` normally with the real task in `message`. The encrypted channel is required.
