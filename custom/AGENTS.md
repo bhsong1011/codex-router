@@ -65,6 +65,7 @@ delivering its task payload.
 2. Call `spawn_agent` with `task_name: <NAME>`, `message: "READ_TASK_FILE"`, `fork_turns: "none"`, and the non-OpenAI `agent_type`.
 3. After the child finishes, verify its first response contains the exact `TOKEN` from the file. If not, rewrite the file and retry via `send_message`/`followup_task` with `target: <NAME>` and `message: "READ_TASK_FILE"`.
 4. In task-file mode, the file is authoritative; the spawn/message `message` field is never authoritative.
+5. Every later `followup_task` in task-file mode is a new task. Before sending `READ_TASK_FILE`, recreate `.codex-agent-tasks/<existing-child-task-name>.md` with the complete follow-up task and a new token; the child deletes its file after each task. Never send `READ_TASK_FILE` to an existing child without a fresh file, and verify its next response contains the new token.
 
 ### Child task delivery rules (non-OpenAI subagents)
 
