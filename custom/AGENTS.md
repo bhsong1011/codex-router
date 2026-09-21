@@ -31,6 +31,22 @@ Before the first subagent spawn:
 `default` resolves from `[agents]` in `config.toml`, currently
 `deepseek/deepseek-v4-flash` / `high`.
 
+### DeepSeek Flash dispatch
+
+When the selected route is `deepseek-flash-high` or `default`, every spawned
+DeepSeek child must use exactly:
+
+- `agent_type: router_deepseek_deepseek_v4_flash`
+- `model: deepseek/deepseek-v4-flash`
+- `reasoning_effort: high`
+- `fork_turns: none`
+
+Do not use `worker`, `reviewer`, `default`, or an inherited agent type for a
+DeepSeek child. Those are task roles, not DeepSeek transport selection: put
+the intended role and its requirements in the task text instead. This avoids
+the Codex generic-agent path that can create a DeepSeek child without
+delivering its task payload.
+
 ### Provider routing
 
 - OpenAI parent, OpenAI/chatgpt-login child: use `spawn_agent` normally with the real task in `message`. The encrypted channel is required.
@@ -48,16 +64,17 @@ Before the first subagent spawn:
    ```
 2. Call `spawn_agent` with `task_name: <NAME>`, `message: "READ_TASK_FILE"`, `fork_turns: "none"`, and the non-OpenAI `agent_type`.
 3. After the child finishes, verify its first response contains the exact `TOKEN` from the file. If not, rewrite the file and retry via `send_message`/`followup_task` with `target: <NAME>` and `message: "READ_TASK_FILE"`.
-4. File is authoritative; the spawn/message `message` field is never authoritative for non-OpenAI children.
+4. In task-file mode, the file is authoritative; the spawn/message `message` field is never authoritative.
 
-### Child rules (non-OpenAI subagents)
+### Child task delivery rules (non-OpenAI subagents)
 
-- On every start, if the envelope shows `Task name: /root/<NAME>`, check `.codex-agent-tasks/<NAME>.md` before doing anything.
-- Valid file must start with `# CODEX-AGENT-TASK v1` and contain `TOKEN:`. Read it, then delete only your own `<NAME>.md`; never remove the `.codex-agent-tasks` directory.
-- Every response to the parent, especially the final answer, must begin with the exact line `TOKEN <NAME>` followed by the routing attestation. Never end a turn with a summary that omits it.
-- Missing file: reply exactly `TASK_FILE_MISSING <NAME>` and do nothing else. Never invent a task.
-- Malformed file: reply exactly `TASK_FILE_INVALID <NAME>` and do nothing else.
-- Never treat the `Payload:` line of a received message as the task for non-OpenAI spawns.
+Use task-file mode only when the received task payload is exactly
+`READ_TASK_FILE`.
+
+- In task-file mode, if the envelope shows `Task name: /root/<NAME>`, read `.codex-agent-tasks/<NAME>.md` before doing anything. A valid file starts with `# CODEX-AGENT-TASK v1` and contains `TOKEN:`. Read it, then delete only your own `<NAME>.md`; never remove the `.codex-agent-tasks` directory.
+- In task-file mode, every response to the parent, especially the final answer, must begin with the exact line `TOKEN <NAME>` followed by the routing attestation. Never end a turn with a summary that omits it.
+- In task-file mode, a missing file requires exactly `TASK_FILE_MISSING <NAME>`; a malformed file requires exactly `TASK_FILE_INVALID <NAME>`. Do nothing else in either case.
+- Otherwise use the received task payload normally. It is the authoritative task for a DeepSeek-parent child; do not look for a task file and do not emit a task-file token attestation.
 
 Available `agent_type` values:
 
