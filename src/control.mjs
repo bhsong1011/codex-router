@@ -1374,8 +1374,8 @@ async function handleSubagents(action, value, flag, rest = []) {
     const [
       { verifySubagentRoute, firstFailure, recordApplicationEvidence, runDeferred },
       { recordVerification, recordVerificationStarted, clearSubagentProof },
-      { assertCallerSecret, callerBaseUrl },
-      { CALLER_SECRET_PATH, PORTS },
+      { assertCallerSecret, callerBaseUrl, configuredCallerBaseUrl },
+      { CALLER_SECRET_PATH, CONFIG_PATH, PORTS },
       { findCodexBinary },
       { VERSION },
     ] = await Promise.all([
@@ -1394,7 +1394,10 @@ async function handleSubagents(action, value, flag, rest = []) {
     }
     const secret = assertCallerSecret(readFileSync(CALLER_SECRET_PATH, "utf8").trim());
     const codexBin = findCodexBinary();
-    const baseUrl = callerBaseUrl(PORTS.router, secret);
+    const configuredBaseUrl = existsSync(CONFIG_PATH)
+      ? configuredCallerBaseUrl(readFileSync(CONFIG_PATH, "utf8"), secret)
+      : undefined;
+    const baseUrl = configuredBaseUrl || callerBaseUrl(PORTS.router, secret);
     const { CODEX_HOME, MERGED_CATALOG_PATH } = await import("./paths.mjs");
     for (const slug of slugs) recordVerificationStarted(slug);
     const outcomes = await Promise.all(

@@ -14,6 +14,7 @@ import { fileURLToPath } from "node:url";
 import {
   authenticatedRoute,
   callerBaseUrl,
+  configuredCallerBaseUrl,
   geminiBaseUrl,
   isManagedCallerBaseUrl,
   isManagedCodexBaseUrl,
@@ -52,6 +53,14 @@ test("caller capability helpers accept only the secret-bearing path and redact i
     redactCallerUrl(baseUrl),
     "http://127.0.0.1:46192/_codex-router/[REDACTED]/v1",
   );
+});
+
+test("configured caller URL uses only the current capability", () => {
+  const current = callerBaseUrl(4102, CALLER_KEY);
+  const stale = callerBaseUrl(4202, "stale-caller-auth-capability-with-sufficient-length");
+  const config = `base_url = ${JSON.stringify(stale)}\nbase_url = ${JSON.stringify(current)}\n`;
+  assert.equal(configuredCallerBaseUrl(config, CALLER_KEY), current);
+  assert.equal(configuredCallerBaseUrl(`base_url = ${JSON.stringify(stale)}\n`, CALLER_KEY), undefined);
 });
 
 test("managed Codex base accepts secret-bearing and plain authenticated loopback endpoints", () => {

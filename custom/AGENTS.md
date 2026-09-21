@@ -52,8 +52,8 @@ delivering its task payload.
 Give every DeepSeek child one bounded deliverable with explicit files, an
 expected verification command, and a success criterion.
 
-- Before a build, test, or research phase likely to take more than a few
-  minutes, emit a concise visible checkpoint: files inspected, current
+- At the first observable boundary before a long build, test, or research
+  phase, emit a concise visible checkpoint: files inspected, current
   hypothesis or finding, next command, and any blocker. Do not expose private
   reasoning.
 - Do not spend a long opaque reasoning phase before the first observable
@@ -61,15 +61,20 @@ expected verification command, and a success criterion.
 - A parent treats the UI thinking indicator as liveness only. Evidence of
   progress is a checkpoint, tool result, file diff, running process, test
   result, or final answer.
-- If a child has no checkpoint after a short bounded wait, request a status
-  checkpoint. For OpenAI-parent to DeepSeek-child communication, recreate the
-  child task file with a new token first; for DeepSeek-parent children, send
-  the request as the normal task message.
+- Do not interrupt a running DeepSeek child solely because it emits no
+  checkpoint during its first five minutes. After that grace period, request a
+  status checkpoint and wait a further five minutes. Interrupt only when the
+  full ten-minute window has no checkpoint, tool result, file diff, running
+  process, test result, or status reply—or when the user sets a shorter
+  deadline. For OpenAI-parent to DeepSeek-child communication, recreate the
+  child task file with a new token before the status request; for
+  DeepSeek-parent children, send the request as the normal task message.
 
 ### Provider routing
 
 - OpenAI parent, OpenAI/chatgpt-login child: use `spawn_agent` normally with the real task in `message`. The encrypted channel is required.
-- OpenAI parent, non-OpenAI child: use the **task-file protocol** below. Never put task text in `message`.
+- OpenAI parent, DeepSeek Flash child: use the `codex_router_deepseek_delegation` MCP tools instead of `spawn_agent`. Call `deepseek_delegate` with the real task and cwd, then manage the returned `job_id` through `deepseek_status`, `deepseek_message`, `deepseek_wait`, `deepseek_cancel`, and `deepseek_result`. This is the required route while Codex rejects native OpenAI-to-DeepSeek child spawning. Do not use task files for this route.
+- OpenAI parent, non-OpenAI non-DeepSeek child: use the **task-file protocol** below. Never put task text in `message`.
 - DeepSeek parent, any child: use `spawn_agent` normally with the real task in `message`; plaintext delivery works. Do not use the task-file protocol.
 
 ### Task-file protocol (OpenAI parent -> non-OpenAI child)

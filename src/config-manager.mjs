@@ -79,6 +79,10 @@ const standaloneWebSearchStartMarker =
   "# BEGIN codex-router-standalone-web-search-managed";
 const standaloneWebSearchEndMarker =
   "# END codex-router-standalone-web-search-managed";
+const delegationMcpStartMarker =
+  "# BEGIN codex-router-deepseek-delegation-mcp-managed";
+const delegationMcpEndMarker =
+  "# END codex-router-deepseek-delegation-mcp-managed";
 const createdAgentsTableMarker = "# codex-router-created-agents-table";
 const managedAgentMaxConcurrency = 6;
 // Codex 0.147 records a child's FINAL_ANSWER as subAgentActivity
@@ -145,6 +149,7 @@ const markerPairs = [
   [agentConcurrencyStartMarker, agentConcurrencyEndMarker],
   [multiAgentV2StartMarker, multiAgentV2EndMarker],
   [standaloneWebSearchStartMarker, standaloneWebSearchEndMarker],
+  [delegationMcpStartMarker, delegationMcpEndMarker, "[mcp_servers.codex_router_deepseek_delegation]"],
   ["# BEGIN kimi-codex-router-managed", "# END kimi-codex-router-managed"],
   ["# BEGIN kimi-codex-proxy-managed", "# END kimi-codex-proxy-managed"],
 ];
@@ -714,11 +719,19 @@ function managedLoginFreeProviderBlockLegacy(providerId, baseUrl) {
   ].join("\n");
 }
 
+// Older managed releases advertised the websocket transport even though the
+// local Responses router does not provide it. Treat that exact prior shape as
+// owned so a normal enable can safely normalize it to the current false value.
+function legacyWebsocketAdvertisement(block) {
+  return block.replace("supports_websockets = false", "supports_websockets = true");
+}
+
 function managedSignedProviderBlockMatches(actual, providerId, baseUrl) {
   return [
     managedSignedProviderBlock(providerId, baseUrl),
     managedSignedProviderBlockHttpFallback(providerId, baseUrl),
     managedSignedProviderBlockLegacy(providerId, baseUrl),
+    legacyWebsocketAdvertisement(managedSignedProviderBlock(providerId, baseUrl)),
   ].includes(actual);
 }
 
@@ -727,6 +740,7 @@ function managedLoginFreeProviderBlockMatches(actual, providerId, baseUrl) {
     managedLoginFreeProviderBlock(providerId, baseUrl),
     managedLoginFreeProviderBlockHttpFallback(providerId, baseUrl),
     managedLoginFreeProviderBlockLegacy(providerId, baseUrl),
+    legacyWebsocketAdvertisement(managedLoginFreeProviderBlock(providerId, baseUrl)),
   ].includes(actual);
 }
 
@@ -1347,11 +1361,16 @@ function enabledContents(contents, { loginFreeProvider = false } = {}) {
       `Refusing to replace user-owned model provider ${routerProviderId}.`,
     );
   }
-  const routerBaseUrl = configuredRouterBaseUrl();
   const cleaned = clean(contentsWithoutLegacyProvider);
   let rootLines = trimBlankEdges(cleaned.rootLines);
   const existingBase = rootValue(rootLines, "openai_base_url");
   const existingCatalog = rootValue(rootLines, "model_catalog_json");
+  // The service can intentionally run on a non-default managed loopback
+  // port.  Keep the endpoint Codex is already using instead of rewriting it
+  // to this checkout's fallback while adding an unrelated managed feature.
+  const routerBaseUrl = existingBase && isManagedRouterBaseUrl(existingBase)
+    ? existingBase
+    : configuredRouterBaseUrl();
   if (existingBase && existingBase !== routerBaseUrl) {
     throw new Error(
       `Refusing to replace user-owned openai_base_url: ${redactCallerUrl(existingBase)}`,
@@ -1392,12 +1411,6 @@ function enabledContents(contents, { loginFreeProvider = false } = {}) {
     endMarker,
   );
   const tableLines = trimBlankEdges(cleaned.tableLines);
-  const next = [
-    ...trimBlankEdges(rootLines),
-    "",
-    ...tableLines,
-    ...(tableLines.length ? [""] : []),
-  ];
   const providerBlock = [
     providerStartMarker,
     `[model_providers.${routerProviderId}]`,
@@ -1413,8 +1426,29 @@ function enabledContents(contents, { loginFreeProvider = false } = {}) {
       : ["requires_openai_auth = true"]),
     providerEndMarker,
   ];
+  const delegationMcpBlock = [
+    delegationMcpStartMarker,
+    "[mcp_servers.codex_router_deepseek_delegation]",
+    `command = ${tomlValue(process.execPath)}`,
+    `args = [${tomlValue(path.join(SOURCE_ROOT, "src", "deepseek-delegation-mcp.mjs"))}]`,
+    "startup_timeout_sec = 10",
+    delegationMcpEndMarker,
+  ];
   return withManagedAgentConcurrency(
-    `${withManagedMultiAgentV2(`${next.join("\n").trimEnd()}\n`).trimEnd()}\n\n${providerBlock.join("\n")}\n`,
+    // Keep this unrelated table before every provider table. Provider ownership
+    // snapshots include nested provider tables up to the next TOML header; a
+    // marker after a user provider would otherwise become false user drift.
+    `${withManagedMultiAgentV2(
+      [
+        ...trimBlankEdges(rootLines),
+        "",
+        ...delegationMcpBlock,
+        "",
+        ...tableLines,
+        ...(tableLines.length ? [""] : []),
+        ...providerBlock,
+      ].join("\n").trimEnd() + "\n",
+    ).trimEnd()}\n`,
   );
 }
 

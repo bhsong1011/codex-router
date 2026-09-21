@@ -10,6 +10,7 @@ test("control health preserves the safe UI contract without returning capability
   const result = await readControlHealth({
     routerPort: 43210,
     readCallerSecret: () => `${CALLER_SECRET}\n`,
+    readConfig: () => "",
     fetchImpl: async (url, options) => {
       requests.push({ url, options });
       return {
@@ -51,6 +52,37 @@ test("control health preserves the safe UI contract without returning capability
     grokOauth: { reachable: true, enabled: false },
   });
   assert.doesNotMatch(JSON.stringify(result), new RegExp(CALLER_SECRET));
+});
+
+test("control health follows the managed endpoint Codex actually uses", async () => {
+  const secret = "x".repeat(32);
+  let requested;
+  const result = await readControlHealth({
+    readCallerSecret: () => secret,
+    readConfig: () => `[model_providers.codex-router]\nbase_url = "http://127.0.0.1:4102/_codex-router/${secret}/v1"\n`,
+    routerPort: 4202,
+    fetchImpl: async (url) => {
+      requested = url;
+      return { ok: true, status: 200, json: async () => ({}) };
+    },
+  });
+  assert.equal(result.ok, true);
+  assert.match(requested, /^http:\/\/127\.0\.0\.1:4102\//);
+});
+
+test("control health accepts the configured plain loopback provider endpoint", async () => {
+  let requested;
+  const result = await readControlHealth({
+    readCallerSecret: () => "x".repeat(32),
+    readConfig: () => 'openai_base_url = "http://127.0.0.1:4102/v1"\n',
+    routerPort: 4202,
+    fetchImpl: async (url) => {
+      requested = url;
+      return { ok: true, status: 200, json: async () => ({}) };
+    },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(requested, "http://127.0.0.1:4102/health");
 });
 
 test("control health fails closed before fetch when the caller capability is unavailable", async () => {

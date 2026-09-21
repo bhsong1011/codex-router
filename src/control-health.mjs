@@ -1,7 +1,12 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 
-import { assertCallerSecret, callerBaseUrl } from "./caller-auth.mjs";
-import { CALLER_SECRET_PATH, PORTS } from "./paths.mjs";
+import {
+  assertCallerSecret,
+  callerBaseUrl,
+  configuredCallerBaseUrl,
+  isManagedCodexBaseUrl,
+} from "./caller-auth.mjs";
+import { CALLER_SECRET_PATH, CONFIG_PATH, PORTS } from "./paths.mjs";
 
 const OFFLINE_ACTIVITY = Object.freeze({ state: "offline", active: [], activeCount: 0 });
 
@@ -22,6 +27,23 @@ function safeService(service) {
   };
 }
 
+function configuredHealthUrl(config, secret, routerPort) {
+  const capabilityBase = configuredCallerBaseUrl(config, secret);
+  if (capabilityBase) return `${capabilityBase}/health`;
+  if (typeof config === "string") {
+    const values = config.matchAll(/^\s*(?:openai_)?base_url\s*=\s*"([^"\r\n]+)"\s*$/gm);
+    for (const match of values) {
+      if (!isManagedCodexBaseUrl(match[1])) continue;
+      try {
+        return `${new URL(match[1]).origin}/health`;
+      } catch {
+        // The managed-base predicate already rejected malformed URLs.
+      }
+    }
+  }
+  return `${callerBaseUrl(routerPort, secret)}/health`;
+}
+
 // Read the protected health leaf and project it to the stable, credential-free
 // contract shared by the CLI, tray, and Electron Control Center. Callers may
 // provide fetch/read seams for deterministic tests; production keeps the
@@ -29,6 +51,7 @@ function safeService(service) {
 export async function readControlHealth({
   fetchImpl = globalThis.fetch,
   readCallerSecret = () => readFileSync(CALLER_SECRET_PATH, "utf8"),
+  readConfig = () => (existsSync(CONFIG_PATH) ? readFileSync(CONFIG_PATH, "utf8") : ""),
   routerPort = PORTS.router,
   timeoutMs = 3_000,
 } = {}) {
@@ -40,7 +63,7 @@ export async function readControlHealth({
   }
 
   try {
-    const response = await fetchImpl(`${callerBaseUrl(routerPort, callerSecret)}/health`, {
+    const response = await fetchImpl(configuredHealthUrl(readConfig(), callerSecret, routerPort), {
       headers: { Accept: "application/json" },
       signal: AbortSignal.timeout(timeoutMs),
     });

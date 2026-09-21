@@ -642,12 +642,12 @@ approval_policy = "never"
 
     writeFileSync(
       configPath,
-      loginFreeConfig.replace("supports_websockets = true", "supports_websockets = false"),
+      loginFreeConfig.replace("supports_websockets = false", "supports_websockets = true"),
       { mode: 0o600 },
     );
     const transportUpgrade = run("enable", codexHome, stateDir);
     assert.equal(transportUpgrade.login_free_managed, true);
-    assert.match(readFileSync(configPath, "utf8"), /supports_websockets = true/);
+    assert.match(readFileSync(configPath, "utf8"), /supports_websockets = false/);
     assert.deepEqual(JSON.parse(readFileSync(providerModePath, "utf8")), originalState);
 
     writeFileSync(
@@ -1532,7 +1532,7 @@ Authorization = "Bearer PROVIDER_HEADER_SECRET"
     assert.match(configured, /base_url = "http:\/\/127\.0\.0\.1:46192\/v1"/);
     assert.doesNotMatch(configured, new RegExp(CALLER_KEY));
     assert.match(configured, /requires_openai_auth = true/);
-    assert.match(configured, /supports_websockets = true/);
+    assert.match(configured, /supports_websockets = false/);
     assert.match(configured, /^supports_standalone_web_search = true$/m);
     assert.doesNotMatch(configured, /PROVIDER_(?:QUERY|AUTH|HEADER)_SECRET/);
     assert.doesNotMatch(
@@ -1551,12 +1551,12 @@ Authorization = "Bearer PROVIDER_HEADER_SECRET"
     // misclassifying router-owned state as a user edit.
     writeFileSync(
       configPath,
-      configured.replace("supports_websockets = true", "supports_websockets = false"),
+      configured.replace("supports_websockets = false", "supports_websockets = true"),
       { mode: 0o600 },
     );
     const upgraded = run("enable", codexHome, stateDir);
     assert.equal(upgraded.signed_routing_managed, true);
-    assert.match(readFileSync(configPath, "utf8"), /supports_websockets = true/);
+    assert.match(readFileSync(configPath, "utf8"), /supports_websockets = false/);
 
     const disabled = run("signed-disable", codexHome, stateDir);
     assert.equal(disabled.model_provider, "custom");

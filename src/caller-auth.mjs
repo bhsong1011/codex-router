@@ -105,6 +105,27 @@ export function isManagedCallerBaseUrl(value, port) {
   return isManagedLeafBaseUrl(value, port, "v1");
 }
 
+// Certification must reach the router instance Codex is actually using. The
+// default port can drift across an upgrade, while the managed config remains
+// the authoritative live endpoint. Accept only a local caller URL bearing the
+// current capability; unrelated user provider URLs cannot become a probe sink.
+export function configuredCallerBaseUrl(config, secret) {
+  if (typeof config !== "string" || !validCallerSecret(secret)) return undefined;
+  const values = config.matchAll(/^\s*base_url\s*=\s*"([^"\r\n]+)"\s*$/gm);
+  for (const match of values) {
+    const value = match[1];
+    if (!isManagedCallerBaseUrl(value)) continue;
+    try {
+      if (authenticatedRoute(new URL(value).pathname, secret) === "/v1") {
+        return value.replace(/\/$/, "");
+      }
+    } catch {
+      // `isManagedCallerBaseUrl` already rejected malformed URLs.
+    }
+  }
+  return undefined;
+}
+
 // Codex can authenticate the router either with the legacy path capability or
 // with a bearer sent to the plain loopback Responses endpoint.
 export function isManagedCodexBaseUrl(value, port) {
