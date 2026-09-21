@@ -158,6 +158,7 @@ export function buildQuotaCards({ account, providerUsage, providerSetup } = {}) 
 
   if (account?.primary) add("openai", "ChatGPT", account.primary);
   if (account?.secondary) add("openai", "ChatGPT", account.secondary);
+  if (account?.monthly) add("openai", "ChatGPT", account.monthly);
 
   const configured = new Set(
     (providerSetup?.providers || [])

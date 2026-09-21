@@ -402,6 +402,7 @@ export interface AccountUsage {
   planType?: string;
   primary?: UsageMetric | null;
   secondary?: UsageMetric | null;
+  monthly?: UsageMetric | null;
   dailyUsageBuckets?: UsageBucket[];
   summary?: {
     lifetimeTokens?: number;

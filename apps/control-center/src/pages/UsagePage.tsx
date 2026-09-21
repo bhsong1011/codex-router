@@ -1265,12 +1265,12 @@ function UsageLoading() {
 
 function codexAccountMetrics(account: AccountUsage): UsageMetric[] {
   const metrics: UsageMetric[] = [];
-  [account.primary, account.secondary].forEach((window, index) => {
+  [account.primary, account.secondary, account.monthly].forEach((window, index) => {
     if (!window) return;
     metrics.push({
       ...window,
       kind: "quota",
-      label: limitWindowLabel(window.windowDurationMins, index),
+      label: window.label || limitWindowLabel(window.windowDurationMins, index),
       detail: account.planType ? `${friendlyPlanName(account.planType)} plan` : "ChatGPT account limit",
     });
   });

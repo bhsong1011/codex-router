@@ -649,7 +649,10 @@ async function runSetApply(provider, desired) {
 
 async function printAccountUsage() {
   const { readCodexAccountUsage } = await import("./codex-account-usage.mjs");
-  process.stdout.write(`${JSON.stringify(await readCodexAccountUsage(), null, 2)}\n`);
+  const { readCodexMonthlyUsage } = await import("./codex-monthly-usage.mjs");
+  const account = await readCodexAccountUsage();
+  const monthly = await readCodexMonthlyUsage().catch(() => null);
+  process.stdout.write(`${JSON.stringify(monthly ? { ...account, monthly } : account, null, 2)}\n`);
 }
 
 async function printProviderUsage() {
