@@ -2047,7 +2047,9 @@ function customToolInput(
   if (!jsonArgumentsAreUnambiguous(argumentsText)) return undefined;
   try {
     const parsed = JSON.parse(argumentsText);
-    return typeof parsed?.[property] === "string" ? parsed[property] : undefined;
+    const properties = Array.isArray(property) ? property : [property];
+    const matches = properties.filter((key) => typeof parsed?.[key] === "string");
+    return matches.length === 1 ? parsed[matches[0]] : undefined;
   } catch {
     return undefined;
   }
@@ -2245,6 +2247,10 @@ function appendInterruptCallsToOutput(output, pending, interrupted) {
 
 const CUSTOM_TOOL_OPENING_LIMIT = 1024;
 const LITELLM_CUSTOM_TOOL_INPUT_PROPERTY = "content";
+const NATIVE_CUSTOM_TOOL_INPUT_PROPERTIES = Object.freeze([
+  LITELLM_CUSTOM_TOOL_INPUT_PROPERTY,
+  CUSTOM_TOOL_INPUT_PROPERTY,
+]);
 const CUSTOM_TOOL_OPENING_PATTERNS = Object.freeze({
   [CUSTOM_TOOL_INPUT_PROPERTY]: /^\s*\{\s*"input"\s*:\s*"/,
   [LITELLM_CUSTOM_TOOL_INPUT_PROPERTY]: /^\s*\{\s*"content"\s*:\s*"/,
@@ -2274,14 +2280,11 @@ function customToolInputDelta(
   let encoded = fragment;
   if (!state.opened) {
     state.opening += encoded;
-    const openingPattern = CUSTOM_TOOL_OPENING_PATTERNS[property];
-    if (!openingPattern) {
-      state.opening = "";
-      state.invalid = true;
-      return undefined;
-    }
-    const opening = state.opening.match(openingPattern);
-    if (!opening) {
+    const properties = Array.isArray(property) ? property : [property];
+    const openedProperty = properties.find((key) =>
+      CUSTOM_TOOL_OPENING_PATTERNS[key]?.test(state.opening)
+    );
+    if (!openedProperty) {
       if (state.opening.length > CUSTOM_TOOL_OPENING_LIMIT) {
         state.opening = "";
         state.invalid = true;
@@ -2289,6 +2292,8 @@ function customToolInputDelta(
       return undefined;
     }
     state.opened = true;
+    state.property = openedProperty;
+    const opening = state.opening.match(CUSTOM_TOOL_OPENING_PATTERNS[openedProperty]);
     encoded = state.opening.slice(opening[0].length);
     state.opening = "";
   }
@@ -2382,6 +2387,7 @@ export class NamespaceToolCallTransform extends Transform {
   #lookups;
   #sessionModel;
   #pendingInterrupts;
+  #suppressCustomToolDeltas = false;
   #injectOnly = false;
   #interruptedTargets = new Set();
   #lastSequence = 0;
@@ -2405,6 +2411,7 @@ export class NamespaceToolCallTransform extends Transform {
     this.#pendingInterrupts = Array.isArray(options.pendingInterrupts)
       ? [...options.pendingInterrupts]
       : [];
+    this.#suppressCustomToolDeltas = Boolean(options.suppressCustomToolDeltas);
     // Native turns attach this transform only to close finished children. A
     // native stream is otherwise relayed byte-identical, so inject-only mode
     // must not run the namespace rewrites (they exist for routed providers)
@@ -3504,6 +3511,9 @@ export class NamespaceToolCallTransform extends Transform {
           if (matched.state.argumentsDone) {
             return this.#unsafeSseFrame(frame, "special tool call delta after arguments done");
           }
+          if (this.#suppressCustomToolDeltas && matched.state.kind === "custom") {
+            return [];
+          }
           if (matched.state.kind === "tool_search") {
             this.#commitSemanticMutation();
             return [];
@@ -3511,7 +3521,7 @@ export class NamespaceToolCallTransform extends Transform {
           matched.state.sawArgumentDelta = true;
           const argumentProperty =
             matched.state.sourceType === "custom_tool_call"
-              ? LITELLM_CUSTOM_TOOL_INPUT_PROPERTY
+              ? NATIVE_CUSTOM_TOOL_INPUT_PROPERTIES
               : CUSTOM_TOOL_INPUT_PROPERTY;
           const delta = customToolInputDelta(
             matched.state.deltaState,
@@ -3556,7 +3566,7 @@ export class NamespaceToolCallTransform extends Transform {
           }
           const argumentProperty =
             matched.state.sourceType === "custom_tool_call"
-              ? LITELLM_CUSTOM_TOOL_INPUT_PROPERTY
+              ? matched.state.deltaState?.property || NATIVE_CUSTOM_TOOL_INPUT_PROPERTIES
               : CUSTOM_TOOL_INPUT_PROPERTY;
           const input = customToolInput(event.arguments, false, argumentProperty);
           if (input === undefined) {

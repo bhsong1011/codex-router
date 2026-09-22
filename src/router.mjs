@@ -4031,7 +4031,13 @@ async function handleResponses(request, response, requestUrl) {
             route?.slug,
             // A native stream is attached only for the injection, so it must
             // not pick up the routed-provider rewrites on the way through.
-            { pendingInterrupts, injectOnly: !route },
+            {
+              pendingInterrupts,
+              injectOnly: !route,
+              // DeepSeek can revise a custom-tool delta before its completed
+              // arguments arrive. Emit only its validated final input.
+              suppressCustomToolDeltas: route?.provider === "deepseek",
+            },
           ),
         );
       }

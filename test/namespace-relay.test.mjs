@@ -4104,6 +4104,52 @@ test("native custom-tool streams accept LiteLLM content-wrapped legacy argument 
   assert.doesNotMatch(output, /response\.function_call_arguments/u);
 });
 
+test("native custom-tool streams accept standard input-wrapped argument events", async () => {
+  const input = "console.log(6 * 7);\n";
+  const argumentsText = JSON.stringify({ input });
+  const events = [
+    {
+      type: "response.output_item.added",
+      item: {
+        type: "custom_tool_call",
+        id: "call_native_input",
+        call_id: "call_native_input",
+        name: "exec",
+        status: "in_progress",
+        input: "",
+      },
+    },
+    {
+      type: "response.function_call_arguments.delta",
+      item_id: "call_native_input",
+      delta: argumentsText,
+    },
+    {
+      type: "response.function_call_arguments.done",
+      item_id: "call_native_input",
+      arguments: argumentsText,
+    },
+    {
+      type: "response.output_item.done",
+      item: {
+        type: "custom_tool_call",
+        id: "call_native_input",
+        call_id: "call_native_input",
+        name: "exec",
+        status: "completed",
+        input,
+      },
+    },
+  ];
+  const source = events
+    .map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`)
+    .join("");
+  const transform = new NamespaceToolCallTransform(new Map(), "text/event-stream");
+  const output = await collect(Readable.from([Buffer.from(source, "utf8")]).pipe(transform));
+  assert.match(output, /response\.custom_tool_call_input\.done/u);
+  assert.doesNotMatch(output, /response\.function_call_arguments/u);
+});
+
 test("native custom-tool legacy arguments still fail closed when streamed input changes", async () => {
   const opening = {
     type: "response.output_item.added",
@@ -4140,6 +4186,66 @@ test("native custom-tool legacy arguments still fail closed when streamed input 
   );
   assert.equal(error.code, "ERR_NAMESPACE_RELAY_COMMITTED_STREAM");
   assert.match(error.message, /custom tool argument deltas disagree with completed input/u);
+});
+
+test("completion-only custom-tool streams tolerate DeepSeek delta rewrites", async () => {
+  const finalInput = "printf final\n";
+  const events = [
+    {
+      type: "response.output_item.added",
+      item: {
+        type: "custom_tool_call",
+        id: "call_deepseek_delta",
+        call_id: "call_deepseek_delta",
+        name: "exec",
+        status: "in_progress",
+        input: "",
+      },
+    },
+    {
+      type: "response.function_call_arguments.delta",
+      item_id: "call_deepseek_delta",
+      delta: JSON.stringify({ input: "printf partial\n" }),
+    },
+    {
+      type: "response.function_call_arguments.done",
+      item_id: "call_deepseek_delta",
+      arguments: JSON.stringify({ input: finalInput }),
+    },
+    {
+      type: "response.output_item.done",
+      item: {
+        type: "custom_tool_call",
+        id: "call_deepseek_delta",
+        call_id: "call_deepseek_delta",
+        name: "exec",
+        status: "completed",
+        input: finalInput,
+      },
+    },
+  ];
+  const source = events
+    .map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`)
+    .join("");
+  const output = await collect(
+    Readable.from([Buffer.from(source, "utf8")]).pipe(
+      new NamespaceToolCallTransform(new Map(), "text/event-stream", undefined, {
+        suppressCustomToolDeltas: true,
+      }),
+    ),
+  );
+  const payloads = output.split(/\n\n/).filter(Boolean).map((block) =>
+    JSON.parse(block.split("\n").find((line) => line.startsWith("data: ")).slice(6))
+  );
+
+  assert.equal(
+    payloads.some((event) => event.type === "response.custom_tool_call_input.delta"),
+    false,
+  );
+  assert.equal(
+    payloads.find((event) => event.type === "response.custom_tool_call_input.done")?.input,
+    finalInput,
+  );
 });
 
 test("a bridged custom tool without a grammar carries only what it was given", () => {
