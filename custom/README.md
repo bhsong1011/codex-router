@@ -19,6 +19,11 @@ upstream `main` (`43deff5`).
   after replaying the failure against upstream (see `custom/NOTES.md`).
 - Routed models advertise `multi_agent_version: "v2"` through upstream's
   catalog so v2 sessions can spawn them.
+- `apps/desktop` tray companion: the Tauri system-tray app and top-center
+  activity pill. Carries the Node >= 22.19 resolution fix, the OpenAI-reported
+  workspace monthly cap, per-account ChatGPT limits, and provider balance rows.
+  Upstream removed this app in `a597f63`, so `custom/apps/desktop` is the
+  source of truth; `apply-patches.sh --tray` restores it.
 
 ## Cross-provider subagent matrix
 
@@ -44,6 +49,8 @@ copy of the global `~/.codex/AGENTS.md` rules.
 6. Enable providers and restart:
    `bin/model-router codex provider-selection` then `bin/model-router codex doctor`
 7. Fully restart Codex desktop.
+8. Tray companion (optional): `./custom/apply-patches.sh --tray .`, then build
+   `apps/desktop` with Rust + Tauri and start it at login.
 
 ## Maintenance
 

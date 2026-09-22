@@ -7,11 +7,12 @@ AGENTS_DST="${CODEX_HOME:-$HOME/.codex}/AGENTS.md"
 
 usage() {
   cat <<EOF
-Usage: $0 [--router] [--scaffold-inbox DIR] [--apply-stock ROUTER_REPO]
+Usage: $0 [--router] [--scaffold-inbox DIR] [--apply-stock ROUTER_REPO] [--tray ROUTER_REPO]
 
   --router             install global AGENTS.md rules (default)
   --scaffold-inbox DIR create DIR/.codex-agent-tasks/.gitignore
   --apply-stock REPO   apply router.patch to a stock router checkout
+  --tray REPO          restore the apps/desktop tray companion into REPO
 EOF
 }
 
@@ -39,15 +40,29 @@ apply_stock() {
   echo "[router] applied custom/router.patch to $repo"
 }
 
+install_tray() {
+  local repo="$1"
+  if [[ ! -d "$repo" ]]; then
+    echo "[tray] no such checkout: $repo" >&2
+    return 1
+  fi
+  mkdir -p "$repo/apps/desktop" "$repo/test"
+  cp -R "$SCRIPT_DIR/apps/desktop/." "$repo/apps/desktop/"
+  cp "$SCRIPT_DIR/test/desktop-ui.test.mjs" "$repo/test/desktop-ui.test.mjs"
+  echo "[tray] restored apps/desktop and test/desktop-ui.test.mjs into $repo"
+}
+
 mode="router"
 inbox_dir=""
 stock_repo=""
+tray_repo=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --router) mode="router" ;;
     --scaffold-inbox) inbox_dir="$2"; shift ;;
     --apply-stock) stock_repo="$2"; shift ;;
+    --tray) tray_repo="$2"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage; exit 1 ;;
   esac
@@ -56,6 +71,9 @@ done
 
 if [[ -n "$stock_repo" ]]; then
   apply_stock "$stock_repo"
+fi
+if [[ -n "$tray_repo" ]]; then
+  install_tray "$tray_repo"
 fi
 if [[ "$mode" == "router" ]]; then
   install_agents
@@ -72,4 +90,6 @@ Post steps:
 3. bin/model-router codex doctor
 4. Build and install the patched Codex CLI from bhsong1011/codex branch custom-v0.151.0
 5. Fully restart Codex desktop
+6. Tray companion (optional): ./custom/apply-patches.sh --tray <checkout>, then build
+   apps/desktop with Rust + Tauri and start it at login
 EOF
