@@ -79,9 +79,11 @@ const standaloneWebSearchStartMarker =
   "# BEGIN codex-router-standalone-web-search-managed";
 const standaloneWebSearchEndMarker =
   "# END codex-router-standalone-web-search-managed";
-const delegationMcpStartMarker =
+// Remove the retired bridge from configurations written by earlier releases.
+// It is cleanup only; enable never recreates this MCP server.
+const retiredDelegationMcpStartMarker =
   "# BEGIN codex-router-deepseek-delegation-mcp-managed";
-const delegationMcpEndMarker =
+const retiredDelegationMcpEndMarker =
   "# END codex-router-deepseek-delegation-mcp-managed";
 const createdAgentsTableMarker = "# codex-router-created-agents-table";
 const managedAgentMaxConcurrency = 6;
@@ -149,7 +151,7 @@ const markerPairs = [
   [agentConcurrencyStartMarker, agentConcurrencyEndMarker],
   [multiAgentV2StartMarker, multiAgentV2EndMarker],
   [standaloneWebSearchStartMarker, standaloneWebSearchEndMarker],
-  [delegationMcpStartMarker, delegationMcpEndMarker, "[mcp_servers.codex_router_deepseek_delegation]"],
+  [retiredDelegationMcpStartMarker, retiredDelegationMcpEndMarker, "[mcp_servers.codex_router_deepseek_delegation]"],
   ["# BEGIN kimi-codex-router-managed", "# END kimi-codex-router-managed"],
   ["# BEGIN kimi-codex-proxy-managed", "# END kimi-codex-proxy-managed"],
 ];
@@ -1426,23 +1428,10 @@ function enabledContents(contents, { loginFreeProvider = false } = {}) {
       : ["requires_openai_auth = true"]),
     providerEndMarker,
   ];
-  const delegationMcpBlock = [
-    delegationMcpStartMarker,
-    "[mcp_servers.codex_router_deepseek_delegation]",
-    `command = ${tomlValue(process.execPath)}`,
-    `args = [${tomlValue(path.join(SOURCE_ROOT, "src", "deepseek-delegation-mcp.mjs"))}]`,
-    "startup_timeout_sec = 10",
-    delegationMcpEndMarker,
-  ];
   return withManagedAgentConcurrency(
-    // Keep this unrelated table before every provider table. Provider ownership
-    // snapshots include nested provider tables up to the next TOML header; a
-    // marker after a user provider would otherwise become false user drift.
     `${withManagedMultiAgentV2(
       [
         ...trimBlankEdges(rootLines),
-        "",
-        ...delegationMcpBlock,
         "",
         ...tableLines,
         ...(tableLines.length ? [""] : []),

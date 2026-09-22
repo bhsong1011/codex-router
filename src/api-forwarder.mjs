@@ -769,8 +769,10 @@ function normalizeBody(buffer, contentType, route) {
     else delete payload.reasoning_effort;
     delete payload.thinking;
   } else if (model.requestProfile === "deepseek-thinking") {
-    payload.thinking = { type: "enabled" };
-    payload.reasoning_effort = deepSeekEffort(payload.reasoning_effort);
+    const disabled = payload.thinking?.type === "disabled" || payload.reasoning_effort === "none";
+    payload.thinking = { type: disabled ? "disabled" : "enabled" };
+    if (disabled) delete payload.reasoning_effort;
+    else payload.reasoning_effort = deepSeekEffort(payload.reasoning_effort);
     delete payload.temperature;
     delete payload.top_p;
     delete payload.presence_penalty;
@@ -780,7 +782,7 @@ function normalizeBody(buffer, contentType, route) {
     // tool calls stay available. Codex sends "required" for the compatibility
     // probe and a function object for the subagent payload relay, so without
     // this both tool calling and routed subagents fail on every thinking model.
-    if (payload.tool_choice !== undefined && payload.tool_choice !== "none") {
+    if (!disabled && payload.tool_choice !== undefined && payload.tool_choice !== "none") {
       payload.tool_choice = "auto";
     }
   } else if (model.requestProfile === "deepseek-nonthinking") {

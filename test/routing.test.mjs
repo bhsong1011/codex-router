@@ -3703,6 +3703,18 @@ test("API forwarder downgrades forced tool choices for DeepSeek thinking models"
     });
     assert.deepEqual(nonThinking.body.thinking, { type: "disabled" });
     assert.equal(nonThinking.body.tool_choice, "required");
+
+    // The router can explicitly disable one continuation when Codex has no
+    // replayable DeepSeek reasoning. The thinking profile must preserve that
+    // request instead of re-enabling thinking downstream.
+    const unavailableReplay = await forward("deepseek-v4-flash", {
+      thinking: { type: "disabled" },
+      reasoning_effort: "high",
+      tool_choice: "required",
+    });
+    assert.deepEqual(unavailableReplay.body.thinking, { type: "disabled" });
+    assert.equal(unavailableReplay.body.reasoning_effort, undefined);
+    assert.equal(unavailableReplay.body.tool_choice, "required");
   } finally {
     await stopChild(forwarder);
     await closeServer(upstream.server);
@@ -8381,6 +8393,63 @@ test("reasoning survives the replay onto tool-call and prose assistant turns ali
       if (previous?.role !== "assistant" || current?.role !== "assistant") continue;
       assert.fail("two assistant messages ended up back to back");
     }
+  } finally {
+    await stopChild(router);
+    await closeServer(gateway.server);
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+// Codex can persist an empty reasoning item for a DeepSeek tool call. The
+// provider requires the exact private reasoning on the next thinking request,
+// which is unavailable to the router. Continue in DeepSeek's documented
+// non-thinking mode rather than inventing or exposing that content.
+test("DeepSeek disables thinking only for an unreplayable tool continuation", async () => {
+  const gatewayBodies = [];
+  const gateway = await mockServer(async (request, response) => {
+    gatewayBodies.push(await bodyJson(request));
+    json(response, 200, { output: [{ type: "message", role: "assistant", content: "ok" }] });
+  });
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "deepseek-unreplayable-thinking-"));
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    MODEL_ROUTER_STATE_DIR: stateDir,
+    CODEX_ROUTER_QUIET: "1",
+  });
+  const input = [
+    { type: "message", role: "user", content: [{ type: "input_text", text: "delegate" }] },
+    { type: "reasoning", id: "rs_missing", summary: [], encrypted_content: null },
+    {
+      type: "function_call",
+      id: "call_agent",
+      call_id: "call_agent",
+      name: "collaboration__spawn_agent",
+      arguments: "{}",
+    },
+    { type: "function_call_output", call_id: "call_agent", output: "spawned" },
+  ];
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const response = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer CODEX_CALLER_SECRET",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "deepseek/deepseek-v4-pro",
+        stream: false,
+        reasoning: { effort: "high" },
+        tools: [{ type: "function", name: "collaboration__spawn_agent", parameters: { type: "object" } }],
+        input,
+      }),
+    });
+    assert.equal(response.status, 200, await response.text());
+    assert.deepEqual(gatewayBodies[0].thinking, { type: "disabled" });
+    assert.equal(gatewayBodies[0].reasoning_effort, undefined);
   } finally {
     await stopChild(router);
     await closeServer(gateway.server);

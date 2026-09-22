@@ -11,9 +11,13 @@ function eventBlock(block) {
   const dataText = lines[dataLineIndex].slice(5).trimStart();
   if (!dataText || dataText === "[DONE]") return undefined;
   try {
-    return { lines, dataLineIndex, newline, event: JSON.parse(dataText) };
+    const event = JSON.parse(dataText);
+    // JSON.parse silently accepts duplicate keys. This transform injects
+    // events, so only canonical JSON is safe to inspect and rewrite.
+    if (JSON.stringify(event) !== dataText) return { opaque: true };
+    return { lines, dataLineIndex, newline, event };
   } catch {
-    return undefined;
+    return { opaque: true };
   }
 }
 
@@ -67,6 +71,7 @@ export class DeepseekReasoningCollapseSseTransform extends Transform {
     super();
     this.decoder = new StringDecoder("utf8");
     this.buffer = "";
+    this.opaque = false;
     this.seq = 0;
     this.reasoningId = undefined;
     this.reasoningContent = [];
@@ -89,7 +94,8 @@ export class DeepseekReasoningCollapseSseTransform extends Transform {
       const block = this.buffer.slice(0, index);
       this.buffer = this.buffer.slice(index + separator.length);
       const parsed = eventBlock(block);
-      if (parsed) this.handleEvent({ ...parsed, raw: block, separator });
+      if (parsed?.opaque) this.opaque = true;
+      if (!this.opaque && parsed?.event) this.handleEvent({ ...parsed, raw: block, separator });
       else this.push(block + separator);
     }
     callback();
@@ -99,7 +105,8 @@ export class DeepseekReasoningCollapseSseTransform extends Transform {
     this.buffer += this.decoder.end();
     if (this.buffer) {
       const parsed = eventBlock(this.buffer);
-      if (parsed) this.handleEvent({ ...parsed, raw: this.buffer, separator: "" });
+      if (parsed?.opaque) this.opaque = true;
+      if (!this.opaque && parsed?.event) this.handleEvent({ ...parsed, raw: this.buffer, separator: "" });
       else this.push(this.buffer);
     }
     this.flushDeferredMessages();

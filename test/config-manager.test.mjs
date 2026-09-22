@@ -228,6 +228,30 @@ approval_policy = "never"
   }
 });
 
+test("enable removes the retired DeepSeek delegation MCP block", () => {
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), "codex-router-retired-mcp-"));
+  const configPath = path.join(codexHome, "config.toml");
+  writeFileSync(
+    configPath,
+    `model = "gpt-5.6-sol"
+# BEGIN codex-router-deepseek-delegation-mcp-managed
+[mcp_servers.codex_router_deepseek_delegation]
+command = "/retired/node"
+args = ["/retired/deepseek-delegation-mcp.mjs"]
+startup_timeout_sec = 10
+# END codex-router-deepseek-delegation-mcp-managed
+`,
+    { mode: 0o600 },
+  );
+  try {
+    run("enable", codexHome);
+    const configured = readFileSync(configPath, "utf8");
+    assert.doesNotMatch(configured, /deepseek-delegation-mcp|codex_router_deepseek_delegation/);
+  } finally {
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
 test("config manager preserves a user-owned standalone web search setting", () => {
   const codexHome = mkdtempSync(path.join(os.tmpdir(), "codex-router-config-"));
   const configPath = path.join(codexHome, "config.toml");

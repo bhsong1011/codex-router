@@ -31,21 +31,32 @@ Before the first subagent spawn:
 `default` resolves from `[agents]` in `config.toml`, currently
 `deepseek/deepseek-v4-flash` / `high`.
 
+`native-terra-high` resolves to `gpt-5.6-terra` / `high` with the normal
+explicit task-role `agent_type`. It is selected only when the user explicitly
+chooses that route.
+
+`personal-terra-high` resolves to `chatgpt-login/gpt-5.6-terra` / `high` with
+the normal explicit task-role `agent_type`. It is selected only when the user
+explicitly chooses that route.
+
 ### DeepSeek Flash dispatch
 
-When the selected route is `deepseek-flash-high` or `default`, every spawned
-DeepSeek child must use exactly:
+When the selected route is `deepseek-flash-high` or `default`, spawn a native
+DeepSeek child with exactly:
 
-- `agent_type: router_deepseek_deepseek_v4_flash`
 - `model: deepseek/deepseek-v4-flash`
 - `reasoning_effort: high`
 - `fork_turns: none`
 
-Do not use `worker`, `reviewer`, `default`, or an inherited agent type for a
-DeepSeek child. Those are task roles, not DeepSeek transport selection: put
-the intended role and its requirements in the task text instead. This avoids
-the Codex generic-agent path that can create a DeepSeek child without
-delivering its task payload.
+Use the normal explicit `agent_type` for the intended role (`default`,
+`worker`, `reviewer`, and so on). Native OA→DS task delivery and follow-up
+messaging are verified; this is the only route that makes the DeepSeek child
+visible in Codex's Subagents view.
+
+The initial DeepSeek turn uses `high`. If Codex has no replayable DeepSeek
+reasoning for a later tool continuation, the router automatically uses that
+continuation's non-thinking mode. Do not expose, invent, or transport private
+reasoning to work around it.
 
 ### DeepSeek progress contract
 
@@ -66,40 +77,16 @@ expected verification command, and a success criterion.
   status checkpoint and wait a further five minutes. Interrupt only when the
   full ten-minute window has no checkpoint, tool result, file diff, running
   process, test result, or status reply—or when the user sets a shorter
-  deadline. For OpenAI-parent to DeepSeek-child communication, recreate the
-  child task file with a new token before the status request; for
-  DeepSeek-parent children, send the request as the normal task message.
+  deadline. Request status with the normal `send_message` or `followup_task`
+  channel.
 
 ### Provider routing
 
-- OpenAI parent, OpenAI/chatgpt-login child: use `spawn_agent` normally with the real task in `message`. The encrypted channel is required.
-- OpenAI parent, DeepSeek Flash child: use the `codex_router_deepseek_delegation` MCP tools instead of `spawn_agent`. Call `deepseek_delegate` with the real task and cwd, then manage the returned `job_id` through `deepseek_status`, `deepseek_message`, `deepseek_wait`, `deepseek_cancel`, and `deepseek_result`. This is the required route while Codex rejects native OpenAI-to-DeepSeek child spawning. Do not use task files for this route.
-- OpenAI parent, non-OpenAI non-DeepSeek child: use the **task-file protocol** below. Never put task text in `message`.
-- DeepSeek parent, any child: use `spawn_agent` normally with the real task in `message`; plaintext delivery works. Do not use the task-file protocol.
-
-### Task-file protocol (OpenAI parent -> non-OpenAI child)
-
-1. Generate a unique task name with `exec_command` (TASK_TEXT is the full task, single line, no unescaped quotes):
-   ```bash
-   mkdir -p .codex-agent-tasks
-   NAME=t$(date +%s%3N)_$(openssl rand -hex 4)
-   printf '# CODEX-AGENT-TASK v1\nTOKEN: %s\nTASK:\n%s\n' "$NAME" "TASK_TEXT_HERE" > ".codex-agent-tasks/${NAME}.md"
-   echo "$NAME"
-   ```
-2. Call `spawn_agent` with `task_name: <NAME>`, `message: "READ_TASK_FILE"`, `fork_turns: "none"`, and the non-OpenAI `agent_type`.
-3. After the child finishes, verify its first response contains the exact `TOKEN` from the file. If not, rewrite the file and retry via `send_message`/`followup_task` with `target: <NAME>` and `message: "READ_TASK_FILE"`.
-4. In task-file mode, the file is authoritative; the spawn/message `message` field is never authoritative.
-5. Every later `followup_task` in task-file mode is a new task. Before sending `READ_TASK_FILE`, recreate `.codex-agent-tasks/<existing-child-task-name>.md` with the complete follow-up task and a new token; the child deletes its file after each task. Never send `READ_TASK_FILE` to an existing child without a fresh file, and verify its next response contains the new token.
-
-### Child task delivery rules (non-OpenAI subagents)
-
-Use task-file mode only when the received task payload is exactly
-`READ_TASK_FILE`.
-
-- In task-file mode, if the envelope shows `Task name: /root/<NAME>`, read `.codex-agent-tasks/<NAME>.md` before doing anything. A valid file starts with `# CODEX-AGENT-TASK v1` and contains `TOKEN:`. Read it, then delete only your own `<NAME>.md`; never remove the `.codex-agent-tasks` directory.
-- In task-file mode, every response to the parent, especially the final answer, must begin with the exact line `TOKEN <NAME>` followed by the routing attestation. Never end a turn with a summary that omits it.
-- In task-file mode, a missing file requires exactly `TASK_FILE_MISSING <NAME>`; a malformed file requires exactly `TASK_FILE_INVALID <NAME>`. Do nothing else in either case.
-- Otherwise use the received task payload normally. It is the authoritative task for a DeepSeek-parent child; do not look for a task file and do not emit a task-file token attestation.
+- OpenAI parent, OpenAI child: use `spawn_agent` normally with the real task in `message`. The encrypted channel is required. For `native-terra-high`, set `model: gpt-5.6-terra`; for `personal-terra-high`, set `model: chatgpt-login/gpt-5.6-terra`; set `reasoning_effort: high` for either route.
+- OpenAI parent, DeepSeek Flash child: use `spawn_agent` normally with the real task in `message`, explicit task-role `agent_type`, `model: deepseek/deepseek-v4-flash`, `reasoning_effort: high`, and `fork_turns: none`. This native route makes DeepSeek visible as a child. If Codex explicitly rejects it, report the rejection; do not use task files or an MCP bridge.
+- DeepSeek parent, DeepSeek Flash child: use the same direct native DeepSeek spawn and exact DS model/effort/fork settings as OpenAI→DeepSeek.
+- DeepSeek parent, OpenAI child: use `spawn_agent` normally with the real task in `message`. It requires the user's explicit `native-terra-high` or `personal-terra-high` route selection and uses that route's model / `reasoning_effort: high`.
+- Other provider combinations have no global fallback. Report the unsupported route instead of inventing a transport workaround.
 
 Available `agent_type` values:
 
@@ -110,10 +97,5 @@ Available `agent_type` values:
 - `explorer`
 - `worker`
 - `default`
-- `router_chatgpt_login_gpt_5_6_luna`
-- `router_chatgpt_login_gpt_5_6_sol`
-- `router_chatgpt_login_gpt_5_6_terra`
-- `router_deepseek_deepseek_v4_flash`
-- `router_deepseek_deepseek_v4_pro`
-
-Model preference is set per worktree, not globally.
+This file sets global routing policy. `[agents]` defaults come from the active
+Codex configuration; a project/worktree override must be configured explicitly.
