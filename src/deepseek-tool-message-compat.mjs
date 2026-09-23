@@ -563,6 +563,31 @@ function strictJsonPreflight(source, limits) {
   return rootState === "done" && stack.length === 0;
 }
 
+// Whether a block can be parsed, inspected, and re-serialized without losing
+// anything: no duplicate object member, and no number whose value
+// JSON.stringify cannot reproduce. This is the policy every rewrite in this
+// module already applies, exposed so the DeepSeek reasoning collapse uses the
+// same one instead of its own byte-equality test.
+//
+// Byte equality is deliberately NOT part of it. LiteLLM serializes with
+// Python's json.dumps, which spells the float as `"top_p":1.0` where
+// JSON.stringify writes `"top_p":1`, so a byte-exact guard refuses the first
+// envelope of every routed stream it sees.
+export function eventJsonIsRewritable(source) {
+  if (typeof source !== "string" || !source) return false;
+  const limits = jsonScanLimits({}, {
+    maxMembers: MAX_FRAME_JSON_MEMBERS,
+    maxKeyCodeUnits: MAX_FRAME_JSON_KEY_CODE_UNITS,
+  });
+  if (!strictJsonPreflight(source, limits)) return false;
+  try {
+    JSON.parse(source);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Function-call arguments are JSON carried inside a JSON string. When an
 // eligible lifecycle is reserialized, validate the complete argument strings
 // with the same numeric and duplicate-member preflight instead of treating the

@@ -303,6 +303,51 @@ test("DeepSeek adds an empty reasoning item before a tool turn", async () => {
   assert.equal(completed.response.output[0].type, "reasoning");
 });
 
+// LiteLLM serializes with Python's json.dumps: it spells the float as
+// `"top_p":1.0` where JSON.stringify writes `"top_p":1`. A guard that required
+// byte equality with the raw block therefore gave up on the very first block of
+// every real DeepSeek stream, and because giving up is permanent for the
+// stream, the collapse never ran at all -- the reasoning summary stayed empty
+// in `response.completed` and Codex had nothing to replay to the provider.
+test("DeepSeek reasoning collapse survives LiteLLM's JSON spelling", async () => {
+  const input = [
+    'data: {"type":"response.created","response":{"id":"resp_1","top_p":1.0,"status":"in_progress"}}\n\n',
+    'data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_1","output_index":0,"delta":"Add the digits"}\n\n',
+    'data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_1","output_index":0,"delta":" then answer"}\n\n',
+    'data: {"type":"response.output_text.delta","item_id":"msg_1","output_index":1,"content_index":0,"delta":"391"}\n\n',
+    'data: {"type":"response.completed","response":{"id":"resp_1","top_p":1.0,"output":[{"id":"rs_1","type":"reasoning","summary":[]},{"id":"msg_1","type":"message","content":[{"type":"output_text","text":"391"}]}]}}\n\n',
+    "data: [DONE]\n\n",
+  ].join("");
+
+  const outputEvents = events(await collect(
+    deepseekReasoningCollapseTransform({ id: "deepseek" }, "text/event-stream"),
+    input,
+  ));
+  const completed = outputEvents.find((event) => event.type === "response.completed");
+  const reasoning = completed.response.output.find((item) => item.type === "reasoning");
+
+  assert.ok(outputEvents.some(
+    (event) => event.type === "response.output_item.added" && event.item?.type === "reasoning",
+  ));
+  assert.deepEqual(reasoning.summary, [
+    { type: "summary_text", text: "Add the digits then answer" },
+  ]);
+});
+
+// The duplicate-member and unstable-number policy stays: that is what a rewrite
+// can actually damage, so a block that breaks it still passes through.
+test("DeepSeek reasoning collapse still refuses duplicate object members", async () => {
+  const input = 'data: {"type":"response.completed","response":{"id":"resp_1","id":"resp_2"}}\n\n';
+
+  assert.equal(
+    await collect(
+      deepseekReasoningCollapseTransform({ id: "deepseek" }, "text/event-stream"),
+      input,
+    ),
+    input,
+  );
+});
+
 test("reasoning collapse leaves other providers alone", () => {
   assert.equal(
     deepseekReasoningCollapseTransform({ id: "openai" }, "text/event-stream"),

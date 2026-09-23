@@ -1,6 +1,8 @@
 import { Transform } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 
+import { eventJsonIsRewritable } from "./deepseek-tool-message-compat.mjs";
+
 const MAX_DEFERRED_MESSAGE_BYTES = 64 * 1024;
 
 function eventBlock(block) {
@@ -10,12 +12,14 @@ function eventBlock(block) {
   if (dataLineIndex === -1) return undefined;
   const dataText = lines[dataLineIndex].slice(5).trimStart();
   if (!dataText || dataText === "[DONE]") return undefined;
+  // Refuse only what a rewrite can damage: duplicate members and numbers
+  // JSON.stringify cannot reproduce faithfully. Byte equality with the raw text
+  // is not the test -- LiteLLM spells floats as `1.0` -- and because the
+  // refusal is permanent for the stream, requiring it made this transform a
+  // pass-through on the first block of every real DeepSeek stream.
+  if (!eventJsonIsRewritable(dataText)) return { opaque: true };
   try {
-    const event = JSON.parse(dataText);
-    // JSON.parse silently accepts duplicate keys. This transform injects
-    // events, so only canonical JSON is safe to inspect and rewrite.
-    if (JSON.stringify(event) !== dataText) return { opaque: true };
-    return { lines, dataLineIndex, newline, event };
+    return { lines, dataLineIndex, newline, event: JSON.parse(dataText) };
   } catch {
     return { opaque: true };
   }
