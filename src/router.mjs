@@ -1888,27 +1888,6 @@ function carryReasoningThroughInput(input, { nativeThinking = false } = {}) {
   }
 }
 
-// A routed DeepSeek turn can occasionally arrive with no replayable reasoning
-// text at all (Codex stores an empty reasoning item). DeepSeek then rejects
-// the next tool-bearing thinking request. Do not fabricate private reasoning:
-// request the documented non-thinking mode for that continuation instead.
-function disableUnreplayableDeepSeekThinking(payload, route, input) {
-  if (
-    route?.requestProfile !== "deepseek-thinking" ||
-    !Array.isArray(input) ||
-    !Array.isArray(payload?.tools) ||
-    payload.tools.length === 0
-  ) return;
-  const unreplayable = input.some((item) => (
-    item?.type === "reasoning" &&
-    !reasoningItemText(item) &&
-    !(typeof item.encrypted_content === "string" && item.encrypted_content)
-  ));
-  if (!unreplayable) return;
-  payload.thinking = { type: "disabled" };
-  delete payload.reasoning_effort;
-}
-
 // A trailing model turn is a destructive rewrite: it discards part of the
 // caller's conversation. Only Google's own provider gets that behavior from
 // identity. Resellers and custom endpoints must opt in per model after their
@@ -2964,7 +2943,16 @@ async function buildRoutedRequest({ request, payload, route, agedInput, tokenMax
   carryReasoningThroughInput(input, {
     nativeThinking: chatCompletionsProvider && route.requestProfile === "glm-thinking",
   });
-  disableUnreplayableDeepSeekThinking(payload, route, input);
+  // There is deliberately no "disable thinking when the reasoning is
+  // unreplayable" step here. One existed for the 400 DeepSeek returned when a
+  // tool call's reasoning could not be replayed, and it could never take
+  // effect: `thinking` is not a field LiteLLM's Responses->chat translation
+  // carries, so the request it meant to change reached the provider untouched.
+  // Measured against the live endpoint the 400 no longer reproduces in any
+  // shape -- absent, empty, or empty-string `reasoning_content`, one or two
+  // tool calls, v4-flash/v4-pro/legacy reasoner -- and switching thinking off
+  // would now only downgrade a continuation that works with it on. The carry
+  // above is what makes the reasoning replayable again.
   // Models marked requiresTrailingUserTurn reject requests ending with a model
   // turn. Pop trailing assistant messages, reasoning, or subagent outputs.
   if (requiresTrailingUserTurn(route)) {
