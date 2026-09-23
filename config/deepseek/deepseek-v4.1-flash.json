@@ -2,13 +2,13 @@
   "version": 1,
   "models": [
     {
-      "slug": "deepseek/deepseek-v4-flash",
-      "gatewayModel": "deepseek-v4-flash",
-      "upstreamModel": "deepseek-v4-flash",
+      "slug": "deepseek/deepseek-v4.1-flash",
+      "gatewayModel": "deepseek-v4.1-flash",
+      "upstreamModel": "deepseek-flash",
       "provider": "deepseek",
       "listed": true,
-      "displayName": "DeepSeek V4 Flash (API)",
-      "description": "DeepSeek V4 Flash via the DeepSeek API; fast reasoning, tool calls, and a 1M context window.",
+      "displayName": "DeepSeek V4.1 Flash (API)",
+      "description": "DeepSeek V4.1 Flash via the DeepSeek API; fast reasoning, tool calls, and a 1M context window.",
       "priority": 6,
       "defaultEffort": "high",
       "reasoningLevels": [
@@ -35,7 +35,7 @@
       },
       "requestProfile": "deepseek-thinking",
       "supportsReasoningSummaries": true,
-      "compHash": "deepseek-v4-flash-v2"
+      "compHash": "deepseek-v4.1-flash-v1"
     }
   ]
 }
