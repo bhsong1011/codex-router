@@ -1624,40 +1624,77 @@ function waitForAgentPayloadRelay(pending, signal) {
 }
 
 // A refusal that names the credential rather than the payload -- the account is
-// capped, rate-limited or signed out -- is worth one retry as the configured
-// Personal ChatGPT login. The ciphertext is not bound to the client's account:
-// a payload a personal parent created decrypts fine there, while the client's
-// own account refuses, which is how a personal child spawn was billed to a
-// native plan with nothing left to spend.
+// capped, rate-limited or signed out -- is not about this payload, and asking
+// the same accounts again a second later buys the same refusal. Codex retried
+// one refused spawn 95 times in 45 seconds, two upstream calls per attempt,
+// pushing the account further into its own rate limit. Try the accounts once,
+// then hold the relay closed for a short window: the same anti-storm backoff
+// the vision bridge already uses, and no claim about when a quota resets.
 const RELAY_CREDENTIAL_REFUSALS = new Set([401, 403, 429]);
+const RELAY_REFUSAL_BACKOFF_MS = 60_000;
+let relayRefusedUntil = 0;
 
-async function personalRelayHeaders(request) {
+// Which accounts may decode a collaboration payload, in the order to try them.
+// The personal login goes first when it is configured: the ciphertext belongs
+// to the conversation rather than to the client's account -- a payload a
+// personal parent created decrypts fine there while the client's own capped
+// account refuses -- and the caller's credential stays as the fallback, so an
+// install whose personal login is the capped one is no worse off.
+async function relayHeaderCandidates(request) {
+  const candidates = [];
   try {
     const session = await ensureFreshChatgptLoginToken();
-    return session ? chatgptLoginRequestHeaders(session, request.headers) : undefined;
+    if (session) {
+      candidates.push({
+        account: "the Personal ChatGPT login",
+        headers: chatgptLoginRequestHeaders(session, request.headers),
+      });
+    }
   } catch {
     // No personal login configured: the caller's own credential is all there is.
-    return undefined;
   }
+  candidates.push({ account: "the caller's ChatGPT session", headers: nativeHeaders(request) });
+  return candidates;
 }
 
-async function relayEncryptedAgentPayloadWithFallback(request, item, key, headers, signal) {
-  try {
-    return await relayEncryptedAgentPayloadOnce(item, key, headers, signal);
-  } catch (error) {
-    if (!RELAY_CREDENTIAL_REFUSALS.has(error?.upstreamStatus)) throw error;
-    const personal = await personalRelayHeaders(request);
-    if (!personal) throw error;
-    console.error(
-      `[codex-router] collaboration relay refused with HTTP ${error.upstreamStatus}; ` +
-        "retrying as the Personal ChatGPT login",
+async function relayEncryptedAgentPayloadWithFallback(request, item, key, signal) {
+  const now = Date.now();
+  if (relayRefusedUntil > now) {
+    const paused = Math.ceil((relayRefusedUntil - now) / 1000);
+    const error = new Error(
+      `Collaboration relay is paused for ${paused}s: every configured ChatGPT account ` +
+        "refused it with a credential or quota error.",
     );
-    return relayEncryptedAgentPayloadOnce(item, key, personal, signal);
+    error.status = 429;
+    error.retryAfterSeconds = paused;
+    throw error;
   }
+  let lastError;
+  for (const candidate of await relayHeaderCandidates(request)) {
+    try {
+      const plaintext = await relayEncryptedAgentPayloadOnce(
+        item,
+        key,
+        candidate.headers,
+        signal,
+      );
+      relayRefusedUntil = 0;
+      return plaintext;
+    } catch (error) {
+      if (!RELAY_CREDENTIAL_REFUSALS.has(error?.upstreamStatus)) throw error;
+      lastError = error;
+      console.error(
+        `[codex-router] collaboration relay refused with HTTP ${error.upstreamStatus} as ` +
+          candidate.account,
+      );
+    }
+  }
+  relayRefusedUntil = Date.now() + RELAY_REFUSAL_BACKOFF_MS;
+  throw lastError;
 }
 
 async function relayEncryptedAgentPayload(request, item, encrypted, signal) {
-  const { accountScope, headers } = nativeRelayContext(request);
+  const { accountScope } = nativeRelayContext(request);
   const key = agentPayloadCacheKey(encrypted, accountScope);
   const cached = cachedAgentPayload(key);
   if (cached !== undefined) return cached;
@@ -1677,7 +1714,6 @@ async function relayEncryptedAgentPayload(request, item, encrypted, signal) {
     request,
     item,
     key,
-    headers,
     controller.signal,
   ).finally(() => {
     operation.settled = true;

@@ -79,11 +79,24 @@ function run(script, env, { nodeArgs = [] } = {}) {
     env?.MODEL_ROUTER_STATE_DIR || env?.CODEX_ROUTER_STATE_DIR
       ? {}
       : { MODEL_ROUTER_STATE_DIR: mkdtempSync(path.join(os.tmpdir(), "routing-state-")) };
+  // The same isolation for the Personal ChatGPT login: the collaboration relay
+  // now tries that login first when it exists, so a real ~/.codex-personal on
+  // this machine would otherwise answer before the test's own credential, and
+  // the test would spend it.
+  const personalIsolation =
+    env?.CODEX_ROUTER_CHATGPT_LOGIN_HOME
+      ? {}
+      : {
+          CODEX_ROUTER_CHATGPT_LOGIN_HOME: mkdtempSync(
+            path.join(os.tmpdir(), "routing-personal-"),
+          ),
+        };
   const child = spawn(process.execPath, [...nodeArgs, path.join(root, "src", script)], {
     cwd: root,
     env: {
       ...process.env,
       ...stateIsolation,
+      ...personalIsolation,
       CODEX_ROUTER_CALLER_KEY: CALLER_KEY,
       CODEX_ROUTER_INTERNAL_KEY: INTERNAL_KEY,
       KIMI_INTERNAL_KEY: INTERNAL_KEY,
@@ -1209,15 +1222,14 @@ test("a small native turn is sent unencoded, exactly as it always was", async ()
   }
 });
 
-// A refusal that names the credential rather than the payload is worth one
-// retry as the configured Personal ChatGPT login: the ciphertext is not bound
-// to the client's account, and a personal parent's child spawn was otherwise
-// billed to a native plan that had nothing left to spend.
-test("a credential-refused collaboration relay retries as the personal login", async () => {
+// The personal login is tried first: the ciphertext belongs to the conversation
+// rather than to the client's account, and the client's account is the one that
+// runs out of allowance. The caller's credential stays as the fallback.
+test("the relay decodes with the personal login before spending the caller's account", async () => {
   const nativeRequests = [];
   const native = await mockServer(async (request, response) => {
     nativeRequests.push({ headers: request.headers, body: await bodyJson(request) });
-    if (nativeRequests.length === 1) {
+    if (request.headers.authorization !== "Bearer PERSONAL_SESSION_TOKEN") {
       json(response, 429, {
         error: { type: "usage_limit_reached", message: "The usage limit has been reached" },
       });
@@ -1303,16 +1315,97 @@ test("a credential-refused collaboration relay retries as the personal login", a
     });
 
     assert.equal(response.status, 200, await response.text());
-    // The first relay spent the caller's credential and was refused; the retry
-    // spends the personal login, which is not the account the client uses.
-    assert.equal(nativeRequests.length, 2);
-    assert.equal(nativeRequests[0].headers.authorization, "Bearer CHATGPT_SESSION_TOKEN");
-    assert.equal(nativeRequests[1].headers.authorization, "Bearer PERSONAL_SESSION_TOKEN");
-    assert.equal(nativeRequests[1].headers["chatgpt-account-id"], "personal-account-id");
+    // The personal login answered first, so the capped caller's account was
+    // never asked at all.
+    assert.equal(nativeRequests.length, 1);
+    assert.equal(nativeRequests[0].headers.authorization, "Bearer PERSONAL_SESSION_TOKEN");
+    assert.equal(nativeRequests[0].headers["chatgpt-account-id"], "personal-account-id");
     assert.equal(gatewayRequests.length, 1);
     const content = gatewayRequests[0].body.input[0].content;
     assert.equal(content.some((part) => part.type === "encrypted_content"), false);
     assert.equal(content.at(-1).text, "Inspect the repository.");
+  } finally {
+    await stopChild(router);
+    await closeServer(native.server);
+    await closeServer(gateway.server);
+    rmSync(personalHome, { recursive: true, force: true });
+  }
+});
+
+// Every account refused: the relay must not spend both of them again on every
+// retry. Codex retried one refused spawn 95 times in 45 seconds.
+test("a relay refused by every account is paused instead of re-spent", async () => {
+  const nativeRequests = [];
+  const native = await mockServer(async (request, response) => {
+    nativeRequests.push({ headers: request.headers, body: await bodyJson(request) });
+    json(response, 429, {
+      error: { type: "usage_limit_reached", message: "The usage limit has been reached" },
+    });
+  });
+  const gateway = await mockServer(async (request, response) => {
+    json(response, 200, { route: "external" });
+  });
+  const personalHome = mkdtempSync(path.join(os.tmpdir(), "personal-relay-paused-"));
+  writeFileSync(
+    path.join(personalHome, "auth.json"),
+    `${JSON.stringify({
+      auth_mode: "chatgpt",
+      last_refresh: new Date().toISOString(),
+      tokens: {
+        access_token: "PERSONAL_SESSION_TOKEN",
+        refresh_token: "personal-refresh-token",
+        account_id: "personal-account-id",
+      },
+    })}\n`,
+    { mode: 0o600 },
+  );
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${native.port}/backend-api/codex`,
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_CHATGPT_LOGIN_HOME: personalHome,
+    CODEX_ROUTER_QUIET: "1",
+  });
+  const childTurn = () =>
+    fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer CHATGPT_SESSION_TOKEN",
+        "ChatGPT-Account-Id": "account-id",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "kimi-oauth/k3",
+        stream: false,
+        input: [
+          {
+            type: "agent_message",
+            content: [
+              {
+                type: "input_text",
+                text: "Message Type: NEW_TASK\nTask name: /root/critic\nSender: /root\nPayload:\n",
+              },
+              { type: "encrypted_content", encrypted_content: "gAAAAA-paused-retry=" },
+            ],
+          },
+        ],
+      }),
+    });
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const refused = await childTurn();
+    assert.equal(refused.status, 502, await refused.text());
+    // One attempt per account, in order: the personal login, then the caller.
+    assert.equal(nativeRequests.length, 2);
+    assert.equal(nativeRequests[0].headers.authorization, "Bearer PERSONAL_SESSION_TOKEN");
+    assert.equal(nativeRequests[1].headers.authorization, "Bearer CHATGPT_SESSION_TOKEN");
+
+    const paused = await childTurn();
+    assert.equal(paused.status, 429, await paused.text());
+    // Nothing new was spent while the relay is paused.
+    assert.equal(nativeRequests.length, 2);
   } finally {
     await stopChild(router);
     await closeServer(native.server);
@@ -1370,6 +1463,9 @@ test("router relays encrypted Codex subagent payloads before external routing", 
     CODEX_ROUTER_PORT: String(routerPort),
     CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${native.port}/backend-api/codex`,
     CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    // An empty personal home: this test covers the caller's own credential, and a
+    // real ~/.codex-personal on the machine would otherwise answer first.
+    CODEX_ROUTER_CHATGPT_LOGIN_HOME: mkdtempSync(path.join(os.tmpdir(), "no-personal-login-")),
     CODEX_ROUTER_QUIET: "1",
   });
 
