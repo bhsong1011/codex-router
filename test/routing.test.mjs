@@ -1209,6 +1209,118 @@ test("a small native turn is sent unencoded, exactly as it always was", async ()
   }
 });
 
+// A refusal that names the credential rather than the payload is worth one
+// retry as the configured Personal ChatGPT login: the ciphertext is not bound
+// to the client's account, and a personal parent's child spawn was otherwise
+// billed to a native plan that had nothing left to spend.
+test("a credential-refused collaboration relay retries as the personal login", async () => {
+  const nativeRequests = [];
+  const native = await mockServer(async (request, response) => {
+    nativeRequests.push({ headers: request.headers, body: await bodyJson(request) });
+    if (nativeRequests.length === 1) {
+      json(response, 429, {
+        error: { type: "usage_limit_reached", message: "The usage limit has been reached" },
+      });
+      return;
+    }
+    const relayArguments = JSON.stringify({ payload: "Inspect the repository." });
+    const relayEvents = [
+      {
+        type: "response.output_item.added",
+        item: {
+          type: "function_call",
+          id: "fc_relay",
+          name: "relay_external_agent_payload",
+          arguments: "",
+        },
+      },
+      {
+        type: "response.function_call_arguments.done",
+        item_id: "fc_relay",
+        arguments: relayArguments,
+      },
+    ];
+    const event = `${relayEvents
+      .map((entry) => `event: ${entry.type}\ndata: ${JSON.stringify(entry)}\n\n`)
+      .join("")}data: [DONE]\n\n`;
+    response.writeHead(200, { "Content-Type": "application/octet-stream" });
+    response.write(event.slice(0, 31));
+    response.end(event.slice(31));
+  });
+  const gatewayRequests = [];
+  const gateway = await mockServer(async (request, response) => {
+    gatewayRequests.push({ headers: request.headers, body: await bodyJson(request) });
+    json(response, 200, { route: "external" });
+  });
+  const personalHome = mkdtempSync(path.join(os.tmpdir(), "personal-relay-home-"));
+  writeFileSync(
+    path.join(personalHome, "auth.json"),
+    `${JSON.stringify({
+      auth_mode: "chatgpt",
+      last_refresh: new Date().toISOString(),
+      tokens: {
+        access_token: "PERSONAL_SESSION_TOKEN",
+        refresh_token: "personal-refresh-token",
+        account_id: "personal-account-id",
+      },
+    })}\n`,
+    { mode: 0o600 },
+  );
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${native.port}/backend-api/codex`,
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_CHATGPT_LOGIN_HOME: personalHome,
+    CODEX_ROUTER_QUIET: "1",
+  });
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const response = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer CHATGPT_SESSION_TOKEN",
+        "ChatGPT-Account-Id": "account-id",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "kimi-oauth/k3",
+        stream: false,
+        input: [
+          {
+            type: "agent_message",
+            content: [
+              {
+                type: "input_text",
+                text: "Message Type: NEW_TASK\nTask name: /root/critic\nSender: /root\nPayload:\n",
+              },
+              { type: "encrypted_content", encrypted_content: "gAAAAA-personal-retry=" },
+            ],
+          },
+        ],
+      }),
+    });
+
+    assert.equal(response.status, 200, await response.text());
+    // The first relay spent the caller's credential and was refused; the retry
+    // spends the personal login, which is not the account the client uses.
+    assert.equal(nativeRequests.length, 2);
+    assert.equal(nativeRequests[0].headers.authorization, "Bearer CHATGPT_SESSION_TOKEN");
+    assert.equal(nativeRequests[1].headers.authorization, "Bearer PERSONAL_SESSION_TOKEN");
+    assert.equal(nativeRequests[1].headers["chatgpt-account-id"], "personal-account-id");
+    assert.equal(gatewayRequests.length, 1);
+    const content = gatewayRequests[0].body.input[0].content;
+    assert.equal(content.some((part) => part.type === "encrypted_content"), false);
+    assert.equal(content.at(-1).text, "Inspect the repository.");
+  } finally {
+    await stopChild(router);
+    await closeServer(native.server);
+    await closeServer(gateway.server);
+    rmSync(personalHome, { recursive: true, force: true });
+  }
+});
+
 test("router relays encrypted Codex subagent payloads before external routing", async () => {
   const nativeRequests = [];
   const native = await mockServer(async (request, response) => {
