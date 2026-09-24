@@ -42,6 +42,9 @@ test("provider registry exposes configured API and OAuth model families", () => 
       "chatgpt-login/gpt-5.6-luna",
       "chatgpt-login/gpt-5.6-sol",
       "chatgpt-login/gpt-5.6-terra",
+      "chatgpt-login/gpt-6-astra",
+      "chatgpt-login/gpt-6-luna",
+      "chatgpt-login/gpt-6-sol",
       "clinepass/deepseek-v4-flash",
       "clinepass/deepseek-v4-pro",
       "clinepass/glm-5.2",
@@ -94,9 +97,9 @@ test("provider registry exposes configured API and OAuth model families", () => 
       "commandcode/qwen3.8-max",
       "commandcode/step-3.7-flash",
       "custom/qwen3.8-27b",
-      "deepseek/deepseek-v4-flash",
       "deepseek/deepseek-v4-flash-vision-exp",
       "deepseek/deepseek-v4-pro",
+      "deepseek/deepseek-v4.1-flash",
       "grok-api/grok-4.5",
       "grok-oauth/grok-4.5",
       "grok-oauth/grok-4.6",
@@ -595,7 +598,7 @@ test("provider registry exposes configured API and OAuth model families", () => 
     assert.deepEqual(MODEL_BY_SLUG.get(slug).searchTool, { mode: "hosted" });
   }
   const standaloneSearchSlugs = new Set([
-    "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-v4.1-flash",
     "deepseek/deepseek-v4-flash-vision-exp",
     "opencode-go/deepseek-v4-flash",
     "xiaomi-mimo/mimo-v2.5",
@@ -681,7 +684,7 @@ test("provider registry exposes configured API and OAuth model families", () => 
     "grok-oauth/grok-4.6",
     "grok-oauth/grok-4.5",
     "grok-api/grok-4.5",
-    "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-v4.1-flash",
     "deepseek/deepseek-v4-flash-vision-exp",
     "deepseek/deepseek-v4-pro",
     "deepseek/deepseek-reasoner",
@@ -690,7 +693,7 @@ test("provider registry exposes configured API and OAuth model families", () => 
   }
   assert.equal(MODEL_BY_SLUG.get("deepseek/deepseek-chat").supportsReasoningSummaries, undefined);
   for (const slug of [
-    "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-v4.1-flash",
     "deepseek/deepseek-v4-flash-vision-exp",
     "deepseek/deepseek-v4-pro",
   ]) {
@@ -700,7 +703,7 @@ test("provider registry exposes configured API and OAuth model families", () => 
     assert.match(model.description, /DeepSeek V4/);
   }
   assert.deepEqual(
-    MODEL_BY_SLUG.get("deepseek/deepseek-v4-flash").inputModalities,
+    MODEL_BY_SLUG.get("deepseek/deepseek-v4.1-flash").inputModalities,
     ["text"],
   );
   assert.deepEqual(
@@ -727,7 +730,7 @@ test("only checked-in Gemini reseller models opt into trailing model-turn trimmi
 
 test("DeepSeek V4 Flash routes opt in to Codex standalone web search", () => {
   for (const slug of [
-    "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-v4.1-flash",
     "deepseek/deepseek-v4-flash-vision-exp",
     "opencode-go/deepseek-v4-flash",
   ]) {

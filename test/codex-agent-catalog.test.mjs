@@ -116,7 +116,7 @@ test("only registry-proven models receive routed agent definitions", () => {
   const models = [
     { slug: "kimi-oauth/k3", multiAgentVersion: "v2" },
     { slug: "grok-oauth/grok-4.5", multiAgentVersion: "v2" },
-    { slug: "deepseek/deepseek-v4-flash" },
+    { slug: "deepseek/deepseek-v4.1-flash" },
   ];
   assert.deepEqual(
     subagentEligibleModels(models, { mode: "proven", enabled: [], disabled: [] }).map(

@@ -793,6 +793,11 @@ const STATIC_MODEL_SLUG_ALIASES = new Map([
   // preserve existing picker and caller state on the new live route.
   ["opencode-go/ox-alpha", "opencode-go/glm-5.3-flash"],
   ["opencode-go/ox-alpha-free", "opencode-go/glm-5.3-flash"],
+  // DeepSeek renamed the flash line: the API serves `deepseek-flash` and the
+  // published slug follows it. Keep the previous slug routable so picker state,
+  // stored session models, and subagent presets that still name it resolve to
+  // the live route instead of failing.
+  ["deepseek/deepseek-v4-flash", "deepseek/deepseek-v4.1-flash"],
   // OpenCode moved Grok 4.5 from Chat Completions to Responses. Keep the old
   // public slug routable while catalog publication carries picker state to
   // the protocol-namespaced replacement.

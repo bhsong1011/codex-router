@@ -473,7 +473,7 @@ test("an unknown native route is not mistaken for the merged catalog's conservat
 
 test("control can test an uncertified route despite its conservative merged-catalog v1", () => {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "control-subagent-unknown-"));
-  const slug = "deepseek/deepseek-v4-flash";
+  const slug = "deepseek/deepseek-v4.1-flash";
   const env = {
     ...process.env,
     // Without this the command republishes into the operator's real
@@ -553,10 +553,10 @@ test("picker all accepts the documented show/hide flag position", () => {
     pickerCommandArgs([
       "picker",
       "set",
-      "deepseek/deepseek-v4-flash",
+      "deepseek/deepseek-v4.1-flash",
       "hide",
     ]),
-    ["set", "deepseek/deepseek-v4-flash", "hide"],
+    ["set", "deepseek/deepseek-v4.1-flash", "hide"],
   );
 });
 
@@ -684,15 +684,15 @@ test("login-free control selects a ready external model and restores Codex defau
         .filter((model) => model.slug.startsWith("deepseek/"))
         .map((model) => [model.slug, model.visibility]),
       [
-        ["deepseek/deepseek-v4-flash", "hide"],
-        ["deepseek/deepseek-v4-flash-vision-exp", "list"],
+        ["deepseek/deepseek-v4-flash-vision-exp", "hide"],
+        ["deepseek/deepseek-v4.1-flash", "list"],
         ["deepseek/deepseek-v4-pro", "list"],
       ],
     );
     const aliases = JSON.parse(readFileSync(path.join(stateDir, "native-aliases.json"), "utf8"));
     assert.deepEqual(aliases, {
       version: 1,
-      aliases: { "gpt-5.6-sol": "deepseek/deepseek-v4-flash" },
+      aliases: { "gpt-5.6-sol": "deepseek/deepseek-v4-flash-vision-exp" },
     });
 
     // A later catalog rebuild has no mode-toggle override. It must recover
@@ -802,7 +802,7 @@ test("login-free aliasing applies even when a ChatGPT credential is still stored
     assert.equal(enabled.login_free, true);
     assert.equal(enabled.model, "gpt-5.6-sol");
     const aliases = JSON.parse(readFileSync(path.join(stateDir, "native-aliases.json"), "utf8"));
-    assert.deepEqual(aliases.aliases, { "gpt-5.6-sol": "deepseek/deepseek-v4-flash" });
+    assert.deepEqual(aliases.aliases, { "gpt-5.6-sol": "deepseek/deepseek-v4-flash-vision-exp" });
     const catalog = JSON.parse(readFileSync(path.join(stateDir, "merged-models.json"), "utf8"));
     assert.match(
       catalog.models.find((model) => model.slug === "gpt-5.6-sol").display_name,
@@ -866,14 +866,14 @@ test("model-set switches the login-free model and rejects unavailable models", (
 
   try {
     assert.throws(
-      () => runControl("model-set", "deepseek/deepseek-v4-flash"),
+      () => runControl("model-set", "deepseek/deepseek-v4.1-flash"),
       /login-free/,
       "model-set must require login-free mode",
     );
 
     runControl("auth-mode", "on");
-    const switched = runControl("model-set", "deepseek/deepseek-v4-flash");
-    assert.equal(switched.model, "gpt-5.6-sol");
+    const switched = runControl("model-set", "deepseek/deepseek-v4.1-flash");
+    assert.equal(switched.model, "deepseek/deepseek-v4.1-flash");
     // The built-in OpenAI identity takes the cross-version-safe provider switch.
     assert.equal(switched.model_provider, "codex-router");
     assert.equal(switched.login_free, true);
@@ -913,7 +913,7 @@ test("signed routing rolls back catalog and config after a forced post-publicati
     models: [
       ...originalCatalog.models,
       {
-        slug: "deepseek/deepseek-v4-flash",
+        slug: "deepseek/deepseek-v4.1-flash",
         display_name: "DeepSeek V4 Flash",
         visibility: "list",
         priority: 6,
@@ -983,7 +983,7 @@ api_key = "ROLLBACK_QUERY_SECRET"
       readFileSync(path.join(stateDir, "merged-models.json"), "utf8"),
     );
     assert.equal(
-      safeCatalog.models.some((model) => model.slug === "deepseek/deepseek-v4-flash"),
+      safeCatalog.models.some((model) => model.slug === "deepseek/deepseek-v4.1-flash"),
       false,
     );
     assert.equal(

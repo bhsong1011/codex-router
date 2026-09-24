@@ -1155,7 +1155,7 @@ test("a ChatGPT-plan model drives the same advertisement as a routed engine", as
   );
   const deepseek = {
     ...grok,
-    slug: "deepseek/deepseek-v4-flash",
+    slug: "deepseek/deepseek-v4.1-flash",
     displayName: "DeepSeek V4 Flash",
     gatewayModel: "deepseek-v4-flash",
     inputModalities: ["text"],
@@ -1340,7 +1340,7 @@ test(
       const visibility = new Map(
         merged.models.map((model) => [String(model.slug), model.visibility]),
       );
-      assert.equal(visibility.get("deepseek/deepseek-v4-flash"), "list");
+      assert.equal(visibility.get("deepseek/deepseek-v4.1-flash"), "list");
       assert.equal(visibility.get("deepseek/deepseek-v4-flash-vision-exp"), "list");
       assert.equal(visibility.get("deepseek/deepseek-v4-pro"), "hide");
       assert.equal(visibility.get("gpt-5.6-sol-1m"), "hide");
@@ -1349,8 +1349,8 @@ test(
         readFileSync(path.join(stateDir, "model-picker.json"), "utf8"),
       );
       assert.deepEqual(picker.visible, [
-        "deepseek/deepseek-v4-flash",
         "deepseek/deepseek-v4-flash-vision-exp",
+        "deepseek/deepseek-v4.1-flash",
       ]);
     } finally {
       rmSync(codexHome, { recursive: true, force: true });

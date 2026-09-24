@@ -593,15 +593,15 @@ test("an opt-in router default survives rebuilds and restores Codex's prior defa
       "router-default-set",
       codexHome,
       stateDir,
-      ["deepseek/deepseek-v4-flash"],
+      ["deepseek/deepseek-v4.1-flash"],
     );
-    assert.equal(selected.model, "deepseek/deepseek-v4-flash");
-    assert.equal(selected.router_default_model, "deepseek/deepseek-v4-flash");
+    assert.equal(selected.model, "deepseek/deepseek-v4.1-flash");
+    assert.equal(selected.router_default_model, "deepseek/deepseek-v4.1-flash");
     assert.equal(selected.router_default_managed, true);
     assert.equal(privateFileIsProtected(defaultStatePath), true);
 
     const rebuilt = run("enable", codexHome, stateDir);
-    assert.equal(rebuilt.model, "deepseek/deepseek-v4-flash");
+    assert.equal(rebuilt.model, "deepseek/deepseek-v4.1-flash");
 
     const restored = run("router-default-clear", codexHome, stateDir);
     assert.equal(restored.model, "gpt-5.6-luna");
@@ -702,10 +702,10 @@ approval_policy = "never"
       "login-free-enable",
       codexHome,
       stateDir,
-      ["deepseek/deepseek-v4-flash"],
+      ["deepseek/deepseek-v4.1-flash"],
     );
     assert.equal(refreshed.login_free, true);
-    assert.equal(refreshed.model, "deepseek/deepseek-v4-flash");
+    assert.equal(refreshed.model, "deepseek/deepseek-v4.1-flash");
     assert.deepEqual(
       JSON.parse(readFileSync(providerModePath, "utf8")),
       originalState,
@@ -1881,7 +1881,7 @@ esac
       );
       assert.ok(catalog.models.some((model) => model.slug === "gpt-5.6-sol"));
       assert.ok(
-        catalog.models.some((model) => model.slug === "deepseek/deepseek-v4-flash"),
+        catalog.models.some((model) => model.slug === "deepseek/deepseek-v4.1-flash"),
       );
     } finally {
       rmSync(codexHome, { recursive: true, force: true });
