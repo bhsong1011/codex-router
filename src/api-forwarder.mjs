@@ -285,16 +285,10 @@ function restoreGlmReasoningContent(messages) {
 const SYNTHETIC_TOOL_RESULT =
   "[tool result unavailable: prior tool execution was interrupted or omitted from history]";
 
-function toolCallIds(message) {
-  if (!Array.isArray(message?.tool_calls)) return [];
-  return message.tool_calls
-    .map((call) => (typeof call?.id === "string" ? call.id : ""))
-    .filter(Boolean);
-}
-
 function ensureToolResultsForCalls(messages) {
   if (!Array.isArray(messages) || messages.length === 0) return messages;
   const repaired = [];
+  let synthetic = 0;
   let index = 0;
   while (index < messages.length) {
     const message = messages[index];
@@ -306,23 +300,57 @@ function ensureToolResultsForCalls(messages) {
       continue;
     }
 
-    repaired.push(message);
-    const callIds = toolCallIds(message);
-    if (message?.role !== "assistant" || callIds.length === 0) {
+    const calls = Array.isArray(message?.tool_calls) ? message.tool_calls : undefined;
+    if (message?.role !== "assistant" || !calls || calls.length === 0) {
+      repaired.push(message);
       index += 1;
       continue;
     }
 
     index += 1;
-    const toolsById = new Map();
+    const rows = [];
     while (index < messages.length && messages[index]?.role === "tool") {
-      const toolMessage = messages[index];
-      const toolCallId =
-        typeof toolMessage?.tool_call_id === "string" ? toolMessage.tool_call_id : "";
-      if (toolCallId && callIds.includes(toolCallId) && !toolsById.has(toolCallId)) {
-        toolsById.set(toolCallId, toolMessage);
-      }
+      rows.push(messages[index]);
       index += 1;
+    }
+
+    // A call can arrive with no id at all -- LiteLLM's bridge keeps the call
+    // when it loses the id, and a relayed collaboration payload is synthesized
+    // locally. Such a call can never be paired by id, and the unpaired
+    // `tool_calls` entry is exactly what DeepSeek rejects with "an assistant
+    // message with 'tool_calls' must be followed by tool messages". Pair it
+    // with the first result no named call claimed, or with the stub below, and
+    // name it so both sides of the pair agree.
+    const named = new Set();
+    for (const call of calls) {
+      if (typeof call?.id === "string" && call.id) named.add(call.id);
+    }
+    const unclaimed = rows.filter((row) => {
+      const id = typeof row?.tool_call_id === "string" ? row.tool_call_id : "";
+      return id && !named.has(id);
+    });
+    let adopted = 0;
+    let renamed = false;
+    const namedCalls = calls.map((call) => {
+      if (typeof call?.id === "string" && call.id) return call;
+      renamed = true;
+      const row = unclaimed[adopted];
+      if (row) adopted += 1;
+      const id =
+        (row && typeof row.tool_call_id === "string" && row.tool_call_id) ||
+        `call_router_synthetic_${(synthetic += 1)}`;
+      return { ...(call && typeof call === "object" ? call : {}), id };
+    });
+    repaired.push(renamed ? { ...message, tool_calls: namedCalls } : message);
+
+    const callIds = namedCalls.map((call) => call.id);
+    const toolsById = new Map();
+    for (const row of rows) {
+      const toolCallId =
+        typeof row?.tool_call_id === "string" ? row.tool_call_id : "";
+      if (toolCallId && callIds.includes(toolCallId) && !toolsById.has(toolCallId)) {
+        toolsById.set(toolCallId, row);
+      }
     }
 
     for (const callId of callIds) {
