@@ -66,6 +66,19 @@ function finalAnswerMessage(item) {
     : item;
 }
 
+// The client only keeps a reasoning item it can hand back later: every stored
+// item carries the opaque continuation token. DeepSeek has no such token to
+// send, so the collapsed summary was dropped on the floor and the child's own
+// thread recorded no reasoning at all. Carry the summary in a token that names
+// what it is -- the client treats it as opaque, the router replays the summary
+// text -- rather than inventing anything that reads like private reasoning.
+function continuedReasoningToken(text) {
+  return Buffer.from(
+    JSON.stringify({ router: "deepseek-reasoning-summary", text: text || "" }),
+    "utf8",
+  ).toString("base64url");
+}
+
 // DeepSeek's chat-completions translation can surface the full reasoning chain
 // as plaintext `reasoning_text`. Keep the opaque payload for DeepSeek's
 // required follow-up replay, while adding a summary the desktop renders in a
@@ -299,13 +312,31 @@ export class DeepseekReasoningCollapseSseTransform extends Transform {
           return [];
         }
         if (item?.type === "reasoning") {
+          // Rebuilt rather than spread. The translated item can arrive with a
+          // `role` and `output_text` content copied from the answer, and a
+          // reasoning item in that shape is not one the client persists -- the
+          // child's own thread then records no reasoning at all. Keep the
+          // fields a reasoning item actually has.
+          const summary = Array.isArray(item.summary) && item.summary.length > 0
+            ? item.summary
+            : this.summaryText
+              ? [{ type: "summary_text", text: this.summaryText }]
+              : [];
           return [{
-            ...item,
-            summary: (Array.isArray(item.summary) && item.summary.length > 0
-              ? item.summary
-              : this.summaryText
-                ? [{ type: "summary_text", text: this.summaryText }]
-                : []),
+            id: item.id,
+            type: "reasoning",
+            status: typeof item.status === "string" ? item.status : "completed",
+            summary,
+            encrypted_content: continuedReasoningToken(
+              summary.map((part) => part.text || "").join(""),
+            ),
+            content: (Array.isArray(item.content) ? item.content : []).filter(
+              (part) =>
+                part &&
+                part.type === "reasoning_text" &&
+                typeof part.text === "string" &&
+                part.text,
+            ),
           }];
         }
         return [finalAnswerMessage(item)];
@@ -467,11 +498,13 @@ export class DeepseekReasoningCollapseSseTransform extends Transform {
         type: "reasoning",
         status: "completed",
         summary: text ? [{ type: "summary_text", text }] : [],
-        content: this.reasoningContent.length > 0
-          ? this.reasoningContent
-          : this.reasoningText
-            ? [{ type: "reasoning_text", text: this.reasoningText }]
-            : [],
+        encrypted_content: continuedReasoningToken(text),
+        // Only real parts. An empty `reasoning_text` placeholder is not a shape
+        // any OpenAI reasoning item carries, and a client that validates the
+        // item drops the whole thing -- summary included.
+        content: this.reasoningContent.filter(
+          (part) => part && part.type === "reasoning_text" && typeof part.text === "string" && part.text,
+        ),
       },
     }, template) + (parsed ? parsed.separator : ""));
   }

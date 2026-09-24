@@ -8792,6 +8792,13 @@ test("router normalizes direct DeepSeek's live reasoning bridge and removes its 
     type: "reasoning",
     status: "completed",
     summary: [{ type: "summary_text", text: reasoningText }],
+    // The continuation token is what makes the client keep the item at all; it
+    // names itself instead of pretending to be a native ciphertext.
+    encrypted_content: Buffer.from(
+      JSON.stringify({ router: "deepseek-reasoning-summary", text: reasoningText }),
+      "utf8",
+    ).toString("base64url"),
+    content: [],
   };
   const gateway = await mockServer(async (request, response) => {
     await bodyJson(request);
