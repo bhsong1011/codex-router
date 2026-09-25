@@ -1222,10 +1222,10 @@ test("a small native turn is sent unencoded, exactly as it always was", async ()
   }
 });
 
-// The personal login is tried first: the ciphertext belongs to the conversation
-// rather than to the client's account, and the client's account is the one that
-// runs out of allowance. The caller's credential stays as the fallback.
-test("the relay decodes with the personal login before spending the caller's account", async () => {
+// The caller's account is tried first -- the payload belongs to this client's
+// conversation -- and a refusal there falls back to the personal login, which
+// is the account that usually still has room.
+test("a refused caller account falls back to the personal login", async () => {
   const nativeRequests = [];
   const native = await mockServer(async (request, response) => {
     nativeRequests.push({ headers: request.headers, body: await bodyJson(request) });
@@ -1315,14 +1315,125 @@ test("the relay decodes with the personal login before spending the caller's acc
     });
 
     assert.equal(response.status, 200, await response.text());
-    // The personal login answered first, so the capped caller's account was
-    // never asked at all.
-    assert.equal(nativeRequests.length, 1);
-    assert.equal(nativeRequests[0].headers.authorization, "Bearer PERSONAL_SESSION_TOKEN");
-    assert.equal(nativeRequests[0].headers["chatgpt-account-id"], "personal-account-id");
+    // The caller's own account was asked first and refused; the personal login
+    // answered, which is the fallback doing its job.
+    assert.equal(nativeRequests.length, 2);
+    assert.equal(nativeRequests[0].headers.authorization, "Bearer CHATGPT_SESSION_TOKEN");
+    assert.equal(nativeRequests[1].headers.authorization, "Bearer PERSONAL_SESSION_TOKEN");
+    assert.equal(nativeRequests[1].headers["chatgpt-account-id"], "personal-account-id");
     assert.equal(gatewayRequests.length, 1);
     const content = gatewayRequests[0].body.input[0].content;
     assert.equal(content.some((part) => part.type === "encrypted_content"), false);
+    assert.equal(content.at(-1).text, "Inspect the repository.");
+  } finally {
+    await stopChild(router);
+    await closeServer(native.server);
+    await closeServer(gateway.server);
+    rmSync(personalHome, { recursive: true, force: true });
+  }
+});
+
+// A 200 that carries no payload is an account-level failure too -- the next
+// candidate may hold the key. A stream that drops the tool call is a known
+// Responses-API failure mode rather than an exotic one.
+test("a relay that returns no payload falls back to the other account", async () => {
+  const nativeRequests = [];
+  const native = await mockServer(async (request, response) => {
+    nativeRequests.push({ headers: request.headers, body: await bodyJson(request) });
+    if (request.headers.authorization === "Bearer CHATGPT_SESSION_TOKEN") {
+      // A 200 whose stream never carries a usable tool call.
+      response.writeHead(200, { "Content-Type": "text/event-stream" });
+      response.end(
+        `event: response.created\ndata: ${JSON.stringify({
+          type: "response.created",
+          response: { id: "resp_no_payload" },
+        })}\n\ndata: [DONE]\n\n`,
+      );
+      return;
+    }
+    const relayArguments = JSON.stringify({ payload: "Inspect the repository." });
+    const relayEvents = [
+      {
+        type: "response.output_item.added",
+        item: {
+          type: "function_call",
+          id: "fc_relay",
+          name: "relay_external_agent_payload",
+          arguments: "",
+        },
+      },
+      {
+        type: "response.function_call_arguments.done",
+        item_id: "fc_relay",
+        arguments: relayArguments,
+      },
+    ];
+    const event = `${relayEvents
+      .map((entry) => `event: ${entry.type}\ndata: ${JSON.stringify(entry)}\n\n`)
+      .join("")}data: [DONE]\n\n`;
+    response.writeHead(200, { "Content-Type": "application/octet-stream" });
+    response.end(event);
+  });
+  const gatewayRequests = [];
+  const gateway = await mockServer(async (request, response) => {
+    gatewayRequests.push({ headers: request.headers, body: await bodyJson(request) });
+    json(response, 200, { route: "external" });
+  });
+  const personalHome = mkdtempSync(path.join(os.tmpdir(), "personal-relay-empty-"));
+  writeFileSync(
+    path.join(personalHome, "auth.json"),
+    `${JSON.stringify({
+      auth_mode: "chatgpt",
+      last_refresh: new Date().toISOString(),
+      tokens: {
+        access_token: "PERSONAL_SESSION_TOKEN",
+        refresh_token: "personal-refresh-token",
+        account_id: "personal-account-id",
+      },
+    })}\n`,
+    { mode: 0o600 },
+  );
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${native.port}/backend-api/codex`,
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_CHATGPT_LOGIN_HOME: personalHome,
+    CODEX_ROUTER_QUIET: "1",
+  });
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const response = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer CHATGPT_SESSION_TOKEN",
+        "ChatGPT-Account-Id": "account-id",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "kimi-oauth/k3",
+        stream: false,
+        input: [
+          {
+            type: "agent_message",
+            content: [
+              {
+                type: "input_text",
+                text: "Message Type: NEW_TASK\nTask name: /root/critic\nSender: /root\nPayload:\n",
+              },
+              { type: "encrypted_content", encrypted_content: "gAAAAA-no-payload=" },
+            ],
+          },
+        ],
+      }),
+    });
+
+    assert.equal(response.status, 200, await response.text());
+    assert.equal(nativeRequests.length, 2);
+    assert.equal(nativeRequests[0].headers.authorization, "Bearer CHATGPT_SESSION_TOKEN");
+    assert.equal(nativeRequests[1].headers.authorization, "Bearer PERSONAL_SESSION_TOKEN");
+    const content = gatewayRequests[0].body.input[0].content;
     assert.equal(content.at(-1).text, "Inspect the repository.");
   } finally {
     await stopChild(router);
@@ -1397,10 +1508,10 @@ test("a relay refused by every account is paused instead of re-spent", async () 
     await waitFor(`${routerBase(routerPort)}/models`, router);
     const refused = await childTurn();
     assert.equal(refused.status, 502, await refused.text());
-    // One attempt per account, in order: the personal login, then the caller.
+    // One attempt per account, in order: the caller, then the personal login.
     assert.equal(nativeRequests.length, 2);
-    assert.equal(nativeRequests[0].headers.authorization, "Bearer PERSONAL_SESSION_TOKEN");
-    assert.equal(nativeRequests[1].headers.authorization, "Bearer CHATGPT_SESSION_TOKEN");
+    assert.equal(nativeRequests[0].headers.authorization, "Bearer CHATGPT_SESSION_TOKEN");
+    assert.equal(nativeRequests[1].headers.authorization, "Bearer PERSONAL_SESSION_TOKEN");
 
     const paused = await childTurn();
     assert.equal(paused.status, 429, await paused.text());

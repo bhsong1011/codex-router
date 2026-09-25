@@ -1581,6 +1581,9 @@ async function relayEncryptedAgentPayloadOnce(
   if (plaintext === undefined) {
     const error = new Error("Native collaboration payload relay omitted the task payload.");
     error.status = 502;
+    // An account that could not open this envelope is worth replacing, not
+    // reporting: the next candidate may hold the right key.
+    error.omittedPayload = true;
     throw error;
   }
   rememberAgentPayload(cacheKey, plaintext);
@@ -1641,7 +1644,14 @@ let relayRefusedUntil = 0;
 // account refuses -- and the caller's credential stays as the fallback, so an
 // install whose personal login is the capped one is no worse off.
 async function relayHeaderCandidates(request) {
-  const candidates = [];
+  // The caller's own account goes first: the payload belongs to this client's
+  // conversation, and the caller's live session is the identity the turn is
+  // already spending. The Personal ChatGPT login follows as the fallback,
+  // because the client's plan is the one that runs out of allowance while the
+  // personal login usually still has room. A refusal costs one round trip.
+  const candidates = [
+    { account: "the caller's ChatGPT session", headers: nativeHeaders(request) },
+  ];
   try {
     const session = await ensureFreshChatgptLoginToken();
     if (session) {
@@ -1653,7 +1663,6 @@ async function relayHeaderCandidates(request) {
   } catch {
     // No personal login configured: the caller's own credential is all there is.
   }
-  candidates.push({ account: "the caller's ChatGPT session", headers: nativeHeaders(request) });
   return candidates;
 }
 
@@ -1681,11 +1690,17 @@ async function relayEncryptedAgentPayloadWithFallback(request, item, key, signal
       relayRefusedUntil = 0;
       return plaintext;
     } catch (error) {
-      if (!RELAY_CREDENTIAL_REFUSALS.has(error?.upstreamStatus)) throw error;
+      // Two failures mean "this account could not do it" rather than "this
+      // payload is broken": a credential refusal, and a 200 that carried no
+      // payload at all (a wrong account, or a stream that dropped the tool
+      // call). Either way the next account deserves one attempt.
+      if (!RELAY_CREDENTIAL_REFUSALS.has(error?.upstreamStatus) && error?.omittedPayload !== true) {
+        throw error;
+      }
       lastError = error;
       console.error(
-        `[codex-router] collaboration relay refused with HTTP ${error.upstreamStatus} as ` +
-          candidate.account,
+        `[codex-router] collaboration relay failed as ${candidate.account}: ` +
+          (error?.upstreamStatus ? `HTTP ${error.upstreamStatus}` : error.message),
       );
     }
   }
