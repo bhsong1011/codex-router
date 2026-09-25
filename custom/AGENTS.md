@@ -18,7 +18,7 @@ Always pass an explicit `agent_type` when calling `spawn_agent`. If `agent_type`
 The user may define `SUBAGENT_ROUTE` in the session's initial prompt:
 
 ```text
-SUBAGENT_ROUTE=<default | native-terra-high | personal-terra-high | deepseek-flash-high>
+SUBAGENT_ROUTE=<default | native-terra-high | personal-terra-high | personal-gpt6-luna-medium | deepseek-flash-high>
 ```
 
 Before the first subagent spawn:
@@ -39,6 +39,10 @@ chooses that route.
 the normal explicit task-role `agent_type`. It is selected only when the user
 explicitly chooses that route.
 
+`personal-gpt6-luna-medium` resolves to `chatgpt-login/gpt-6-luna` / `medium`
+with the normal explicit task-role `agent_type`. It is selected only when the
+user explicitly chooses that route.
+
 ### DeepSeek Flash dispatch
 
 When the selected route is `deepseek-flash-high` or `default`, spawn a native
@@ -53,10 +57,12 @@ Use the normal explicit `agent_type` for the intended role (`default`,
 messaging are verified; this is the only route that makes the DeepSeek child
 visible in Codex's Subagents view.
 
-The initial DeepSeek turn uses `high`. If Codex has no replayable DeepSeek
-reasoning for a later tool continuation, the router automatically uses that
-continuation's non-thinking mode. Do not expose, invent, or transport private
-reasoning to work around it.
+The initial DeepSeek turn uses `high`, and thinking stays on for the rest of the
+turn: the router carries each turn's reasoning summary back to the provider on
+the following tool continuation, and records that same summary in the child's
+own thread. Do not expose, invent, or transport private reasoning to work
+around anything; if a continuation ever arrives without reasoning, report that
+rather than reconstructing it by hand.
 
 ### DeepSeek progress contract
 
@@ -97,6 +103,7 @@ expected verification command, and a success criterion.
 ### Provider routing
 
 - OpenAI parent, OpenAI child: use `spawn_agent` normally with the real task in `message`. The encrypted channel is required. For `native-terra-high`, set `model: gpt-5.6-terra`; for `personal-terra-high`, set `model: chatgpt-login/gpt-5.6-terra`; set `reasoning_effort: high` for either route.
+- For `personal-gpt6-luna-medium`, set `model: chatgpt-login/gpt-6-luna` and `reasoning_effort: medium` with the explicit task-role `agent_type`.
 - OpenAI parent, DeepSeek Flash child: use `spawn_agent` normally with the real task in `message`, explicit task-role `agent_type`, `model: deepseek/deepseek-v4.1-flash`, `reasoning_effort: high`, and `fork_turns: none`. This native route makes DeepSeek visible as a child. If Codex explicitly rejects it, report the rejection; do not use task files or an MCP bridge.
 - DeepSeek parent, DeepSeek Flash child: use the same direct native DeepSeek spawn and exact DS model/effort/fork settings as OpenAI→DeepSeek.
 - DeepSeek parent, OpenAI child: use `spawn_agent` normally with the real task in `message`. It requires the user's explicit `native-terra-high` or `personal-terra-high` route selection and uses that route's model / `reasoning_effort: high`.
