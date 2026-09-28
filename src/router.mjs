@@ -3025,22 +3025,27 @@ async function buildRoutedRequest({ request, payload, route, agedInput, tokenMax
   const input = Array.isArray(bridged) ? [...bridged] : bridged;
   // Thinking chat providers need the assistant's reasoning replayed, but
   // LiteLLM drops Responses `reasoning` input items. Generic providers keep
-  // the established visible-content carry used for DeepSeek. GLM's native
-  // preserved-thinking contract needs reasoning kept structurally separate so
-  // the API forwarder can restore it as `reasoning_content` before Z.ai.
+  // the established visible-content carry. Two providers need the reasoning
+  // kept structurally separate instead, so the API forwarder can restore it as
+  // `reasoning_content` at the last hop: Z.ai's preserved-thinking contract,
+  // and DeepSeek, whose thinking mode refuses any assistant turn carrying
+  // tool_calls without that field -- even when the visible content holds the
+  // same text, which is what the generic carry produces.
   carryReasoningThroughInput(input, {
-    nativeThinking: chatCompletionsProvider && route.requestProfile === "glm-thinking",
+    nativeThinking:
+      chatCompletionsProvider &&
+      (route.requestProfile === "glm-thinking" || route.requestProfile === "deepseek-thinking"),
   });
   // There is deliberately no "disable thinking when the reasoning is
   // unreplayable" step here. One existed for the 400 DeepSeek returned when a
   // tool call's reasoning could not be replayed, and it could never take
   // effect: `thinking` is not a field LiteLLM's Responses->chat translation
   // carries, so the request it meant to change reached the provider untouched.
-  // Measured against the live endpoint the 400 no longer reproduces in any
-  // shape -- absent, empty, or empty-string `reasoning_content`, one or two
-  // tool calls, v4-flash/v4-pro/legacy reasoner -- and switching thinking off
-  // would now only downgrade a continuation that works with it on. The carry
-  // above is what makes the reasoning replayable again.
+  // The carry above is what makes the reasoning replayable, and the API
+  // forwarder is now the layer that finishes the job: it is the only one that
+  // can see the translated chat messages and write the field DeepSeek
+  // validates, `reasoning_content`. A turn that still has none is made
+  // acceptable there rather than by downgrading the whole request.
   // Models marked requiresTrailingUserTurn reject requests ending with a model
   // turn. Pop trailing assistant messages, reasoning, or subagent outputs.
   if (requiresTrailingUserTurn(route)) {

@@ -236,7 +236,13 @@ function coalesceAssistantMessages(messages) {
   return coalesced;
 }
 
-function restoreGlmReasoningContent(messages) {
+// Thinking providers that keep reasoning in a structurally separate field
+// arrive here as `thinking` content parts: the router carries each reasoning
+// item onto the assistant turn it belongs to, and LiteLLM's Responses->chat
+// translation keeps that part type. Z.ai wants it back as preserved thinking
+// and DeepSeek validates it as `reasoning_content`, so both read it out of the
+// content and onto the message field the provider looks for.
+function restoreReasoningContent(messages) {
   if (!Array.isArray(messages)) return messages;
   return messages.map((message) => {
     if (message?.role !== "assistant" || !Array.isArray(message.content)) return message;
@@ -273,6 +279,36 @@ function restoreGlmReasoningContent(messages) {
     }
     return restored;
   });
+}
+
+// DeepSeek's thinking mode validates two shapes the Responses bridge can hand
+// it once the reasoning has been read back out of the content. Measured
+// against api.deepseek.com with thinking enabled:
+//
+// * an assistant turn carrying tool_calls without a `reasoning_content` field
+//   is refused -- "The `reasoning_content` in the thinking mode must be passed
+//   back to the API" -- even when the turn's content says the same thing, at
+//   any depth of the history, one tool call or many. An empty string satisfies
+//   it where an absent field does not, so a turn the router had no reasoning
+//   to replay for -- history written before this route existed, or by another
+//   provider -- gets the empty field rather than a rebuilt summary. The
+//   endpoint asks only for the field, and inventing reasoning would put words
+//   in the transcript the model never produced.
+// * an assistant turn with a null content and no tool_calls is refused with
+//   "Invalid assistant message: content or tool_calls must be set". Clearing
+//   the reasoning out of the content is what can leave a turn in that state,
+//   so the empty string goes back in its place; the endpoint accepts it.
+function normalizeDeepSeekThinkingMessages(messages, { disabled = false } = {}) {
+  if (!Array.isArray(messages)) return messages;
+  for (const message of messages) {
+    if (message?.role !== "assistant") continue;
+    const calls = Array.isArray(message.tool_calls) ? message.tool_calls.length : 0;
+    if (!calls && message.content === null) message.content = "";
+    if (!disabled && calls && typeof message.reasoning_content !== "string") {
+      message.reasoning_content = "";
+    }
+  }
+  return messages;
 }
 
 // Strict chat-completions providers (Console Go / MiniMax / similar) reject any
@@ -813,6 +849,17 @@ function normalizeBody(buffer, contentType, route) {
     if (!disabled && payload.tool_choice !== undefined && payload.tool_choice !== "none") {
       payload.tool_choice = "auto";
     }
+    // The reasoning the router carried across the Responses bridge belongs in
+    // `reasoning_content` here, not in the assistant's content: DeepSeek
+    // validates the field, and a `thinking` part left in `content` is a part
+    // type it has no contract for. Reading it out is always safe -- the
+    // endpoint accepts the field with thinking on or off -- while the two
+    // repairs it can leave behind are only needed while thinking is on, which
+    // is the mode that validates both of them.
+    payload.messages = normalizeDeepSeekThinkingMessages(
+      restoreReasoningContent(payload.messages),
+      { disabled },
+    );
   } else if (model.requestProfile === "deepseek-nonthinking") {
     payload.thinking = { type: "disabled" };
     delete payload.reasoning_effort;
@@ -865,7 +912,7 @@ function normalizeBody(buffer, contentType, route) {
     }
   } else if (model.requestProfile === "glm-thinking") {
     payload.thinking = { type: "enabled", clear_thinking: false };
-    payload.messages = restoreGlmReasoningContent(payload.messages);
+    payload.messages = restoreReasoningContent(payload.messages);
     // Each GLM entry declares exactly the tiers Z.ai documents for it, and the
     // requested effort is clamped onto them. Models whose registry entry offers
     // a single level (GLM-5-Turbo, GLM-4.7) do not support the parameter at

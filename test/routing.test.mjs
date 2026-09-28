@@ -5791,6 +5791,92 @@ test("API forwarder restores bridged GLM thinking as native reasoning_content", 
   }
 });
 
+// The native DeepSeek routes force `thinking: {type:"enabled"}` on, and the
+// endpoint then validates two shapes the Responses bridge can hand it, both
+// measured against api.deepseek.com. An assistant turn carrying tool_calls
+// without a `reasoning_content` field is refused at any depth of the history,
+// one tool call or many; an omitted field answers 400 where `reasoning_content:
+// ""` answers 200. And a turn with null content and no tool_calls is refused
+// with "Invalid assistant message: content or tool_calls must be set", which
+// is the shape clearing reasoning out of the content can leave behind. So the
+// carried reasoning has to land on `reasoning_content`, and both repairs have
+// to hold for a turn this route never had reasoning for.
+test("API forwarder replays DeepSeek thinking as reasoning_content", async () => {
+  const upstreamRequests = [];
+  const upstream = await mockServer(async (request, response) => {
+    upstreamRequests.push({ body: await bodyJson(request) });
+    json(response, 200, { choices: [] });
+  });
+  const forwarderPort = await openPort();
+  const forwarder = run("api-forwarder.mjs", {
+    CODEX_ROUTER_API_PORT: String(forwarderPort),
+    DEEPSEEK_API_BASE_URL: `http://127.0.0.1:${upstream.port}`,
+    DEEPSEEK_API_KEY: "TEST_DEEPSEEK_API_KEY",
+    CODEX_ROUTER_QUIET: "1",
+  });
+  const call = (id) => ({
+    id,
+    type: "function",
+    function: { name: "exec_command", arguments: "{}" },
+  });
+
+  try {
+    await waitFor(`http://127.0.0.1:${forwarderPort}/health`, forwarder, {
+      Authorization: `Bearer ${INTERNAL_KEY}`,
+    });
+    const response = await fetch(
+      `http://127.0.0.1:${forwarderPort}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${INTERNAL_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "deepseek-v4.1-flash",
+          messages: [
+            { role: "user", content: "first" },
+            {
+              role: "assistant",
+              content: [{ type: "thinking", text: "the log lives under /var/log" }],
+              tool_calls: [call("c1")],
+            },
+            { role: "tool", tool_call_id: "c1", content: "ok" },
+            { role: "user", content: "again" },
+            // A turn no reasoning was ever recorded for: the field has to be
+            // present and empty, and nothing may be invented to fill it.
+            { role: "assistant", tool_calls: [call("c2")] },
+            { role: "tool", tool_call_id: "c2", content: "ok" },
+            { role: "user", content: "and a prose answer" },
+            // Reasoning-only, no visible content and no tool call.
+            { role: "assistant", content: [{ type: "thinking", text: "nothing to add" }] },
+            { role: "user", content: "still there?" },
+          ],
+        }),
+      },
+    );
+    assert.equal(response.status, 200);
+    const request = upstreamRequests[0].body;
+    assert.deepEqual(request.thinking, { type: "enabled" });
+    const replayed = request.messages.find(
+      (message) => Array.isArray(message.tool_calls) && message.tool_calls[0].id === "c1",
+    );
+    assert.equal(replayed.reasoning_content, "the log lives under /var/log");
+    assert.equal(replayed.content, null);
+    const unreplayable = request.messages.find(
+      (message) => Array.isArray(message.tool_calls) && message.tool_calls[0].id === "c2",
+    );
+    assert.equal(unreplayable.reasoning_content, "");
+    const prose = request.messages.find(
+      (message) => message.reasoning_content === "nothing to add",
+    );
+    assert.equal(prose.content, "", "a null content is what DeepSeek calls an invalid turn");
+  } finally {
+    await stopChild(forwarder);
+    await closeServer(upstream.server);
+  }
+});
+
 test("API forwarder preserves Z.ai cached-token telemetry before the LiteLLM bridge", async () => {
   const upstream = await mockServer(async (request, response) => {
     await bodyJson(request);
@@ -8865,6 +8951,62 @@ test("GLM reasoning stays structurally separate while crossing the Responses bri
       false,
       "provider reasoning leaked into visible assistant content",
     );
+  } finally {
+    await stopChild(router);
+    await closeServer(gateway.server);
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+// DeepSeek is the second provider that needs the reasoning kept structurally
+// separate across the bridge. Its thinking mode validates `reasoning_content`
+// on every tool-call turn, so the carry has to arrive as a `thinking` part the
+// API forwarder can move onto that field; the generic visible-content carry is
+// exactly the shape the endpoint refuses.
+test("DeepSeek reasoning crosses the Responses bridge as a thinking part", async () => {
+  const gatewayBodies = [];
+  const gateway = await mockServer(async (request, response) => {
+    gatewayBodies.push(await bodyJson(request));
+    json(response, 200, { output: [{ type: "message", role: "assistant", content: "ok" }] });
+  });
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "deepseek-reasoning-bridge-state-"));
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    MODEL_ROUTER_STATE_DIR: stateDir,
+    CODEX_ROUTER_QUIET: "1",
+  });
+  const input = [
+    { type: "message", role: "user", content: [{ type: "input_text", text: "check the log" }] },
+    {
+      type: "reasoning",
+      id: "rs_direct_deepseek",
+      summary: [{ type: "summary_text", text: "The log lives under /var/log." }],
+      content: null,
+    },
+    { type: "function_call", call_id: "ds-call", name: "exec_command", arguments: "{}" },
+    { type: "function_call_output", call_id: "ds-call", output: "nothing to report" },
+  ];
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const response = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer CODEX_CALLER_SECRET",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ model: "deepseek/deepseek-v4.1-flash", stream: false, input }),
+    });
+    assert.equal(response.status, 200, await response.text());
+    const forwarded = gatewayBodies[0].input;
+    const callIndex = forwarded.findIndex((item) => item?.type === "function_call");
+    const beforeCall = forwarded[callIndex - 1];
+    assert.equal(beforeCall?.role, "assistant");
+    assert.deepEqual(beforeCall.content, [
+      { type: "thinking", text: "The log lives under /var/log." },
+    ]);
   } finally {
     await stopChild(router);
     await closeServer(gateway.server);
