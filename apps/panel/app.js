@@ -2031,7 +2031,11 @@ function startIsland() {
   refreshIslandUsage();
   refreshIslandHealth();
   window.setInterval(refreshIslandHealth, 750);
-  window.setInterval(refreshIslandUsage, 30_000);
+  // Every account read spawns a `codex app-server`, and each of those leaks a
+  // full marketplace clone (see src/marketplace-staging-prune.mjs). The router
+  // already caches the answer for two minutes, so a faster poll than this buys
+  // nothing and only spends processes.
+  window.setInterval(refreshIslandUsage, 60_000);
 
   async function refreshIslandHealth() {
     if (state.healthPending) return;
