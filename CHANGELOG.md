@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **Account usage is read through one long-lived Codex session instead of a
+  short-lived process per read.** Killing the app-server a second after it
+  answers is what stranded its marketplace clone: the upgrade runs on a
+  detached thread, the copy finishes into
+  `$CODEX_HOME/.tmp/marketplaces/.staging/marketplace-upgrade-*`, and nothing
+  removes it (openai/codex#47735, #21005). The router now keeps one app-server
+  for the lifetime of the service and republishes the account cache from it
+  every 60 seconds, so the tray, the panel and the CLI all read that instead of
+  spawning anything. Measured: one process, zero clones over five minutes, and
+  the marketplace checkout untouched because nothing is left to finish. The
+  staging sweep stays as the backstop.
+
 - **Account usage reads are cached, and Codex's abandoned marketplace clones
   are swept.** Reading the signed-in account spawns a `codex app-server`, and
   every such startup begins Codex's marketplace auto-upgrade on a detached

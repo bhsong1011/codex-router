@@ -24,6 +24,13 @@ import { spawnableCommand } from "./spawnable-command.mjs";
 import { ensureOllamaHeadless } from "./ollama-runtime.mjs";
 import { venvRuntimeProblem } from "./venv-runtime.mjs";
 import { startMarketplaceStagingPrune } from "./marketplace-staging-prune.mjs";
+import {
+  createCodexAppServerSession,
+  startAccountUsageRefresh,
+} from "./codex-account-session.mjs";
+import { findCodexBinary } from "./codex-binary.mjs";
+import { normalizeCodexAccountUsage } from "./codex-account-usage.mjs";
+import { readCodexMonthlyUsage } from "./codex-monthly-usage.mjs";
 import { dependencyRepairHint } from "./dependency-repair.mjs";
 import { clearServiceProcessState, writeServiceProcessState } from "./service-process.mjs";
 import {
@@ -256,9 +263,42 @@ function waitForHealth(label, url, headers = {}, timeoutMs = 30_000, expectedSer
 // drift apart; the margin covers the exit itself.
 const SIGKILL_AFTER_MS = SHUTDOWN_DRAIN_MS + SHUTDOWN_FLUSH_MS + 2_000;
 
+// Assigned by startAccountUsage() in main(); the shutdown path needs it before
+// that has run, so it starts as a no-op.
+let stopAccountUsage = () => {};
+
+// One Codex process, reused, publishing account usage into the cache every
+// reader already consults. Spawning one per read is what stranded a full
+// marketplace clone per read -- see codex-account-session.mjs.
+function startAccountUsage() {
+  const binary = findCodexBinary();
+  if (!binary) {
+    console.error("[codex-router] no Codex binary was found; account usage stays unread.");
+    return;
+  }
+  const session = createCodexAppServerSession({ binary });
+  const refresh = startAccountUsageRefresh({
+    session,
+    compose: async () => {
+      const { limits, usage } = await session.readRaw();
+      const account = normalizeCodexAccountUsage(limits, usage);
+      const monthly = await readCodexMonthlyUsage().catch(() => null);
+      return monthly ? { ...account, monthly } : account;
+    },
+  });
+  stopAccountUsage = () => {
+    refresh.stop();
+    session.stop();
+  };
+}
+
 function stopChildren() {
   if (shuttingDown) return;
   shuttingDown = true;
+  // The account session holds a Codex process that is not in `children`, so it
+  // is not covered by the SIGTERM/SIGKILL sweep below. Leaving it behind would
+  // orphan exactly the kind of process this router stopped creating.
+  stopAccountUsage();
   for (const child of children) {
     if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
   }
@@ -278,6 +318,9 @@ async function main() {
   // every time the tray reads account usage. Sweep our own leftovers from
   // startup so the directory cannot grow across restarts.
   startMarketplaceStagingPrune();
+  // Then stop provoking them: one reused Codex session publishes account usage
+  // for every reader instead of one short-lived process per read.
+  startAccountUsage();
   // These forwarders use separate ports and do not depend on one another.
   // Start all of them before waiting so a cold service does not pay their
   // startup times one after another.

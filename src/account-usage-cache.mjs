@@ -39,6 +39,18 @@ function writeCache(cachePath, entry) {
   }
 }
 
+// The router service publishes into the same file every reader consults, so the
+// one long-lived Codex session is what answers the tray, the panel and the CLI
+// alike -- none of them need to spawn anything of their own.
+export function storeAccountUsage({
+  value,
+  cachePath = ACCOUNT_USAGE_CACHE_PATH,
+  now = Date.now(),
+} = {}) {
+  writeCache(cachePath, { storedAtMs: now, value });
+  return value;
+}
+
 export async function cachedAccountUsage({
   cachePath = ACCOUNT_USAGE_CACHE_PATH,
   ttlMs = ACCOUNT_USAGE_TTL_MS,

@@ -124,3 +124,39 @@ remove the trigger outright (a home with no marketplaces has nothing to upgrade;
 verified working), but it shares `auth.json` with the main home, so a token
 refresh from the probe writes the file the app is using. Not shipped.
 Reusing one long-lived app-server would also end the churn. Both are open.
+
+### Long-lived account session (2026-09-29)
+
+The cache and sweep above bounded the leak; they did not stop it. The trigger
+is that a usage read spawns `codex app-server`, asks two questions, and kills it
+about a second later -- while the marketplace upgrade that same startup began is
+still running on a detached thread. The clone finishes into `.staging` and is
+never reaped.
+
+`src/codex-account-session.mjs` keeps one app-server for the lifetime of the
+router service and reads `account/rateLimits/read` plus `account/usage/read` on
+demand, serially, one request pair at a time. `startAccountUsageRefresh()` in
+the same file republishes the result to `account-usage-cache.json` every 60
+seconds; `control.mjs account` already reads that file, so the tray, the panel
+and the CLI all take the published reading and spawn nothing. The CLI keeps its
+own live spawn as a fallback for when the router is not running.
+
+The session lives in `start.mjs` because that is the only long-lived process we
+own -- `control.mjs` is one-shot. `stopChildren()` calls `stopAccountUsage()`,
+so a router restart kills the Codex process it owns rather than orphaning it.
+Failures back off 1s / 5s / 30s / 5min and are capped, so a Codex that cannot
+start costs one attempt per interval instead of a spawn storm.
+
+Verified: 7 unit tests against a stub app-server (reuse, timeout without
+wedging, respawn after death, notification noise, publish-then-read, capped
+backoff, stop kills the child), plus live observation -- the router holds
+exactly one app-server, the cache refreshes every ~60s, a router restart reaps
+the old child, and `.staging` stayed at zero across five minutes with the tray
+polling.
+
+Open: the tray reads account usage with `CODEX_HOME=~/.codex-personal`, which
+resolves its own cache path (`~/.codex-personal/codex-router/`), so those reads
+still miss the published cache and spawn. That home has no marketplaces
+configured, so it strands nothing -- its staging directory does not exist -- but
+it still spends a process every couple of minutes. Serving both homes from the
+publisher, or keying the cache per home, would close it.

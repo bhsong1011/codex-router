@@ -22,7 +22,7 @@ function codexBinary() {
 // Killing a child that was reached through cmd.exe kills the shell, not the
 // app-server behind it. On a timeout that left a Codex process holding the
 // pipe for as long as the session lived, once per poll.
-function killProcessTree(child, viaShell) {
+export function killProcessTree(child, viaShell) {
   if (!viaShell || process.platform !== "win32" || !child.pid) {
     child.kill();
     return;
