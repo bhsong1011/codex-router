@@ -23,6 +23,7 @@ import { readLocalModelSelection } from "./local-models.mjs";
 import { spawnableCommand } from "./spawnable-command.mjs";
 import { ensureOllamaHeadless } from "./ollama-runtime.mjs";
 import { venvRuntimeProblem } from "./venv-runtime.mjs";
+import { startMarketplaceStagingPrune } from "./marketplace-staging-prune.mjs";
 import { dependencyRepairHint } from "./dependency-repair.mjs";
 import { clearServiceProcessState, writeServiceProcessState } from "./service-process.mjs";
 import {
@@ -272,6 +273,11 @@ const FRONTEND = { script: "router.mjs", service: "codex-router", label: "Codex 
 for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, stopChildren);
 
 async function main() {
+  // Codex's marketplace upgrade abandons a full clone whenever the app-server
+  // that started it exits first, and this router provokes those app-servers
+  // every time the tray reads account usage. Sweep our own leftovers from
+  // startup so the directory cannot grow across restarts.
+  startMarketplaceStagingPrune();
   // These forwarders use separate ports and do not depend on one another.
   // Start all of them before waiting so a cold service does not pay their
   // startup times one after another.

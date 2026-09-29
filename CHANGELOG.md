@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **Account usage reads are cached, and Codex's abandoned marketplace clones
+  are swept.** Reading the signed-in account spawns a `codex app-server`, and
+  every such startup begins Codex's marketplace auto-upgrade on a detached
+  thread. The router kills that app-server as soon as it answers -- about a
+  second -- so the upgrade's `git cloneimplement 1` outlives its parent, finishes into
+  `$CODEX_HOME/.tmp/marketplaces/.staging/marketplace-upgrade-*`, and is never
+  removed (openai/codex#47735, #21005). Nothing in Codex cleans it up, and
+  because the upgrade never persists, the marketplace stays stale and the whole
+  cycle repeats on the next read. On this machine it accumulated 116G in three
+  days. `codex-router account` now serves a cached reading for two minutes --
+  the windows it paints are five hours and one week long -- and the router
+  prunes staging directories older than ten minutes at startup and every ten
+  minutes after. Measured: app-server launches fell from 9 to 2 per 90 seconds,
+  and the directory is now bounded instead of unbounded.
+
 - **Strict generic providers no longer receive unadvertised hosted-search
   extensions.** Codex may attach `web_search`, `web_search_preview`,
   `web_search_options`, and search-only `include` entries even when the chosen

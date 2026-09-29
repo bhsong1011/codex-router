@@ -75,3 +75,52 @@ Upstream tracking:
 - Do not commit the built binary (~1.4 GB). Rebuild per machine or ship the
   binary out of band.
 - Verification is behavior-based (doctor + spawn matrix), not binary sha.
+
+## Marketplace upgrade staging leak
+
+Found 2026-09-29. `$CODEX_HOME/.tmp/marketplaces/.staging` held 3,500
+directories and 116G. Every one was a complete clone of the same repository
+(`mksglu/context-mode`, 46M, clean tree, same commit) -- not partial work.
+
+**Mechanism.** Reading account usage spawns a short-lived `codex app-server`.
+Every app-server startup runs Codex's marketplace auto-upgrade on a detached
+thread, which `git clone`s each configured Git marketplace into
+`.staging/marketplace-upgrade-XXXXXX`. The router kills that app-server the
+moment the account answer arrives -- about a second, via `killProcessTree()` in
+`codex-account-usage.mjs` -- so the clone outlives its parent and finishes into
+a directory nothing owns. Neither the git child is killed nor the temp-directory
+destructor runs, and Codex has no equivalent of its own
+`remove_stale_curated_repo_temp_dirs()` for this path, so the clone is permanent.
+The upgrade never persists either: `config.toml` still recorded
+`last_revision = 2dba0ff7` (Aug 31) against an upstream `c6477b6`, so the next
+launch re-attempted the same upgrade and leaked again. Self-perpetuating.
+
+**Why us.** The tray polls account usage every 30s for the island widget's
+token and percent readout. Measured 6 app-server launches per minute, 3 orphans
+per minute, ~8G/hour. The desktop app's own long-lived app-server also runs the
+upgrade, but it survives, so its upgrades complete and nothing is orphaned.
+
+Upstream tracking: openai/codex#47735 (root cause), #21005 (missing sweep),
+#38770 (30s clone timeout), #45943 (212G on another machine), #34128 (annotated
+tag loop). Unfixed in `0.155.0-alpha.16.3`.
+
+**Fix (both landed here, neither upstream):**
+
+- `account-usage-cache.mjs` -- `codex-router account` serves a reading cached
+  for `ACCOUNT_USAGE_TTL_MS` (120s). The windows it paints are five hours and
+  one week, so a cached answer is accurate, and it costs no process.
+- `marketplace-staging-prune.mjs` -- removes `marketplace-*` entries older than
+  `STALE_STAGING_MS` (10 min) at startup and on a ten-minute timer. The age
+  floor is what makes it safe: the launcher dies in ~1s and its orphan finishes
+  within a minute, so nothing that old is in flight. Non-`marketplace-*` entries
+  are left alone.
+
+**Verified.** 116G -> 1.5G on the initial sweep; `~/.codex` 120G -> 12G. Startup
+sweep confirmed by planting a synthetic hour-old directory and restarting.
+App-server launches 9 -> 2 per 90s, staging growth 3/min -> under 1/min.
+
+**Deliberately not done.** A scratch `CODEX_HOME` for the account read would
+remove the trigger outright (a home with no marketplaces has nothing to upgrade;
+verified working), but it shares `auth.json` with the main home, so a token
+refresh from the probe writes the file the app is using. Not shipped.
+Reusing one long-lived app-server would also end the churn. Both are open.

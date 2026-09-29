@@ -650,9 +650,19 @@ async function runSetApply(provider, desired) {
 async function printAccountUsage() {
   const { readCodexAccountUsage } = await import("./codex-account-usage.mjs");
   const { readCodexMonthlyUsage } = await import("./codex-monthly-usage.mjs");
-  const account = await readCodexAccountUsage();
-  const monthly = await readCodexMonthlyUsage().catch(() => null);
-  process.stdout.write(`${JSON.stringify(monthly ? { ...account, monthly } : account, null, 2)}\n`);
+  const { cachedAccountUsage } = await import("./account-usage-cache.mjs");
+  // Every read spawns a `codex app-server`, and each of those spawns leaks a
+  // full marketplace clone (see marketplace-staging-prune.mjs). The windows
+  // this feeds are hours and days long, so a cached answer is as good as a
+  // live one here and costs no process.
+  const account = await cachedAccountUsage({
+    read: async () => {
+      const live = await readCodexAccountUsage();
+      const monthly = await readCodexMonthlyUsage().catch(() => null);
+      return monthly ? { ...live, monthly } : live;
+    },
+  });
+  process.stdout.write(`${JSON.stringify(account, null, 2)}\n`);
 }
 
 async function printProviderUsage() {
