@@ -1,5 +1,38 @@
 # Notes and limitations
 
+## Native Responses WebSocket disabled (2026-10-08)
+
+After the desktop app was updated to `26.1002.52244` (`codex-cli
+0.162.0-alpha.2`), a turn in thread `01a0d6f5` failed with:
+
+```
+Responses WebSocket messages must have type response.create.
+```
+
+This is not a router fault. The failing turn ran `model = gpt-6-sol` with no
+provider override, so it went to OpenAI's native backend, and the router's own
+log holds zero occurrences of that message. The string is absent from the
+client binary, so a server produced it; the codex logs DB shows the first
+occurrence at 2026-10-08 20:16:56, after the 13:04 install.
+
+The updated client carries `responses_websockets` / `responses_websockets_v2`
+feature flags and sends `OpenAI-Beta: responses_websockets=2026-02-06`, so
+native turns now use the Responses WebSocket transport rather than HTTP
+streaming. Upstream has several open issues on that path (#35751, #47792,
+#46975).
+
+Change: `responses_websockets = false` under `[features]` in
+`~/.codex/config.toml`, with a comment naming this file. Native turns return to
+HTTP streaming. Routed models are unaffected either way -- the router serves
+both transports (`src/responses-websocket.mjs` for the WS edge, requiring the
+beta header). Cost: no warm socket, so each turn opens a fresh stream and
+resends history. Benefit beyond the fix: upstream #46975 reports the startup
+prewarm sending ~9k uncached input tokens that never appear in turn usage.
+
+Revert by deleting the line once the client's WebSocket path stops producing
+this error class.
+
+
 ## Baselines
 
 - Router fork base: `duolahypercho/codex-router` commit `43deff5`.
