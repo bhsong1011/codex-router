@@ -975,7 +975,8 @@ class ResponsesWebSocketPeer {
       console.error(
         `[codex-router] rejected Responses WebSocket message type=` +
           `${JSON.stringify(request?.type ?? null)} keys=` +
-          `${Array.isArray(request) ? "array" : Object.keys(request || {}).join(",")}`,
+          `${Array.isArray(request) ? "array" : Object.keys(request || {}).join(",")} ` +
+          `frame=${JSON.stringify(text).slice(0, 600)}`,
       );
       this.sendError(400, {
         type: "invalid_request_error",
