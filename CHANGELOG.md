@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Adds a `personal-gpt6.1-sol-high` subagent route.** Resolves to
+  `chatgpt-login/gpt-6.1-sol` at `high` with the normal explicit task-role
+  `agent_type`, alongside the existing `personal-terra-high` and
+  `personal-gpt6-luna-medium` routes. Selected only when the user asks for it.
+
 - **Adds GPT-6.1 Sol to the personal ChatGPT login.** `chatgpt-login/gpt-6.1-sol`
   is the newer Sol model in the GPT-6 series -- near-Astra performance for
   complex coding, computer use, and professional work at a lower price than
