@@ -45,6 +45,7 @@ test("provider registry exposes configured API and OAuth model families", () => 
       "chatgpt-login/gpt-6-astra",
       "chatgpt-login/gpt-6-luna",
       "chatgpt-login/gpt-6-sol",
+      "chatgpt-login/gpt-6.1-sol",
       "clinepass/deepseek-v4-flash",
       "clinepass/deepseek-v4-pro",
       "clinepass/glm-5.2",

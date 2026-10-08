@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **Adds GPT-6.1 Sol to the personal ChatGPT login.** `chatgpt-login/gpt-6.1-sol`
+  is the newer Sol model in the GPT-6 series -- near-Astra performance for
+  complex coding, computer use, and professional work at a lower price than
+  Astra -- and the routing entry mirrors the existing personal models: the same
+  request profile, the same 272k window the installed Codex advertises, and the
+  low / medium / high / xhigh / max / ultra ladder. It sits above GPT-6 Sol in
+  the picker, since OpenAI's own model page points at it as Sol's successor.
+
 - **Account usage is read through one long-lived Codex session instead of a
   short-lived process per read.** Killing the app-server a second after it
   answers is what stranded its marketplace clone: the upgrade runs on a
