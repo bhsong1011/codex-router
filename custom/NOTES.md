@@ -1,37 +1,39 @@
 # Notes and limitations
 
-## Native Responses WebSocket disabled (2026-10-08)
+## Responses WebSocket rejection on the router edge (2026-10-08)
 
-After the desktop app was updated to `26.1002.52244` (`codex-cli
-0.162.0-alpha.2`), a turn in thread `01a0d6f5` failed with:
+Symptom, twice: a turn fails with
 
 ```
 Responses WebSocket messages must have type response.create.
 ```
 
-This is not a router fault. The failing turn ran `model = gpt-6-sol` with no
-provider override, so it went to OpenAI's native backend, and the router's own
-log holds zero occurrences of that message. The string is absent from the
-client binary, so a server produced it; the codex logs DB shows the first
-occurrence at 2026-10-08 20:16:56, after the 13:04 install.
+First attempt at a fix was wrong and has been reverted. `[features]
+responses_websockets = false` in `~/.codex/config.toml` is inert: the client
+confirmed the flag off (`doctor` shows it absent from the 56 enabled features)
+while still opening `codex_api::endpoint::responses_websocket`. The transport is
+selected by provider capability, not that feature flag -- the documented key is
+`model_providers.<id>.supports_websockets`
+(developers.openai.com, config-file reference and the WebSocket-mode guide).
 
-The updated client carries `responses_websockets` / `responses_websockets_v2`
-feature flags and sends `OpenAI-Beta: responses_websockets=2026-02-06`, so
-native turns now use the Responses WebSocket transport rather than HTTP
-streaming. Upstream has several open issues on that path (#35751, #47792,
-#46975).
+Second correction: this is our router, not OpenAI. `openai_base_url =
+"http://127.0.0.1:4202/v1"` in `config.toml` reroutes the *native* provider
+through the router, so even a `gpt-6-sol` turn lands on our edge -- the earlier
+"native, therefore not ours" reasoning was wrong, as was reading an empty
+`router.log` as proof, since in-band WS errors were never logged at all.
 
-Change: `responses_websockets = false` under `[features]` in
-`~/.codex/config.toml`, with a comment naming this file. Native turns return to
-HTTP streaming. Routed models are unaffected either way -- the router serves
-both transports (`src/responses-websocket.mjs` for the WS edge, requiring the
-beta header). Cost: no warm socket, so each turn opens a fresh stream and
-resends history. Benefit beyond the fix: upstream #46975 reports the startup
-prewarm sending ~9k uncached input tokens that never appear in turn usage.
+`src/responses-websocket.mjs` accepted exactly one client message type,
+`response.create`. The 2026 protocol carries more: `response.steer` for
+mid-turn input and `response.inject` for tool results
+(developers.openai.com, Responses WebSocket reference). Anything else is
+rejected with that 400 -- and the error envelope we send is keyed
+`type, status, error`, matching what the thread recorded.
 
-Revert by deleting the line once the client's WebSocket path stops producing
-this error class.
-
+Change so far: a rejection now logs the offending type and keys, one line on the
+error path only. Still to do once a rejection is captured: accept and forward the
+types the client actually sends, or set
+`model_providers.<id>.supports_websockets = false` to fall back to HTTP. The
+output of the new log line decides which.
 
 ## Baselines
 

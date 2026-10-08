@@ -968,6 +968,15 @@ class ResponsesWebSocketPeer {
       return;
     }
     if (!request || Array.isArray(request) || request.type !== "response.create") {
+      // The 2026 WebSocket protocol carries more than response.create --
+      // response.steer for mid-turn input, and response.inject for tool
+      // results. Name the type that arrived so a rejection is attributable
+      // instead of a mystery 400 on the client.
+      console.error(
+        `[codex-router] rejected Responses WebSocket message type=` +
+          `${JSON.stringify(request?.type ?? null)} keys=` +
+          `${Array.isArray(request) ? "array" : Object.keys(request || {}).join(",")}`,
+      );
       this.sendError(400, {
         type: "invalid_request_error",
         message: "Responses WebSocket messages must have type response.create.",
