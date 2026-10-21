@@ -61,12 +61,29 @@ function macosTransactionFixture({
 }
 
 function installCompleteMacosTrayBundle(bundle, { includeWidget = true } = {}) {
-  mkdirSync(path.join(bundle, "Contents", "MacOS"), { recursive: true });
+  for (const relative of [
+    "Contents",
+    "Contents/MacOS",
+    "Contents/PlugIns",
+    "Contents/PlugIns/RouterUsageWidget.appex",
+    "Contents/PlugIns/RouterUsageWidget.appex/Contents",
+    "Contents/PlugIns/RouterUsageWidget.appex/Contents/MacOS",
+    "Contents/Resources",
+    "Contents/Resources/Control Center.app",
+    "Contents/Resources/Control Center.app/Contents",
+    "Contents/Resources/Control Center.app/Contents/MacOS",
+    "Contents/Resources/Control Center.app/Contents/Resources",
+  ]) {
+    const directory = path.join(bundle, relative);
+    mkdirSync(directory, { recursive: true, mode: 0o755 });
+    chmodSync(directory, 0o755);
+  }
   writeFileSync(
     path.join(bundle, "Contents", "Info.plist"),
     "<plist><dict><key>CFBundleIdentifier</key><string>io.github.codex-router.tray</string></dict></plist>",
     "utf8",
   );
+  chmodSync(path.join(bundle, "Contents", "Info.plist"), 0o644);
   const nativeBinary = path.join(bundle, "Contents", "MacOS", "ModelRouterTray");
   writeFileSync(nativeBinary, "binary", "utf8");
   chmodSync(nativeBinary, 0o755);
@@ -80,7 +97,6 @@ function installCompleteMacosTrayBundle(bundle, { includeWidget = true } = {}) {
       "MacOS",
       "RouterUsageWidget",
     );
-    mkdirSync(path.dirname(widgetBinary), { recursive: true });
     writeFileSync(
       path.join(
         bundle,
@@ -93,6 +109,17 @@ function installCompleteMacosTrayBundle(bundle, { includeWidget = true } = {}) {
       "<plist><dict><key>CFBundleIdentifier</key><string>io.github.codex-router.tray.widget</string></dict></plist>",
       "utf8",
     );
+    chmodSync(
+      path.join(
+        bundle,
+        "Contents",
+        "PlugIns",
+        "RouterUsageWidget.appex",
+        "Contents",
+        "Info.plist",
+      ),
+      0o644,
+    );
     writeFileSync(widgetBinary, "widget", "utf8");
     chmodSync(widgetBinary, 0o755);
   }
@@ -103,12 +130,12 @@ function installCompleteMacosTrayBundle(bundle, { includeWidget = true } = {}) {
     "Control Center.app",
     "Contents",
   );
-  mkdirSync(path.join(embedded, "MacOS"), { recursive: true });
-  mkdirSync(path.join(embedded, "Resources"), { recursive: true });
   const embeddedBinary = path.join(embedded, "MacOS", "Codex Router");
   writeFileSync(embeddedBinary, "binary", "utf8");
   chmodSync(embeddedBinary, 0o755);
-  writeFileSync(path.join(embedded, "Resources", "app.asar"), "archive", "utf8");
+  const embeddedArchive = path.join(embedded, "Resources", "app.asar");
+  writeFileSync(embeddedArchive, "archive", "utf8");
+  chmodSync(embeddedArchive, 0o644);
   return bundle;
 }
 
