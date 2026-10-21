@@ -142,6 +142,18 @@ test("messages in later tool exchanges stay with their own exchange", () => {
   ]);
 });
 
+test("assistant messages are hoisted out of tool-call exchanges", () => {
+  const assistantMessage = { type: "message", role: "assistant", content: "checkpoint" };
+  const call = { type: "function_call", call_id: "call_1", name: "shell", arguments: "{}" };
+  const output = { type: "function_call_output", call_id: "call_1", output: "done" };
+
+  assert.deepEqual(deepSeekResponsesInput([call, assistantMessage, output]), [
+    assistantMessage,
+    call,
+    output,
+  ]);
+});
+
 test("only unsupported custom tools require the function bridge", () => {
   assert.deepEqual(deepSeekCustomToolNames(
     [{ type: "custom", name: "apply_patch" }, { type: "custom", name: "exec" }],

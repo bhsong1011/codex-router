@@ -42,11 +42,15 @@ function relocateMessagesOutOfToolExchanges(items) {
   for (const item of items) {
     const type = item?.type;
     if (isAssistantMessage(item)) {
-      if (openCalls.size === 0) {
+      if (openCalls.size > 0 && exchangeStart >= 0) {
+        const at = hoistAt >= 0 ? hoistAt : exchangeStart;
+        result.splice(at, 0, item);
+        hoistAt = at + 1;
+      } else {
         exchangeStart = result.length;
         hoistAt = -1;
+        result.push(item);
       }
-      result.push(item);
       continue;
     }
     if (TOOL_CALL_TYPES.has(type)) {
