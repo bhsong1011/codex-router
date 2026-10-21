@@ -779,61 +779,6 @@ class ResponsesWebSocketPeer {
     });
   }
 
-  async relayCompletedJsonResponse(body, fullRequest, upstream) {
-    let response;
-    try {
-      response = JSON.parse(body.toString("utf8"));
-    } catch {
-      return false;
-    }
-    if (
-      !response ||
-      typeof response !== "object" ||
-      Array.isArray(response) ||
-      response.object !== "response" ||
-      !["completed", "incomplete", "failed"].includes(response.status) ||
-      typeof response.id !== "string" ||
-      !Array.isArray(response.output)
-    ) {
-      return false;
-    }
-    if (!(await sendSuccessfulResponseHeaders(this, upstream))) return true;
-    if (!(await this.sendJsonWithBackpressure({
-      type: "response.created",
-      response: { id: response.id },
-    }))) return true;
-
-    let outputItemsBytes = 0;
-    let continuationOverflow = false;
-    for (const [output_index, item] of response.output.entries()) {
-      const itemBytes = Buffer.byteLength(JSON.stringify(item), "utf8");
-      if (outputItemsBytes + itemBytes <= this.options.maxContinuationBytes) {
-        outputItemsBytes += itemBytes;
-      } else {
-        continuationOverflow = true;
-      }
-      if (!(await this.sendJsonWithBackpressure({
-        type: "response.output_item.done",
-        output_index,
-        item,
-      }))) return true;
-    }
-    if (!(await this.sendJsonWithBackpressure({
-      type: `response.${response.status}`,
-      response,
-    }))) return true;
-    this.continuations.clear();
-    if (response.status === "completed" && !continuationOverflow) {
-      const continuation = continuationState(
-        fullRequest.input,
-        response.output,
-        this.options.maxContinuationBytes,
-      );
-      if (continuation) this.continuations.set(response.id, continuation);
-    }
-    return true;
-  }
-
   fail(code, reason) {
     if (this.closed) return;
     if (!this.closeSent) {
@@ -1109,17 +1054,18 @@ class ResponsesWebSocketPeer {
         this.turnState = { value: responseTurnState, turnId: currentTurnId };
       }
       let contentType = String(upstream.headers.get("content-type") || "").toLowerCase();
-      const declaredMediaType = contentType.split(";", 1)[0].trim();
-      const declaredJson =
-        declaredMediaType === "application/json" || declaredMediaType.endsWith("+json");
-      if (!contentType.includes("text/event-stream") && !declaredJson) {
+      let sseBody = upstream.body;
+      if (!contentType.includes("text/event-stream")) {
         // A completed internal request must not be discarded solely because a
         // loopback hop omitted or misdeclared Content-Type. Sniff only enough
         // bytes to prove SSE framing; otherwise retain the untouched body and
         // validate it through the bounded completed-JSON path below.
         const detected = await sniffUndeclaredResponse(upstream, controller.signal);
         upstream = detected.response;
-        if (detected.kind === "event-stream") contentType = "text/event-stream";
+        if (detected.kind === "event-stream") {
+          contentType = "text/event-stream";
+          sseBody = upstream.body;
+        }
       }
       if (!contentType.includes("text/event-stream")) {
         const body = await readResponseBody(upstream, {
@@ -1142,7 +1088,7 @@ class ResponsesWebSocketPeer {
           Array.isArray(completedResponse) ||
           typeof completedResponse.id !== "string" ||
           completedResponse.id.length === 0 ||
-          completedResponse.status !== "completed" ||
+          !["completed", "incomplete", "failed"].includes(completedResponse.status) ||
           !Array.isArray(completedResponse.output)
         ) {
           this.sendError(502, {
@@ -1172,17 +1118,21 @@ class ResponsesWebSocketPeer {
         if (active.interrupted) return;
         active.terminalSent = true;
         if (!(await this.sendJsonWithBackpressure({
-          type: "response.completed",
+          type: `response.${completedResponse.status}`,
           response: completedResponse,
         }))) return;
-        this.lastResponseId = completedResponse.id;
+        if (completedResponse.status === "completed") {
+          this.lastResponseId = completedResponse.id;
+        }
         this.continuations.clear();
-        const continuation = continuationState(
-          fullRequest.input,
-          completedResponse.output,
-          this.options.maxContinuationBytes,
-        );
-        if (continuation) this.continuations.set(completedResponse.id, continuation);
+        if (completedResponse.status === "completed") {
+          const continuation = continuationState(
+            fullRequest.input,
+            completedResponse.output,
+            this.options.maxContinuationBytes,
+          );
+          if (continuation) this.continuations.set(completedResponse.id, continuation);
+        }
         return;
       }
       if (!(await sendSuccessfulResponseHeaders(this, upstream))) return;

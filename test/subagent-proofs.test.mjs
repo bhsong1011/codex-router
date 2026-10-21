@@ -149,34 +149,34 @@ test("verification skips reviewed v1/v2 models, unknown slugs, and settled candi
   const candidates = subagentVerificationCandidates([
     "kimi-oauth/k3", // registry v2: shipped with the full native proof
     "deepseek/deepseek-v4-pro", // already a settled local candidate
-    "deepseek/deepseek-v4-flash", // real, unproven: the one that needs research
+    "deepseek/deepseek-flash", // real, unproven: the one that needs research
     "not-a/model", // unknown slugs cannot be probed
-    "deepseek/deepseek-v4-flash", // duplicates collapse
+    "deepseek/deepseek-flash", // duplicates collapse
   ]);
-  assert.deepEqual(candidates, ["deepseek/deepseek-v4-flash"]);
+  assert.deepEqual(candidates, ["deepseek/deepseek-flash"]);
   // force may retry a candidate, but never a reviewed registry v1/v2 verdict.
   assert.ok(subagentVerificationCandidates(["deepseek/deepseek-v4-pro"], { force: true }).includes("deepseek/deepseek-v4-pro"));
   clearSubagentProof("deepseek/deepseek-v4-pro");
 });
 
 test("verify records the probe's verdict, and a probe crash reads as a failure", async () => {
-  const passed = await verifySubagentCandidates(["deepseek/deepseek-v4-flash"], {
+  const passed = await verifySubagentCandidates(["deepseek/deepseek-flash"], {
     probe: async (slug) => ({ ok: true, checks: [{ name: "tool calling", ok: true, slug }] }),
   });
   assert.equal(passed[0].status, "candidate");
-  assert.equal(subagentProofSnapshot()["deepseek/deepseek-v4-flash"].status, "candidate");
-  clearSubagentProof("deepseek/deepseek-v4-flash");
+  assert.equal(subagentProofSnapshot()["deepseek/deepseek-flash"].status, "candidate");
+  clearSubagentProof("deepseek/deepseek-flash");
 
   // A probe that never reached the provider proved nothing: it defers and
   // leaves no verdict, instead of writing "incapable" for a socket error.
-  const crashed = await verifySubagentCandidates(["deepseek/deepseek-v4-flash"], {
+  const crashed = await verifySubagentCandidates(["deepseek/deepseek-flash"], {
     probe: async () => {
       throw new Error("router unreachable");
     },
   });
   assert.equal(crashed[0].status, "deferred");
   assert.match(crashed[0].reason, /router unreachable/);
-  assert.equal(subagentProofSnapshot()["deepseek/deepseek-v4-flash"], undefined);
+  assert.equal(subagentProofSnapshot()["deepseek/deepseek-flash"], undefined);
 });
 
 test("the proofs path override is honoured", () => {
@@ -184,7 +184,7 @@ test("the proofs path override is honoured", () => {
 });
 
 test("a wedged 'checking' becomes retryable once it goes stale", () => {
-  const slug = "deepseek/deepseek-v4-flash";
+  const slug = "deepseek/deepseek-flash";
   recordProbeStarted(slug);
   const started = Date.parse(subagentProofSnapshot()[slug].startedAt);
 
@@ -207,7 +207,7 @@ test("a wedged 'checking' becomes retryable once it goes stale", () => {
 });
 
 test("a probe that only hit quota or outage defers instead of condemning", async () => {
-  const slug = "deepseek/deepseek-v4-flash";
+  const slug = "deepseek/deepseek-flash";
   const deferred = await verifySubagentCandidates([slug], {
     probe: async () => ({
       ok: false,
@@ -239,7 +239,7 @@ test("a probe that only hit quota or outage defers instead of condemning", async
 });
 
 test("a plan-entitlement refusal defers every model it gated, condemning none", async () => {
-  const slug = "deepseek/deepseek-v4-flash";
+  const slug = "deepseek/deepseek-flash";
   // The Command Code case: the credential authenticates, the plan cannot call
   // the API, and every model behind it answers 403. Thirty models probed on
   // an un-entitled account must not become thirty "incapable" verdicts.

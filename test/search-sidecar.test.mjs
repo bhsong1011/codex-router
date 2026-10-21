@@ -25,7 +25,7 @@ const {
 const { privateFileIsProtected } = await import("../src/file-security.mjs");
 
 const binding = {
-  model: "deepseek/deepseek-v4-flash",
+  model: "deepseek/deepseek-flash",
   providerId: "perplexity-sidecar",
   adapter: "perplexity-search",
   enabled: true,

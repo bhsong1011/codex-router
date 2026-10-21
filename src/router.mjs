@@ -88,7 +88,10 @@ import { ResponsesHeartbeatTransform } from "./responses-heartbeat.mjs";
 import { responsesStreamFailureTransform } from "./responses-stream-failure.mjs";
 import { glmRepetitionGuardTransform, REPETITIVE_GENERATION_CODE } from "./glm-repetition-guard.mjs";
 import { messagePhaseTransform } from "./message-phase.mjs";
-import { translatedToolMessageCompatTransform } from "./deepseek-tool-message-compat.mjs";
+import {
+  deepseekToolMessageCompatTransform,
+  translatedToolMessageCompatTransform,
+} from "./deepseek-tool-message-compat.mjs";
 import {
   deepSeekCustomToolNames,
   deepSeekResponsesInput,
@@ -556,7 +559,6 @@ const AGENT_RELAY_FAILURE_BACKOFF_MS =
   configuredAgentRelayFailureBackoffMs > 0
     ? Math.floor(configuredAgentRelayFailureBackoffMs)
     : 60_000;
-const AGENT_RELAY_FAILURE_MAX_ENTRIES = 128;
 const agentPayloadCache = new Map();
 const agentPayloadCacheInFlight = new Map();
 const agentPayloadRelayFailures = new Map();
@@ -1729,6 +1731,17 @@ function messageItem(text) {
   };
 }
 
+function syntheticCodexDelegation(item) {
+  return (
+    item?.type === "function_call_output" &&
+    !item.call_id &&
+    item.namespace === "codex_app" &&
+    ["create_thread", "send_message_to_thread"].includes(item.name) &&
+    typeof item.output === "string" &&
+    item.output.startsWith("<codex_delegation>")
+  );
+}
+
 function normalizeOrphanAppToolOutput(item) {
   if (
     item?.type !== "function_call_output" ||
@@ -1922,8 +1935,7 @@ function parseRelayedAgentPayloadSse(bytes) {
   return undefined;
 }
 
-function nativeRelayContext(request) {
-  const headers = nativeHeaders(request);
+function nativeRelayAccountScope(headers) {
   const authorization =
     typeof headers.authorization === "string" ? headers.authorization : "";
   const account = nativeAccountKey(headers);
@@ -1935,7 +1947,12 @@ function nativeRelayContext(request) {
     .update("\0")
     .update(account)
     .digest("base64url");
-  return { accountScope, headers };
+  return accountScope;
+}
+
+function nativeRelayContext(request) {
+  const headers = nativeHeaders(request);
+  return { accountScope: nativeRelayAccountScope(headers), headers };
 }
 
 function agentPayloadCacheKey(encrypted, accountScope) {
@@ -1958,26 +1975,6 @@ function nativeAgentRelayUnauthorizedError() {
   error.status = 401;
   error.code = "ERR_NATIVE_AGENT_RELAY_UNAUTHORIZED";
   return error;
-}
-
-function purgeExpiredAgentRelayFailures(now = Date.now()) {
-  for (const [key, expiresAt] of agentPayloadRelayFailures) {
-    if (expiresAt <= now) agentPayloadRelayFailures.delete(key);
-  }
-}
-
-function agentRelayFailureActive(key, now = Date.now()) {
-  purgeExpiredAgentRelayFailures(now);
-  return agentPayloadRelayFailures.has(key);
-}
-
-function rememberAgentRelayFailure(key, now = Date.now()) {
-  purgeExpiredAgentRelayFailures(now);
-  agentPayloadRelayFailures.delete(key);
-  agentPayloadRelayFailures.set(key, now + AGENT_RELAY_FAILURE_BACKOFF_MS);
-  while (agentPayloadRelayFailures.size > AGENT_RELAY_FAILURE_MAX_ENTRIES) {
-    agentPayloadRelayFailures.delete(agentPayloadRelayFailures.keys().next().value);
-  }
 }
 
 function evictAgentPayload(key, { expired = false, evicted = false } = {}) {
@@ -2033,10 +2030,30 @@ function rememberAgentPayload(key, plaintext) {
   }
 }
 
+function agentRelayFailureActive(accountScope, now = Date.now()) {
+  const expiresAt = agentPayloadRelayFailures.get(accountScope);
+  if (expiresAt === undefined) return false;
+  if (expiresAt <= now) {
+    agentPayloadRelayFailures.delete(accountScope);
+    return false;
+  }
+  return true;
+}
+
+function rememberAgentRelayFailure(accountScope, now = Date.now()) {
+  for (const [key, expiresAt] of agentPayloadRelayFailures) {
+    if (expiresAt <= now) agentPayloadRelayFailures.delete(key);
+  }
+  agentPayloadRelayFailures.delete(accountScope);
+  agentPayloadRelayFailures.set(accountScope, now + AGENT_RELAY_FAILURE_BACKOFF_MS);
+  while (agentPayloadRelayFailures.size > 128) {
+    agentPayloadRelayFailures.delete(agentPayloadRelayFailures.keys().next().value);
+  }
+}
+
 const agentPayloadCachePurgeTimer = setInterval(
   () => {
     purgeExpiredAgentPayloads();
-    purgeExpiredAgentRelayFailures();
   },
   Math.min(AGENT_PAYLOAD_CACHE_TTL_MS, 60_000),
 );
@@ -2065,6 +2082,7 @@ nativeCatalogDriftCheckTimer.unref?.();
 async function relayEncryptedAgentPayloadOnce(
   item,
   cacheKey,
+  accountScope,
   headers,
   signal,
 ) {
@@ -2105,8 +2123,10 @@ async function relayEncryptedAgentPayloadOnce(
   });
   if (!upstream.ok) {
     if (upstream.status === 429) {
-      rememberAgentRelayFailure(cacheKey);
-      throw nativeAgentRelayRateLimitError();
+      rememberAgentRelayFailure(accountScope);
+      const error = nativeAgentRelayRateLimitError();
+      error.upstreamStatus = upstream.status;
+      throw error;
     }
     if (upstream.status === 401) {
       throw nativeAgentRelayUnauthorizedError();
@@ -2193,8 +2213,6 @@ function waitForAgentPayloadRelay(pending, signal) {
 // then hold the relay closed for a short window: the same anti-storm backoff
 // the vision bridge already uses, and no claim about when a quota resets.
 const RELAY_CREDENTIAL_REFUSALS = new Set([401, 403, 429]);
-const RELAY_REFUSAL_BACKOFF_MS = 60_000;
-let relayRefusedUntil = 0;
 
 // Which accounts may decode a collaboration payload, in the order to try them.
 // The personal login goes first when it is configured: the ciphertext belongs
@@ -2226,27 +2244,21 @@ async function relayHeaderCandidates(request) {
 }
 
 async function relayEncryptedAgentPayloadWithFallback(request, item, key, signal) {
-  const now = Date.now();
-  if (relayRefusedUntil > now) {
-    const paused = Math.ceil((relayRefusedUntil - now) / 1000);
-    const error = new Error(
-      `Collaboration relay is paused for ${paused}s: every configured ChatGPT account ` +
-        "refused it with a credential or quota error.",
-    );
-    error.status = 429;
-    error.retryAfterSeconds = paused;
-    throw error;
-  }
   let lastError;
   for (const candidate of await relayHeaderCandidates(request)) {
+    const accountScope = nativeRelayAccountScope(candidate.headers);
+    if (agentRelayFailureActive(accountScope)) {
+      lastError = nativeAgentRelayRateLimitError();
+      continue;
+    }
     try {
       const plaintext = await relayEncryptedAgentPayloadOnce(
         item,
         key,
+        accountScope,
         candidate.headers,
         signal,
       );
-      relayRefusedUntil = 0;
       return plaintext;
     } catch (error) {
       // Two failures mean "this account could not do it" rather than "this
@@ -2263,7 +2275,6 @@ async function relayEncryptedAgentPayloadWithFallback(request, item, key, signal
       );
     }
   }
-  relayRefusedUntil = Date.now() + RELAY_REFUSAL_BACKOFF_MS;
   throw lastError;
 }
 
@@ -2272,7 +2283,6 @@ async function relayEncryptedAgentPayload(request, item, encrypted, signal) {
   const key = agentPayloadCacheKey(encrypted, accountScope);
   const cached = cachedAgentPayload(key);
   if (cached !== undefined) return cached;
-  if (agentRelayFailureActive(key)) throw nativeAgentRelayRateLimitError();
   const pending = agentPayloadCacheInFlight.get(key);
   if (pending) {
     agentPayloadCacheMetrics.coalesced += 1;
@@ -5521,6 +5531,10 @@ async function handleResponses(request, response, requestUrl) {
             : undefined,
       });
       const transforms = [activity.progress.byteObserver(), usageObserver];
+      const deepseekToolMessageCompat = route && usesDeepSeekResponses(route)
+        ? deepseekToolMessageCompatTransform(route.provider, contentType)
+        : undefined;
+      if (deepseekToolMessageCompat) transforms.splice(1, 0, deepseekToolMessageCompat);
       // LiteLLM's Chat Completions bridge can stream assistant text after a
       // reasoning item with no message envelope, on the reasoning item's own
       // output index (Z.ai GLM-5.3, OpenRouter MiMo). Codex logs every such

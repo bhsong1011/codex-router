@@ -5070,9 +5070,9 @@ test("native custom-tool streams accept LiteLLM content-wrapped legacy argument 
   assert.doesNotMatch(output, /response\.function_call_arguments/u);
 });
 
-test("native custom-tool streams accept standard input-wrapped argument events", async () => {
+test("native custom-tool streams accept LiteLLM content-wrapped argument events", async () => {
   const input = "console.log(6 * 7);\n";
-  const argumentsText = JSON.stringify({ input });
+  const argumentsText = JSON.stringify({ content: input });
   const events = [
     {
       type: "response.output_item.added",

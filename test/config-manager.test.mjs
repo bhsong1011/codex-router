@@ -671,15 +671,15 @@ test("an opt-in router default survives rebuilds and restores Codex's prior defa
       "router-default-set",
       codexHome,
       stateDir,
-      ["deepseek/deepseek-v4.1-flash"],
+      ["deepseek/deepseek-flash"],
     );
-    assert.equal(selected.model, "deepseek/deepseek-v4.1-flash");
-    assert.equal(selected.router_default_model, "deepseek/deepseek-v4.1-flash");
+    assert.equal(selected.model, "deepseek/deepseek-flash");
+    assert.equal(selected.router_default_model, "deepseek/deepseek-flash");
     assert.equal(selected.router_default_managed, true);
     assert.equal(privateFileIsProtected(defaultStatePath), true);
 
     const rebuilt = run("enable", codexHome, stateDir);
-    assert.equal(rebuilt.model, "deepseek/deepseek-v4.1-flash");
+    assert.equal(rebuilt.model, "deepseek/deepseek-flash");
 
     const restored = run("router-default-clear", codexHome, stateDir);
     assert.equal(restored.model, "gpt-5.6-luna");
@@ -780,10 +780,10 @@ approval_policy = "never"
       "login-free-enable",
       codexHome,
       stateDir,
-      ["deepseek/deepseek-v4.1-flash"],
+      ["deepseek/deepseek-flash"],
     );
     assert.equal(refreshed.login_free, true);
-    assert.equal(refreshed.model, "deepseek/deepseek-v4.1-flash");
+    assert.equal(refreshed.model, "deepseek/deepseek-flash");
     assert.deepEqual(
       JSON.parse(readFileSync(providerModePath, "utf8")),
       originalState,
@@ -1962,7 +1962,7 @@ esac
       );
       assert.ok(catalog.models.some((model) => model.slug === "gpt-5.6-sol"));
       assert.ok(
-        catalog.models.some((model) => model.slug === "deepseek/deepseek-v4.1-flash"),
+        catalog.models.some((model) => model.slug === "deepseek/deepseek-flash"),
       );
     } finally {
       rmSync(codexHome, { recursive: true, force: true });
@@ -2530,9 +2530,9 @@ test("a root multiline string that contains assignment-shaped prose is never rew
       "router-default-set",
       codexHome,
       stateDir,
-      ["deepseek/deepseek-v4-flash"],
+      ["deepseek/deepseek-flash"],
     );
-    assert.equal(selected.model, "deepseek/deepseek-v4-flash");
+    assert.equal(selected.model, "deepseek/deepseek-flash");
     contents = readFileSync(configPath, "utf8");
     assert.ok(
       contents.includes(instructions),
@@ -2542,7 +2542,7 @@ test("a root multiline string that contains assignment-shaped prose is never rew
     // one that moved. The prose is identical in shape, so it can only be told
     // apart by whether it is inside the string.
     const outside = contents.replace(instructions, "");
-    assert.match(outside, /^model = "deepseek\/deepseek-v4-flash"$/m);
+    assert.match(outside, /^model = "deepseek\/deepseek-flash"$/m);
     assert.ok(
       !outside.includes("documented example"),
       `prose escaped the multiline string:\n${contents}`,
@@ -2621,7 +2621,7 @@ for (const invalidTable of [false, true]) {
     try {
       run("enable", home);
       assert.ok(readFileSync(config, "utf8").includes(prose));
-      run("router-default-set", home, undefined, ["deepseek/deepseek-v4-flash"]);
+      run("router-default-set", home, undefined, ["deepseek/deepseek-flash"]);
       assert.ok(readFileSync(config, "utf8").includes(prose));
       const restored = run("router-default-clear", home);
       assert.equal(restored.model, "gpt-5.6");

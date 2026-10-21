@@ -8,10 +8,11 @@ import { curatedModelBlockReason, curatedModelProviderId } from "../src/opencode
 // `max` effort, so compaction must leave at least that much of the window.
 const MAX_EFFORT_DEFAULT_OUTPUT = 128_000;
 
-test("DeepSeek V4.1 Flash on the direct API publishes its documented capabilities", () => {
-  const model = MODEL_BY_SLUG.get("deepseek/deepseek-v4.1-flash");
+test("deepseek-flash publishes its documented capabilities", () => {
+  const model = MODEL_BY_SLUG.get("deepseek/deepseek-flash");
   assert.ok(model);
   assert.equal(model.provider, "deepseek");
+  assert.equal(model.slug, "deepseek/deepseek-flash");
   assert.equal(model.upstreamModel, "deepseek-flash");
   assert.equal(model.listed, true);
   assert.equal(model.requestProfile, "deepseek-thinking");
@@ -22,7 +23,7 @@ test("DeepSeek V4.1 Flash on the direct API publishes its documented capabilitie
   assert.deepEqual(model.inputModalities, ["text", "image"]);
   assert.notEqual(model.multiAgentVersion, "v2");
   const published = routedModel({ slug: "gpt-5.5" }, model);
-  assert.equal(published.display_name, "DeepSeek V4.1 Flash (API)");
+  assert.equal(published.display_name, "deepseek-flash");
   assert.deepEqual(published.input_modalities, ["text", "image"]);
 });
 
@@ -91,7 +92,7 @@ test("DeepSeek V4.1 Flash on OpenRouter takes the catalog window and DeepSeek's 
   assert.deepEqual(model.inputModalities, ["text", "image"]);
   assert.notEqual(model.multiAgentVersion, "v2");
   // A reseller route sits in its provider's band, not beside the direct API.
-  assert.ok(model.priority > MODEL_BY_SLUG.get("deepseek/deepseek-v4.1-flash").priority);
+  assert.ok(model.priority > MODEL_BY_SLUG.get("deepseek/deepseek-flash").priority);
 });
 
 test("DeepSeek V4.1 Flash on Ollama Cloud uses the cloud tag and the shared serving profile", () => {
@@ -122,9 +123,8 @@ test("DeepSeek V4.1 Flash on Ollama Cloud uses the cloud tag and the shared serv
   assert.ok(model.priority > MODEL_BY_SLUG.get("ollama-cloud/deepseek-v4-flash").priority);
 });
 
-test("V4.1 Flash is added alongside the V4 routes rather than replacing them", () => {
+test("V4.1 Flash is added alongside the remaining V4 routes", () => {
   for (const [slug, upstreamModel] of [
-    ["deepseek/deepseek-v4-flash", "deepseek-v4-flash"],
     ["deepseek/deepseek-v4-flash-vision-exp", "deepseek-v4-flash-vision-exp"],
     ["deepseek/deepseek-v4-pro", "deepseek-v4-pro"],
     ["openrouter/deepseek-v4-pro", "deepseek/deepseek-v4-pro"],

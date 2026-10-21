@@ -83,6 +83,25 @@ async function run({ foreground = false, disabled = false, mode = "healthy", see
       loopback: (port, suffix = "") => `http://127.0.0.1:${port}${suffix}`,
     },
     "./caller-auth.mjs": { assertCallerSecret: (key) => key },
+    "./codex-account-usage.mjs": { normalizeCodexAccountUsage: () => ({}) },
+    "./codex-monthly-usage.mjs": { readCodexMonthlyUsage: async () => null },
+    "./codex-binary.mjs": { findCodexBinary: () => "fixture-codex" },
+    "./codex-account-session.mjs": {
+      createCodexAppServerSession: () => {
+        events.push("account-session-start");
+        return {
+          readRaw: async () => ({ limits: {}, usage: {} }),
+          stop: () => events.push("account-session-stop"),
+        };
+      },
+      startAccountUsageRefresh: () => {
+        events.push("account-refresh-start");
+        return { stop: () => events.push("account-refresh-stop") };
+      },
+    },
+    "./marketplace-staging-prune.mjs": {
+      startMarketplaceStagingPrune: () => events.push("marketplace-prune-start"),
+    },
     "./http-utils.mjs": { SHUTDOWN_DRAIN_MS: 1, SHUTDOWN_FLUSH_MS: 1 },
     "./startup-timeout.mjs": { clearStartupTimeouts: () => {}, runtimeChildEnvironment: (env) => env, startupTimeoutMs: (_name, fallback) => fallback },
     "./health-probe.mjs": { waitForHealth: async () => {
@@ -148,14 +167,28 @@ async function run({ foreground = false, disabled = false, mode = "healthy", see
     return evaluated;
   }
   await load(foreground ? "foreground-start.mjs" : "start.mjs");
-  return { record, original, diagnostics, events, exitCode: fakeProcess.exitCode, childrenStopped: children.every((child) => child.signalCode !== null || child.exitCode !== null) };
+  return {
+    record,
+    original,
+    diagnostics,
+    events,
+    exitCode: fakeProcess.exitCode,
+    childrenStopped: children.every((child) => child.signalCode !== null || child.exitCode !== null),
+    accountUsageStopped:
+      !events.includes("account-session-start")
+      || (events.includes("account-session-stop") && events.includes("account-refresh-stop")),
+  };
 }
 
 async function checks(platform) {
   const results = [];
   async function check(name, options, oracle) {
     let result, failure;
-    try { result = await run({ platform, ...options }); oracle(result); }
+    try {
+      result = await run({ platform, ...options });
+      assert.ok(result.accountUsageStopped, "account usage resources stopped with startup");
+      oracle(result);
+    }
     catch (error) { failure = error.stack; }
     results.push({ name, passed: !failure, failure, result });
   }

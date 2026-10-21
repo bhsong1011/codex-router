@@ -152,7 +152,7 @@ test("native DeepSeek receives delegated tasks as supported user messages", () =
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const INTERNAL_KEY = "test-internal-service-key-with-sufficient-length";
 const CALLER_KEY = "test-router-caller-capability-with-sufficient-length";
-const MODEL = "deepseek/deepseek-v4.1-flash";
+const MODEL = "deepseek/deepseek-flash";
 const TEXT = "Both checks pass. Final content check complete.";
 const REASONING = "The synthetic pixel was inspected.";
 const IMAGE = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAY0lEQVR4nO3PQQ3AIADAQEALAhGJsIngcVnSU9DOfe74s6UDXjWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgfRdzAdh+IIyPAAAAAElFTkSuQmCC";
@@ -249,7 +249,7 @@ test("direct DeepSeek Responses preserves images, reasoning, tools and stream bo
   const codexHome = path.join(state, "codex");
   mkdirSync(codexHome);
   const legacy = JSON.parse(readFileSync(path.join(root, "config/deepseek/deepseek-v4-flashvision-exp.json"))).models[0];
-  writeFileSync(path.join(state, "user-models.json"), JSON.stringify({ version: 1, models: [{ ...legacy, slug: MODEL, gatewayModel: "deepseek-v4-1-flash", upstreamModel: "deepseek-flash", compHash: "native-responses-test" }] }));
+  writeFileSync(path.join(state, "user-models.json"), JSON.stringify({ version: 1, models: [{ ...legacy, slug: MODEL, gatewayModel: "deepseek-flash", upstreamModel: "deepseek-flash", compHash: "native-responses-test" }] }));
   writeFileSync(path.join(state, "enabled-providers.json"), JSON.stringify({ version: 1, providers: ["deepseek"] }));
   const requests = [];
   let gatewayRequests = 0;

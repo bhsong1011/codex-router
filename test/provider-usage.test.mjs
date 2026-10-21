@@ -394,7 +394,7 @@ test("breaks provider usage down by model, heaviest first", () => {
         meteringVersion: 1,
         at: "2026-07-20T12:00:00Z",
         provider: "deepseek",
-        model: "deepseek/deepseek-v4-flash",
+        model: "deepseek/deepseek-flash",
         status: 200,
         durationMs: 2_000,
         firstTokenMs: 500,
@@ -418,7 +418,7 @@ test("breaks provider usage down by model, heaviest first", () => {
         meteringVersion: 1,
         at: "2026-07-21T12:00:00Z",
         provider: "deepseek",
-        model: "deepseek/deepseek-v4-flash",
+        model: "deepseek/deepseek-flash",
         status: 500,
         durationMs: 100,
         inputTokens: 10,
@@ -432,11 +432,11 @@ test("breaks provider usage down by model, heaviest first", () => {
 
   assert.deepEqual(
     deepseek.models.map((model) => model.slug),
-    ["deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash"],
+    ["deepseek/deepseek-v4-pro", "deepseek/deepseek-flash"],
   );
 
-  const flash = deepseek.models.find((model) => model.slug === "deepseek/deepseek-v4-flash");
-  assert.equal(flash.displayName, "deepseek-v4-flash");
+  const flash = deepseek.models.find((model) => model.slug === "deepseek/deepseek-flash");
+  assert.equal(flash.displayName, "deepseek-flash");
   assert.equal(flash.requests, 2);
   assert.equal(flash.successfulRequests, 1);
   assert.equal(flash.totalTokens, 150);
@@ -458,7 +458,7 @@ test("reports no observed speed when successful requests have no metered output"
         meteringVersion: 1,
         at: "2026-07-21T12:00:00Z",
         provider: "deepseek",
-        model: "deepseek/deepseek-v4-flash",
+        model: "deepseek/deepseek-flash",
         status: 200,
         durationMs: 1_000,
         inputTokens: 100,
@@ -481,7 +481,7 @@ test("uses only the latest 20 clean generation timings for observed speed", () =
     meteringVersion: 1,
     at: new Date(now - (21 - index) * 60_000).toISOString(),
     provider: "deepseek",
-    model: "deepseek/deepseek-v4-flash",
+    model: "deepseek/deepseek-flash",
     status: 200,
     durationMs: index < 2 ? 11_000 : 3_000,
     firstTokenMs: 1_000,
@@ -563,7 +563,7 @@ test("accepts a response that starts within the first measured millisecond", () 
         meteringVersion: 1,
         at: new Date(now).toISOString(),
         provider: "deepseek",
-        model: "deepseek/deepseek-v4-flash",
+        model: "deepseek/deepseek-flash",
         status: 200,
         durationMs: 2_000,
         firstTokenMs: 0,

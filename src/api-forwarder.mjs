@@ -224,9 +224,9 @@ function hy4Effort(value, levels) {
 //   glm-5.3                     low / high / max              (default max)
 //   deepseek-v4-flash-0731,
 //   deepseek-v4-pro-0813        none / low / high / max       (default high)
-//   deepseek-v4.1-flash,
+//   deepseek-flash,
 //   deepseek-v4-pro,
-//   deepseek-v4-flash           none / high / max             (default high)
+//   deepseek-v4-flash-0731      none / high / max             (default high)
 //
 // Model Studio documents the fold for a rung a model does not have (minimal to
 // low and high/max to xhigh for Qwen3.8, and so on). Codex's ladder has no
@@ -346,7 +346,7 @@ function coalesceAssistantMessages(messages) {
   return coalesced;
 }
 
-function restoreNativeReasoningContent(messages) {
+function restoreNativeReasoningContent(messages, { emptyContentForThinking = false } = {}) {
   if (!Array.isArray(messages)) return messages;
   return messages.map((message) => {
     if (message?.role !== "assistant" || !Array.isArray(message.content)) return message;
@@ -373,7 +373,12 @@ function restoreNativeReasoningContent(messages) {
     if (!sawThinking) return message;
     const restored = {
       ...message,
-      content: visible.length ? visible : null,
+      content:
+        visible.length
+          ? visible
+          : emptyContentForThinking && !Array.isArray(message.tool_calls)
+            ? ""
+            : null,
     };
     if (
       reasoning.length &&
@@ -1251,7 +1256,9 @@ function normalizeBody(buffer, contentType, route) {
   if (Array.isArray(payload.messages)) {
     payload.messages = sanitizeChatToolHistory(payload.messages, provider, model);
     if (usesNativeChatReasoning(model)) {
-      payload.messages = restoreNativeReasoningContent(payload.messages);
+      payload.messages = restoreNativeReasoningContent(payload.messages, {
+        emptyContentForThinking: requiresReasoningContentOnToolCalls(model),
+      });
     }
     if (requiresReasoningContentOnToolCalls(model)) {
       payload.messages = ensureToolCallReasoningContent(payload.messages);
@@ -1325,19 +1332,21 @@ function normalizeBody(buffer, contentType, route) {
     else delete payload.reasoning_effort;
     delete payload.thinking;
   } else if (model.requestProfile === "deepseek-thinking" && !usesDeepSeekResponses(model)) {
-    payload.thinking = { type: "enabled" };
-    payload.reasoning_effort = deepSeekEffort(payload.reasoning_effort);
-    delete payload.temperature;
-    delete payload.top_p;
-    delete payload.presence_penalty;
-    delete payload.frequency_penalty;
-    // DeepSeek rejects forced tool choices while thinking is enabled
-    // ("Thinking mode does not support this tool_choice"); downgrade to auto so
-    // tool calls stay available. Codex sends "required" for the compatibility
-    // probe and a function object for the subagent payload relay, so without
-    // this both tool calling and routed subagents fail on every thinking model.
-    if (!disabled && payload.tool_choice !== undefined && payload.tool_choice !== "none") {
-      payload.tool_choice = "auto";
+    const disabled = payload.thinking?.type === "disabled";
+    if (disabled) {
+      delete payload.reasoning_effort;
+    } else {
+      payload.thinking = { type: "enabled" };
+      payload.reasoning_effort = deepSeekEffort(payload.reasoning_effort);
+      delete payload.temperature;
+      delete payload.top_p;
+      delete payload.presence_penalty;
+      delete payload.frequency_penalty;
+      // DeepSeek rejects forced tool choices while thinking is enabled
+      // ("Thinking mode does not support this tool_choice"); downgrade to auto.
+      if (payload.tool_choice !== undefined && payload.tool_choice !== "none") {
+        payload.tool_choice = "auto";
+      }
     }
   } else if (model.requestProfile === "deepseek-nonthinking" && !usesDeepSeekResponses(model)) {
     payload.thinking = { type: "disabled" };

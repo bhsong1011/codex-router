@@ -29,7 +29,7 @@ Before the first subagent spawn:
 - Use explicit model/effort routing on every spawn.
 
 `default` resolves from `[agents]` in `config.toml`, currently
-`deepseek/deepseek-v4.1-flash` / `high`.
+`deepseek/deepseek-flash` / `high`.
 
 `native-terra-high` resolves to `gpt-5.6-terra` / `high` with the normal
 explicit task-role `agent_type`. It is selected only when the user explicitly
@@ -52,7 +52,7 @@ user explicitly chooses that route.
 When the selected route is `deepseek-flash-high` or `default`, spawn a native
 DeepSeek child with exactly:
 
-- `model: deepseek/deepseek-v4.1-flash`
+- `model: deepseek/deepseek-flash`
 - `reasoning_effort: high`
 - `fork_turns: none`
 
@@ -109,7 +109,7 @@ expected verification command, and a success criterion.
 - OpenAI parent, OpenAI child: use `spawn_agent` normally with the real task in `message`. The encrypted channel is required. For `native-terra-high`, set `model: gpt-5.6-terra`; for `personal-terra-high`, set `model: chatgpt-login/gpt-5.6-terra`; set `reasoning_effort: high` for either route.
 - For `personal-gpt6-luna-medium`, set `model: chatgpt-login/gpt-6-luna` and `reasoning_effort: medium` with the explicit task-role `agent_type`.
 - For `personal-gpt6.1-sol-high`, set `model: chatgpt-login/gpt-6.1-sol` and `reasoning_effort: high` with the explicit task-role `agent_type`.
-- OpenAI parent, DeepSeek Flash child: use `spawn_agent` normally with the real task in `message`, explicit task-role `agent_type`, `model: deepseek/deepseek-v4.1-flash`, `reasoning_effort: high`, and `fork_turns: none`. This native route makes DeepSeek visible as a child. If Codex explicitly rejects it, report the rejection; do not use task files or an MCP bridge.
+- OpenAI parent, DeepSeek Flash child: use `spawn_agent` normally with the real task in `message`, explicit task-role `agent_type`, `model: deepseek/deepseek-flash`, `reasoning_effort: high`, and `fork_turns: none`. This native route makes DeepSeek visible as a child. If Codex explicitly rejects it, report the rejection; do not use task files or an MCP bridge.
 - DeepSeek parent, DeepSeek Flash child: use the same direct native DeepSeek spawn and exact DS model/effort/fork settings as OpenAI→DeepSeek.
 - DeepSeek parent, OpenAI child: use `spawn_agent` normally with the real task in `message`. It requires the user's explicit `native-terra-high` or `personal-terra-high` route selection and uses that route's model / `reasoning_effort: high`.
 - Other provider combinations have no global fallback. Report the unsupported route instead of inventing a transport workaround.

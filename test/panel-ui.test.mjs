@@ -247,8 +247,8 @@ test("active model speed prefers its provider and matches qualified slugs", () =
         id: "deepseek",
         models: [
           {
-            slug: "deepseek/deepseek-v4-flash",
-            displayName: "deepseek-v4-flash",
+            slug: "deepseek/deepseek-flash",
+            displayName: "deepseek-flash",
             observedTokensPerSecond: 18.7,
             speedSampleCount: 4,
           },
@@ -256,12 +256,12 @@ test("active model speed prefers its provider and matches qualified slugs", () =
       },
     ],
   };
-  assert.deepEqual(observedModelSpeed(usage, "deepseek", "deepseek/deepseek-v4-flash"), {
+  assert.deepEqual(observedModelSpeed(usage, "deepseek", "deepseek/deepseek-flash"), {
     speed: 18.7,
     samples: 4,
   });
   usage.providers[0].models[0].observedTokensPerSecond = null;
-  assert.equal(observedModelSpeed(usage, "deepseek", "deepseek/deepseek-v4-flash"), null);
+  assert.equal(observedModelSpeed(usage, "deepseek", "deepseek/deepseek-flash"), null);
   assert.equal(observedModelSpeed(usage, "deepseek", "missing/model"), null);
 });
 

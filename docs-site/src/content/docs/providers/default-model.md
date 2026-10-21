@@ -10,7 +10,7 @@ picker. The router snapshots the prior Codex default, reapplies your router
 choice after an update or repair, and restores that prior default when cleared:
 
 ```sh
-./bin/control router-default set deepseek/deepseek-v4-flash
+./bin/control router-default set deepseek/deepseek-flash
 ./bin/control router-default clear
 ```
 

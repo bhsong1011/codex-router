@@ -632,7 +632,7 @@ test("v1 routed models publish in a band above the visible native maximum while 
   const routed = [
     { ...v1, slug: "opencode-go/glm-5.3", provider: "opencode-go", priority: 7 },
     { ...v1, slug: "deepseek/deepseek-v4-pro", provider: "deepseek", priority: 1 },
-    { ...v1, slug: "deepseek/deepseek-v4-flash", provider: "deepseek", priority: 6 },
+    { ...v1, slug: "deepseek/deepseek-flash", provider: "deepseek", priority: 6 },
     { ...grok, slug: "grok-oauth/grok-4.5", provider: "grok-oauth", priority: 2 },
     { ...v1, slug: "grok-oauth/grok-4.6", provider: "grok-oauth", priority: 1 },
   ];
@@ -658,7 +658,7 @@ test("v1 routed models publish in a band above the visible native maximum while 
   assert.deepEqual(
     [
       "deepseek/deepseek-v4-pro",
-      "deepseek/deepseek-v4-flash",
+      "deepseek/deepseek-flash",
       "opencode-go/glm-5.3",
       "grok-oauth/grok-4.6",
     ].map((slug) => bySlug.get(slug).priority),
@@ -1435,8 +1435,8 @@ test("a ChatGPT-plan model drives the same advertisement as a routed engine", as
   );
   const deepseek = {
     ...grok,
-    slug: "deepseek/deepseek-v4.1-flash",
-    displayName: "DeepSeek V4 Flash",
+    slug: "deepseek/deepseek-flash",
+    displayName: "deepseek-flash",
     gatewayModel: "deepseek-v4-flash",
     inputModalities: ["text"],
     compHash: "deepseek-v4-flash-native-bridge-v1",
@@ -1620,8 +1620,8 @@ test(
       const visibility = new Map(
         merged.models.map((model) => [String(model.slug), model.visibility]),
       );
-      assert.equal(visibility.get("deepseek/deepseek-v4.1-flash"), "list");
-      assert.equal(visibility.get("deepseek/deepseek-v4-flash"), "list");
+      assert.equal(visibility.get("deepseek/deepseek-flash"), "list");
+      assert.equal(visibility.has("deepseek/deepseek-v4-flash"), false);
       assert.equal(visibility.get("deepseek/deepseek-v4-flash-vision-exp"), "list");
       assert.equal(visibility.get("deepseek/deepseek-v4-pro"), "hide");
       assert.equal(visibility.get("gpt-5.6-sol-1m"), "hide");
@@ -1630,8 +1630,8 @@ test(
         readFileSync(path.join(stateDir, "model-picker.json"), "utf8"),
       );
       assert.deepEqual(picker.visible, [
+        "deepseek/deepseek-flash",
         "deepseek/deepseek-v4-flash-vision-exp",
-        "deepseek/deepseek-v4.1-flash",
       ]);
     } finally {
       rmSync(codexHome, { recursive: true, force: true });

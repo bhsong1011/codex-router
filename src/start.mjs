@@ -3,6 +3,11 @@ import { existsSync, readFileSync, writeSync } from "node:fs";
 import path from "node:path";
 
 import { assertCallerSecret } from "./caller-auth.mjs";
+import { normalizeCodexAccountUsage } from "./codex-account-usage.mjs";
+import { readCodexMonthlyUsage } from "./codex-monthly-usage.mjs";
+import { findCodexBinary } from "./codex-binary.mjs";
+import { createCodexAppServerSession, startAccountUsageRefresh } from "./codex-account-session.mjs";
+import { startMarketplaceStagingPrune } from "./marketplace-staging-prune.mjs";
 import {
   CALLER_SECRET_PATH,
   CURSOR_CATALOG_PATH,
@@ -356,6 +361,7 @@ function stopChildren() {
   if (shuttingDown) return;
   shuttingDown = true;
   stopNativeCatalogWatch();
+  stopAccountUsage();
   for (const child of children) {
     if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
   }

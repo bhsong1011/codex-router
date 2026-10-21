@@ -118,9 +118,9 @@ test("provider registry exposes configured API and OAuth model families", () => 
       "commandcode/qwen3.8-max",
       "commandcode/step-3.7-flash",
       "custom/qwen3.8-27b",
+      "deepseek/deepseek-flash",
       "deepseek/deepseek-v4-flash-vision-exp",
       "deepseek/deepseek-v4-pro",
-      "deepseek/deepseek-v4.1-flash",
       "grok-api/grok-4.5",
       "grok-api/grok-4.7",
       "grok-oauth/grok-4.5",
@@ -681,7 +681,7 @@ test("provider registry exposes configured API and OAuth model families", () => 
   }
   const standaloneSearchSlugs = new Set([
     "opencode-go/glm-5.3-flash",
-    "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-flash",
     "deepseek/deepseek-v4-flash-vision-exp",
     "opencode-go/deepseek-v4-flash",
     "xiaomi-mimo/mimo-v2.5",
@@ -773,27 +773,29 @@ test("provider registry exposes configured API and OAuth model families", () => 
     "grok-oauth/grok-4.6",
     "grok-oauth/grok-4.5",
     "grok-api/grok-4.5",
-    "deepseek/deepseek-v4.1-flash",
+    "deepseek/deepseek-flash",
     "deepseek/deepseek-v4-flash-vision-exp",
     "deepseek/deepseek-v4-pro",
     "deepseek/deepseek-reasoner",
   ]) {
     assert.equal(MODEL_BY_SLUG.get(slug).supportsReasoningSummaries, true);
   }
+  assert.equal(MODEL_BY_SLUG.has("deepseek/deepseek-v4.1-flash"), false);
+  assert.equal(MODEL_BY_SLUG.has("deepseek/deepseek-v4-flash"), false);
   assert.equal(MODEL_BY_SLUG.get("deepseek/deepseek-chat").supportsReasoningSummaries, undefined);
   for (const slug of [
-    "deepseek/deepseek-v4.1-flash",
+    "deepseek/deepseek-flash",
     "deepseek/deepseek-v4-flash-vision-exp",
     "deepseek/deepseek-v4-pro",
   ]) {
     const model = MODEL_BY_SLUG.get(slug);
     assert.equal(model.contextWindow, 1_048_576);
     assert.equal(model.autoCompact, 900_000);
-    assert.match(model.description, /DeepSeek V4/);
+    assert.match(model.description, /DeepSeek(?: |-)?V4/);
   }
   assert.deepEqual(
-    MODEL_BY_SLUG.get("deepseek/deepseek-v4.1-flash").inputModalities,
-    ["text"],
+    MODEL_BY_SLUG.get("deepseek/deepseek-flash").inputModalities,
+    ["text", "image"],
   );
   assert.deepEqual(
     MODEL_BY_SLUG.get("deepseek/deepseek-v4-pro").inputModalities,
@@ -864,7 +866,6 @@ test("only checked-in Gemini reseller models opt into trailing model-turn trimmi
 
 test("DeepSeek V4 Flash routes opt in to Codex standalone web search", () => {
   for (const slug of [
-    "deepseek/deepseek-v4.1-flash",
     "deepseek/deepseek-v4-flash-vision-exp",
     "opencode-go/deepseek-v4-flash",
   ]) {
@@ -878,7 +879,7 @@ test("DeepSeek V4 Flash routes opt in to Codex standalone web search", () => {
 // (#887). The default stays `high`.
 test("DeepSeek V4 Pro on the direct API advertises the same effort ladder as V4 Flash", () => {
   const pro = MODEL_BY_SLUG.get("deepseek/deepseek-v4-pro");
-  const flash = MODEL_BY_SLUG.get("deepseek/deepseek-v4-flash");
+  const flash = MODEL_BY_SLUG.get("deepseek/deepseek-flash");
   assert.deepEqual(
     pro.reasoningLevels.map((level) => level.effort),
     ["low", "high", "max"],
@@ -1909,7 +1910,7 @@ test("ClinePass deployments are single-shot inside LiteLLM, and only they are", 
     assert.ok(block, gatewayModel);
     assert.match(block[2], /^      num_retries: 0$/m, gatewayModel);
   }
-  const deepSeek = blocks.find((entry) => entry[1] === "deepseek-v4-flash");
+  const deepSeek = blocks.find((entry) => entry[1] === "deepseek-flash");
   assert.ok(deepSeek);
   assert.doesNotMatch(deepSeek[2], /num_retries/);
 });

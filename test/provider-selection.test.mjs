@@ -101,19 +101,17 @@ test("provider selection keeps backward compatibility and can hide the final pro
     assert.deepEqual(
       selectedListedModels().map((model) => model.slug),
       [
-        "deepseek/deepseek-v4-flash",
+        "deepseek/deepseek-flash",
         "deepseek/deepseek-v4-flash-vision-exp",
         "deepseek/deepseek-v4-pro",
-        "deepseek/deepseek-v4.1-flash",
       ],
     );
     assert.deepEqual(
       selectedConfiguredListedModels().map((model) => model.slug),
       [
-        "deepseek/deepseek-v4-flash",
+        "deepseek/deepseek-flash",
         "deepseek/deepseek-v4-flash-vision-exp",
         "deepseek/deepseek-v4-pro",
-        "deepseek/deepseek-v4.1-flash",
       ],
     );
 
@@ -279,10 +277,9 @@ test("an unknown provider id in the selection file is filtered out, not fatal", 
     assert.deepEqual(
       selectedListedModels().map((model) => model.slug),
       [
-        "deepseek/deepseek-v4-flash",
+        "deepseek/deepseek-flash",
         "deepseek/deepseek-v4-flash-vision-exp",
         "deepseek/deepseek-v4-pro",
-        "deepseek/deepseek-v4.1-flash",
       ],
     );
     // Doctor and the support bundle read through this, so the damage is

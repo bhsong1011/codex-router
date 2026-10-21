@@ -535,10 +535,10 @@ test("a same-account stored list answers discovery without a network", async () 
     assert.equal(cached.fetchedAt, "2020-01-01T00:00:00.000Z");
     // Old enough to want re-reading, and still served rather than withheld.
     assert.equal(cached.stale, true);
-    assert.deepEqual(cached.unregistered, ["deepseek-v9-preview"]);
+    assert.deepEqual(cached.unregistered, ["deepseek-v4-flash", "deepseek-v9-preview"]);
     // What is registered locally is always recomputed, never cached, so a
     // stored list can never claim a model is curated when it is not.
-    assert.ok(cached.registered.includes("deepseek-v4-flash"));
+    assert.ok(cached.registered.includes("deepseek-flash"));
 
     // Refreshing is the only path that reaches the provider, and when it
     // cannot be reached it must fail rather than quietly serve the stored list.

@@ -1,8 +1,8 @@
 {
   "version": 1,
   "provider": "deepseek",
-  "model": "deepseek-v4.1-flash",
-  "slug": "deepseek/deepseek-v4.1-flash",
+  "model": "deepseek-flash",
+  "slug": "deepseek/deepseek-flash",
   "status": "draft",
   "officialSources": [
     "provider catalog: api.deepseek.com/models lists the exact upstream id `deepseek-flash`"

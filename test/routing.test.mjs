@@ -82,6 +82,23 @@ function run(script, env, { nodeArgs = [] } = {}) {
     env?.MODEL_ROUTER_STATE_DIR || env?.CODEX_ROUTER_STATE_DIR
       ? {}
       : { MODEL_ROUTER_STATE_DIR: mkdtempSync(path.join(os.tmpdir(), "routing-state-")) };
+  const personalIsolation =
+    env?.CODEX_ROUTER_CHATGPT_LOGIN_HOME
+      ? {}
+      : {
+          CODEX_ROUTER_CHATGPT_LOGIN_HOME: mkdtempSync(
+            path.join(os.tmpdir(), "routing-personal-"),
+          ),
+        };
+  const routerApiIsolation =
+    script === "router.mjs"
+      ? {
+          CODEX_ROUTER_API_BASE_URL:
+            env?.CODEX_ROUTER_API_BASE_URL ??
+            env?.CODEX_ROUTER_GATEWAY_BASE_URL ??
+            "http://127.0.0.1:0/v1",
+        }
+      : {};
   const child = spawnNodeFixture(path.join(root, "src", script), {
     nodeArgs,
     cwd: root,
@@ -93,6 +110,7 @@ function run(script, env, { nodeArgs = [] } = {}) {
       CODEX_ROUTER_INTERNAL_KEY: INTERNAL_KEY,
       KIMI_INTERNAL_KEY: INTERNAL_KEY,
       CODEX_ROUTER_SHOW_ALL_MODELS: "1",
+      ...routerApiIsolation,
       ...env,
     },
   });
@@ -383,7 +401,7 @@ test("router requires the configured path capability before any model route", as
     const secondHeldRequest = fetch(`${routerBase(routerPort)}/responses`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "Thread-Id": secondThread },
-      body: JSON.stringify({ model: "deepseek/deepseek-v4.1-flash", input: "hold" }),
+      body: JSON.stringify({ model: "deepseek/deepseek-flash", input: "hold" }),
     });
     let generatingActivity;
     for (let attempt = 0; attempt < 40; attempt += 1) {
@@ -404,14 +422,14 @@ test("router requires the configured path capability before any model route", as
     assert.equal(generatingActivity.active.length, 2);
     assert.deepEqual(
       new Set(generatingActivity.active.map((entry) => entry.model)),
-      new Set(["deepseek/deepseek-v4-pro", "deepseek/deepseek-v4.1-flash"]),
+      new Set(["deepseek/deepseek-v4-pro", "deepseek/deepseek-flash"]),
     );
     assert.deepEqual(
       new Set(generatingActivity.active.map((entry) => entry.sessionName)),
       new Set(["Checkout release", "Audit telemetry"]),
     );
     assert.ok(
-      ["deepseek/deepseek-v4-pro", "deepseek/deepseek-v4.1-flash"].includes(
+      ["deepseek/deepseek-v4-pro", "deepseek/deepseek-flash"].includes(
         generatingActivity.model,
       ),
     );
@@ -1182,7 +1200,7 @@ test("router preserves native auth and isolates every external route", async () 
     for (const [model, gatewayModel] of [
       ["kimi-oauth/k3", "kimi-oauth-k3"],
       ["kimi-api/kimi-k3", "kimi-api-k3"],
-      ["deepseek/deepseek-v4.1-flash", "deepseek-v4.1-flash"],
+      ["deepseek/deepseek-flash", "deepseek-flash"],
       ["deepseek/deepseek-v4-pro", "deepseek-v4-pro"],
       ["grok-api/grok-4.5", "grok-api-grok-4-5"],
       ["anthropic-api/claude-opus-4.8", "anthropic-api-claude-opus-4-8"],
@@ -1909,7 +1927,7 @@ test("a relay refused by every account is paused instead of re-spent", async () 
   try {
     await waitFor(`${routerBase(routerPort)}/models`, router);
     const refused = await childTurn();
-    assert.equal(refused.status, 502, await refused.text());
+    assert.equal(refused.status, 429, await refused.text());
     // One attempt per account, in order: the caller, then the personal login.
     assert.equal(nativeRequests.length, 2);
     assert.equal(nativeRequests[0].headers.authorization, "Bearer CHATGPT_SESSION_TOKEN");
@@ -2421,7 +2439,7 @@ test("native web search fails closed without a ChatGPT session", async () => {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "deepseek/deepseek-v4.1-flash",
+        model: "deepseek/deepseek-flash",
         commands: { search_query: [{ q: "OpenAI news" }] },
       }),
     });
@@ -4319,7 +4337,7 @@ test("API forwarder replaces an image a text-only model cannot read", async () =
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "deepseek-v4.1-flash",
+        model: "deepseek-v4-pro",
         messages: [
           {
             role: "user",
@@ -4331,7 +4349,7 @@ test("API forwarder replaces an image a text-only model cannot read", async () =
         ],
       }),
     });
-    assert.equal(response.status, 200);
+    assert.equal(response.status, 200, `${await response.text()}\n${forwarder.testErrors()}`);
     const body = upstreamRequests[0];
     assert.doesNotMatch(JSON.stringify(body), /image_url|base64/);
     // A chat-completions part is `text`; substituting a Responses `input_text`
@@ -4851,7 +4869,7 @@ test("API forwarder health omits disabled API providers", async () => {
   }
 });
 
-test("API forwarder supports all DeepSeek V4 models and normalizes thinking", async () => {
+test("API forwarder supports chat-compatible DeepSeek V4 models and normalizes thinking", async () => {
   const upstreamRequests = [];
   const upstream = await mockServer(async (request, response) => {
     upstreamRequests.push({ headers: request.headers, body: await bodyJson(request) });
@@ -4869,11 +4887,9 @@ test("API forwarder supports all DeepSeek V4 models and normalizes thinking", as
     await waitFor(`http://127.0.0.1:${forwarderPort}/health`, forwarder, {
       Authorization: `Bearer ${INTERNAL_KEY}`,
     });
-    // DeepSeek documents low/high/max; low passes through (a real tier on
-    // V4 Flash) and the xhigh compat alias maps to max.
+    // DeepSeek documents low/high/max; V4 Pro exposes all three and the xhigh
+    // compatibility alias maps to max.
     for (const [gatewayModel, upstreamModel, sentEffort, effort] of [
-      ["deepseek-v4.1-flash", "deepseek-flash", "low", "low"],
-      ["deepseek-v4.1-flash", "deepseek-flash", "medium", "high"],
       ["deepseek-v4-flash-vision-exp", "deepseek-v4-flash-vision-exp", "low", "low"],
       ["deepseek-v4-flash-vision-exp", "deepseek-v4-flash-vision-exp", "medium", "high"],
       ["deepseek-v4-pro", "deepseek-v4-pro", "xhigh", "max"],
@@ -4955,7 +4971,7 @@ test("API forwarder downgrades forced tool choices for DeepSeek thinking models"
     // probe sends the string form and the subagent payload relay sends the
     // object form, so both must arrive as auto rather than failing the turn.
     for (const gatewayModel of [
-      "deepseek-v4.1-flash",
+      "deepseek-v4-pro",
       "deepseek-v4-flash-vision-exp",
       "deepseek-v4-pro",
       "deepseek-legacy-reasoner",
@@ -4991,7 +5007,7 @@ test("API forwarder downgrades forced tool choices for DeepSeek thinking models"
     // The router can explicitly disable one continuation when Codex has no
     // replayable DeepSeek reasoning. The thinking profile must preserve that
     // request instead of re-enabling thinking downstream.
-    const unavailableReplay = await forward("deepseek-v4.1-flash", {
+    const unavailableReplay = await forward("deepseek-v4-pro", {
       thinking: { type: "disabled" },
       reasoning_effort: "high",
       tool_choice: "required",
@@ -5108,7 +5124,7 @@ test("API forwarder synthesizes missing tool results for incomplete tool_calls h
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          model: "deepseek-v4.1-flash",
+          model: "deepseek-v4-pro",
           messages: [
             { role: "user", content: "continue after compact" },
             { role: "assistant", tool_calls: toolCalls },
@@ -5175,7 +5191,7 @@ test("API forwarder pairs an id-less tool call with its result instead of orphan
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          model: "deepseek-v4.1-flash",
+          model: "deepseek-v4-pro",
           messages: [
             { role: "user", content: "delegate" },
             {
@@ -7004,7 +7020,7 @@ test("API forwarder routes GLM coding-plan models with thinking enabled", async 
 
 [
   "zai-coding-glm-5-3",
-  "deepseek-v4-flash",
+  "deepseek-v4-pro",
   "commandcode-deepseek-v4-flash",
   "opencode-go-hy4-preview",
   // Reseller routes keyed on the upstream family rather than a profile.
@@ -7069,8 +7085,9 @@ test("API forwarder routes GLM coding-plan models with thinking enabled", async 
     assert.deepEqual(assistant.content, [{ type: "text", text: "visible answer" }]);
     if (gatewayModel === "zai-coding-glm-5-3") {
       assert.deepEqual(request.thinking, { type: "enabled", clear_thinking: false });
-    } else if (gatewayModel === "deepseek-v4-flash") {
+    } else if (gatewayModel === "deepseek-v4-pro") {
       assert.deepEqual(request.thinking, { type: "enabled" });
+      assert.ok(upstreamRequests[0].url.endsWith("/v1/chat/completions"));
     } else if (gatewayModel.startsWith("opencode-go-")) {
       // These routes have no thinking parameter of their own; the history
       // contract alone must restore reasoning_content without inventing one.
@@ -7163,7 +7180,7 @@ test("API forwarder gives DeepSeek tool calls without reasoning an empty reasoni
   }
 });
 
-// The native DeepSeek routes force `thinking: {type:"enabled"}` on, and the
+// DeepSeek V4 Chat routes force `thinking: {type:"enabled"}` on, and the
 // endpoint then validates two shapes the Responses bridge can hand it, both
 // measured against api.deepseek.com. An assistant turn carrying tool_calls
 // without a `reasoning_content` field is refused at any depth of the history,
@@ -7205,7 +7222,7 @@ test("API forwarder replays DeepSeek thinking as reasoning_content", async () =>
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          model: "deepseek-v4.1-flash",
+          model: "deepseek-v4-pro",
           messages: [
             { role: "user", content: "first" },
             {
@@ -8039,7 +8056,7 @@ test("router preserves orphan Codex app outputs as readable history", async () =
     assert.deepEqual(recovered.content, [
       {
         type: "input_text",
-        text: `[Codex app tool result: codex_app.send_message_to_thread]\n${delegation}`,
+        text: delegation,
       },
     ]);
     assert.deepEqual(gatewayRequests[0].input.slice(-2), input.slice(-2));
@@ -8054,13 +8071,16 @@ test("router preserves orphan Codex app outputs as readable history", async () =
     }
     assert.match(
       JSON.stringify(gatewayRequests[1].input),
+      /child finished/u,
+    );
+    assert.doesNotMatch(
+      JSON.stringify(gatewayRequests[1].input),
       /Codex app tool result: codex_app\.send_message_to_thread/u,
     );
-    assert.match(JSON.stringify(gatewayRequests[1].input), /child finished/u);
     const catalog = gatewayRequests[1].input.at(-2).content[0].text;
     assert.match(catalog, /"kind":"tool_result"/u);
-    assert.match(catalog, /"tool":"send_message_to_thread"/u);
-    assert.doesNotMatch(catalog, /"kind":"user_message"/u);
+    assert.match(catalog, /"kind":"user_message"/u);
+    assert.match(catalog, /child finished/u);
   } finally {
     await stopChild(router);
     await closeServer(gateway.server);
@@ -9749,8 +9769,8 @@ test("direct DeepSeek screenshots do not saturate the prompt-token estimate", as
   const userModels = path.join(stateDir, "user-models.json");
   writeFileSync(userModels, JSON.stringify({ version: 1, models: [{
     ...legacy,
-    slug: "deepseek/deepseek-v4.1-flash",
-    gatewayModel: "deepseek-v4-1-flash",
+    slug: "deepseek/deepseek-flash",
+    gatewayModel: "deepseek-flash",
     upstreamModel: "deepseek-flash",
     compHash: "deepseek-flash-image-estimate-fixture",
   }] }));
@@ -9764,7 +9784,7 @@ test("direct DeepSeek screenshots do not saturate the prompt-token estimate", as
   });
   const image_url = `data:image/png;base64,${"A".repeat(3_600_000)}`;
   const body = JSON.stringify({
-    model: "deepseek/deepseek-v4.1-flash",
+    model: "deepseek/deepseek-flash",
     input: [{ role: "user", content: [
       { type: "input_text", text: "Inspect this screenshot." },
       { type: "input_image", image_url },
@@ -9794,7 +9814,7 @@ test("direct DeepSeek screenshots do not saturate the prompt-token estimate", as
         .filter((part) => part.type === "input_image");
       assert.equal(images.length, 1);
       assert.equal(images[0].image_url, image_url);
-      assert.equal(gatewayBodies.at(-1).model, "deepseek-v4-1-flash");
+      assert.equal(gatewayBodies.at(-1).model, "deepseek-flash");
     }
   } finally {
     await stopChild(router);
@@ -10720,7 +10740,7 @@ test("a live child turn refines a legacy experimental subagent diagnostic", asyn
       version: 1,
       proofs: {
         "deepseek/deepseek-v4-pro": { status: "experimental" },
-        "deepseek/deepseek-v4.1-flash": { status: "experimental" },
+        "deepseek/deepseek-flash": { status: "experimental" },
         "deepseek/deepseek-chat": { status: "experimental" },
       },
     }),
@@ -10774,7 +10794,7 @@ test("a live child turn refines a legacy experimental subagent diagnostic", asyn
     assert.equal(proven.status, 200);
 
     // A structural rejection becomes negative diagnostic evidence.
-    const rejected = await childTurn("deepseek/deepseek-v4.1-flash", {
+    const rejected = await childTurn("deepseek/deepseek-flash", {
       "x-openai-subagent": "review-child",
     });
     assert.equal(rejected.status, 400);
@@ -10789,15 +10809,15 @@ test("a live child turn refines a legacy experimental subagent diagnostic", asyn
       proofs = JSON.parse(readFileSync(proofsPath, "utf8")).proofs;
       if (
         proofs["deepseek/deepseek-v4-pro"].status === "proven" &&
-        proofs["deepseek/deepseek-v4.1-flash"].status === "failed"
+        proofs["deepseek/deepseek-flash"].status === "failed"
       ) {
         break;
       }
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
     assert.equal(proofs["deepseek/deepseek-v4-pro"].status, "proven");
-    assert.equal(proofs["deepseek/deepseek-v4.1-flash"].status, "failed");
-    assert.match(proofs["deepseek/deepseek-v4.1-flash"].reason, /400/);
+    assert.equal(proofs["deepseek/deepseek-flash"].status, "failed");
+    assert.match(proofs["deepseek/deepseek-flash"].reason, /400/);
     assert.equal(proofs["deepseek/deepseek-chat"].status, "experimental");
   } finally {
     await stopChild(router);
@@ -10819,7 +10839,7 @@ test("ordinary child traffic does not mutate a legacy local proven record", asyn
       version: 1,
       proofs: {
         "deepseek/deepseek-v4-pro": { status: "proven", spawn: { ok: true, status: 200 } },
-        "deepseek/deepseek-v4.1-flash": { status: "proven", spawn: { ok: true, status: 200 } },
+        "deepseek/deepseek-flash": { status: "proven", spawn: { ok: true, status: 200 } },
       },
     }),
     { mode: 0o600 },
@@ -10894,12 +10914,12 @@ test("ordinary child traffic does not mutate a legacy local proven record", asyn
 
     // A structural rejection does not alter a legacy local record: it was
     // never a valid authority to advertise v2 in the first place.
-    const rejected = await childTurn("deepseek/deepseek-v4.1-flash", {
+    const rejected = await childTurn("deepseek/deepseek-flash", {
       "thread-id": "99999999-8888-4777-8666-555555555555",
     });
     assert.equal(rejected.status, 400);
     const flash = await proofFor(
-      "deepseek/deepseek-v4.1-flash",
+      "deepseek/deepseek-flash",
       (proof) => proof?.status === "proven",
     );
     assert.equal(flash.status, "proven");
@@ -10986,7 +11006,7 @@ test("a subagent effort reaches child turns and leaves parent turns alone", asyn
     assert.equal(parent.status, 200);
 
     // A model with no configured effort is untouched in either role.
-    const other = await turn("deepseek/deepseek-v4.1-flash", {
+    const other = await turn("deepseek/deepseek-flash", {
       "x-openai-subagent": "review-child",
     });
     assert.equal(other.status, 200);
@@ -11214,7 +11234,7 @@ test("reasoning survives the replay onto tool-call and prose assistant turns ali
   }
 });
 
-["zai-coding/glm-5.3", "deepseek/deepseek-v4-flash", "commandcode/deepseek-v4-flash"].forEach((routedModel) => test(`${routedModel} reasoning stays structurally separate while crossing the Responses bridge`, async () => {
+["zai-coding/glm-5.3", "deepseek/deepseek-flash", "commandcode/deepseek-v4-flash"].forEach((routedModel) => test(`${routedModel} reasoning stays structurally separate while crossing the Responses bridge`, async () => {
   const gatewayBodies = [];
   const gateway = await mockServer(async (request, response) => {
     gatewayBodies.push(await bodyJson(request));
@@ -11266,9 +11286,16 @@ test("reasoning survives the replay onto tool-call and prose assistant turns ali
     const forwarded = gatewayBodies[0].input;
     const callIndex = forwarded.findIndex((item) => item?.type === "function_call");
     const beforeCall = forwarded[callIndex - 1];
-    assert.equal(beforeCall?.role, "assistant");
-    assert.deepEqual(beforeCall.content, [{ type: "thinking", text: "tool-call reasoning\ntool detail" }]);
-    assert.equal(forwarded.some((item) => item.type === "reasoning"), false);
+    if (routedModel === "deepseek/deepseek-flash") {
+      assert.equal(beforeCall?.type, "reasoning");
+      assert.equal(forwarded.filter((item) => item.type === "reasoning").length, 3);
+      assert.ok(forwarded.every((item) => item.type !== "reasoning" || Array.isArray(item.content)));
+      assert.equal(forwarded.some((item) => item.role === "assistant"), true);
+    } else {
+      assert.equal(beforeCall?.role, "assistant");
+      assert.deepEqual(beforeCall.content, [{ type: "thinking", text: "tool-call reasoning\ntool detail" }]);
+      assert.equal(forwarded.some((item) => item.type === "reasoning"), false);
+    }
     for (const text of ["tool-call reasoning", "tool detail", "provider-native reasoning"]) {
       assert.equal(JSON.stringify(forwarded).split(text).length - 1, 1);
     }
@@ -11282,8 +11309,16 @@ test("reasoning survives the replay onto tool-call and prose assistant turns ali
     );
     assert.ok(assistant);
     const parts = assistant.content;
-    assert.deepEqual(parts[0], { type: "thinking", text: "provider-native reasoning" });
-    assert.deepEqual(parts[1], { type: "output_text", text: "visible answer" });
+    if (routedModel === "deepseek/deepseek-flash") {
+      assert.deepEqual(parts, [{ type: "output_text", text: "visible answer" }]);
+      assert.ok(forwarded.some((item) =>
+        item?.type === "reasoning" &&
+        item.content?.some((part) => part.text === "provider-native reasoning"),
+      ));
+    } else {
+      assert.deepEqual(parts[0], { type: "thinking", text: "provider-native reasoning" });
+      assert.deepEqual(parts[1], { type: "output_text", text: "visible answer" });
+    }
     assert.equal(
       parts.filter((part) => part.type === "output_text").some((part) => /reasoning/.test(part.text)),
       false,
@@ -11311,10 +11346,18 @@ test("reasoning survives the replay onto tool-call and prose assistant turns ali
     const replay = gatewayBodies.at(-1).input;
     const answers = replay.filter((item) => item.role === "assistant");
     assert.equal(answers.length, 1);
-    assert.deepEqual(answers[0].content, [
-      { type: "thinking", text: "Check the marker format." },
-      { type: "output_text", text: `MARKER: ${marker}` },
-    ]);
+    if (routedModel === "deepseek/deepseek-flash") {
+      assert.equal(answers[0].content, `MARKER: ${marker}`);
+      assert.ok(replay.some((item) =>
+        item?.type === "reasoning" &&
+        item.content?.some((part) => part.text === "Check the marker format."),
+      ));
+    } else {
+      assert.deepEqual(answers[0].content, [
+        { type: "thinking", text: "Check the marker format." },
+        { type: "output_text", text: `MARKER: ${marker}` },
+      ]);
+    }
     assert.equal(JSON.stringify(replay).split(marker).length - 1, 1);
     assert.equal(replay.at(-1).role, "user");
   } finally {
@@ -11329,7 +11372,7 @@ test("reasoning survives the replay onto tool-call and prose assistant turns ali
 // on every tool-call turn, so the carry has to arrive as a `thinking` part the
 // API forwarder can move onto that field; the generic visible-content carry is
 // exactly the shape the endpoint refuses.
-test("DeepSeek reasoning crosses the Responses bridge as a thinking part", async () => {
+test("DeepSeek reasoning stays native across the Responses bridge", async () => {
   const gatewayBodies = [];
   const gateway = await mockServer(async (request, response) => {
     gatewayBodies.push(await bodyJson(request));
@@ -11363,15 +11406,15 @@ test("DeepSeek reasoning crosses the Responses bridge as a thinking part", async
         Authorization: "Bearer CODEX_CALLER_SECRET",
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ model: "deepseek/deepseek-v4.1-flash", stream: false, input }),
+      body: JSON.stringify({ model: "deepseek/deepseek-flash", stream: false, input }),
     });
     assert.equal(response.status, 200, await response.text());
     const forwarded = gatewayBodies[0].input;
     const callIndex = forwarded.findIndex((item) => item?.type === "function_call");
     const beforeCall = forwarded[callIndex - 1];
-    assert.equal(beforeCall?.role, "assistant");
+    assert.equal(beforeCall?.type, "reasoning");
     assert.deepEqual(beforeCall.content, [
-      { type: "thinking", text: "The log lives under /var/log." },
+      { type: "reasoning_text", text: "The log lives under /var/log." },
     ]);
   } finally {
     await stopChild(router);
@@ -11752,7 +11795,7 @@ test("router exposes Chat Completions reasoning behind a Desktop-sized prelude",
 });
 
 test("router normalizes direct DeepSeek's live reasoning bridge and removes its blank", async () => {
-  const model = "deepseek-v4.1-flash";
+  const model = "deepseek-flash";
   const reasoningText = "Inspect the request, then call the tool exactly once.";
   const blankMessage = {
     id: "msg_direct_live",
@@ -11786,13 +11829,6 @@ test("router normalizes direct DeepSeek's live reasoning bridge and removes its 
     type: "reasoning",
     status: "completed",
     summary: [{ type: "summary_text", text: reasoningText }],
-    // The continuation token is what makes the client keep the item at all; it
-    // names itself instead of pretending to be a native ciphertext.
-    encrypted_content: Buffer.from(
-      JSON.stringify({ router: "deepseek-reasoning-summary", text: reasoningText }),
-      "utf8",
-    ).toString("base64url"),
-    content: [],
   };
   const gateway = await mockServer(async (request, response) => {
     await bodyJson(request);
@@ -11929,7 +11965,7 @@ test("router normalizes direct DeepSeek's live reasoning bridge and removes its 
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        model: "deepseek/deepseek-v4-flash-vision-exp",
+        model: "deepseek/deepseek-flash",
         input: "list files",
         stream: true,
       }),

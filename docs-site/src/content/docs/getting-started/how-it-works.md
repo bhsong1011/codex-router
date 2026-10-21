@@ -91,7 +91,7 @@ map, which restores native GPT routing.
 | K2.7 Coding OAuth | `kimi-oauth/kimi-for-coding` | `kimi-oauth-kimi-for-coding` | `kimi-for-coding` |
 | Kimi K3 OAuth | `kimi-oauth/k3` | `kimi-oauth-k3` | `k3` |
 | Kimi K3 API | `kimi-api/kimi-k3` | `kimi-api-k3` | `kimi-k3` |
-| DeepSeek V4 Flash | `deepseek/deepseek-v4-flash` | `deepseek-v4-flash` | `deepseek-v4-flash` |
+| deepseek-flash | `deepseek/deepseek-flash` | `deepseek-flash` | `deepseek-flash` |
 | DeepSeek V4 Pro | `deepseek/deepseek-v4-pro` | `deepseek-v4-pro` | `deepseek-v4-pro` |
 | Grok 4.5 OAuth | `grok-oauth/grok-4.5` | `grok-oauth-grok-4-5` | `grok-4.5` |
 | Grok 4.5 | `grok-api/grok-4.5` | `grok-api-grok-4-5` | `grok-4.5` |
@@ -252,7 +252,7 @@ still sends ambient hosted-search extensions to an unsupported runtime-generic
 route, the router strips those extensions at its managed Responses boundary;
 it does not mutate direct gateway calls or ordinary caller-owned functions.
 
-The checked-in registry currently enables this mode for DeepSeek V4 Flash on
+The checked-in registry currently enables this mode for `deepseek-flash` on
 its direct API and opencode Go routes, DeepSeek V4 Flash Vision Exp, Xiaomi
 MiMo v2.5, and GLM-5.3 on the Z.ai Coding Plan. Other provider/model pairs
 stay off until verified -- including GLM-5.3 on the opencode Go relay, which

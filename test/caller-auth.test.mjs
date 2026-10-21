@@ -15,6 +15,7 @@ import {
   authenticatedRoute,
   callerBaseUrl,
   claudeBaseUrl,
+  configuredCallerBaseUrl,
   cursorCliBaseUrl,
   geminiBaseUrl,
   isManagedCallerBaseUrl,

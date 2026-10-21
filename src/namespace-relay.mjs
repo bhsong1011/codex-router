@@ -2923,10 +2923,6 @@ function appendInterruptCallsToOutput(output, pending, interrupted, namespace) {
 
 const CUSTOM_TOOL_OPENING_LIMIT = 1024;
 const LITELLM_CUSTOM_TOOL_INPUT_PROPERTY = "content";
-const NATIVE_CUSTOM_TOOL_INPUT_PROPERTIES = Object.freeze([
-  LITELLM_CUSTOM_TOOL_INPUT_PROPERTY,
-  CUSTOM_TOOL_INPUT_PROPERTY,
-]);
 const CUSTOM_TOOL_OPENING_PATTERNS = Object.freeze({
   [CUSTOM_TOOL_INPUT_PROPERTY]: /^\s*\{\s*"input"\s*:\s*"/,
   [LITELLM_CUSTOM_TOOL_INPUT_PROPERTY]: /^\s*\{\s*"content"\s*:\s*"/,
@@ -4396,7 +4392,7 @@ export class NamespaceToolCallTransform extends Transform {
           matched.state.sawArgumentDelta = true;
           const argumentProperty =
             matched.state.sourceType === "custom_tool_call"
-              ? NATIVE_CUSTOM_TOOL_INPUT_PROPERTIES
+              ? LITELLM_CUSTOM_TOOL_INPUT_PROPERTY
               : CUSTOM_TOOL_INPUT_PROPERTY;
           const delta = customToolInputDelta(
             matched.state.deltaState,
@@ -4457,7 +4453,7 @@ export class NamespaceToolCallTransform extends Transform {
           } else {
           const argumentProperty =
             matched.state.sourceType === "custom_tool_call"
-              ? matched.state.deltaState?.property || NATIVE_CUSTOM_TOOL_INPUT_PROPERTIES
+              ? matched.state.deltaState?.property || LITELLM_CUSTOM_TOOL_INPUT_PROPERTY
               : CUSTOM_TOOL_INPUT_PROPERTY;
           const input = matched.state.sourceType === "custom_tool_call" && !matched.state.codec
             ? litellmCustomToolInput(event.arguments)

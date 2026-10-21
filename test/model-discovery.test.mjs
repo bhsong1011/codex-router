@@ -48,7 +48,7 @@ test("model discovery compares fixtures without needing or exposing a key", () =
     assert.deepEqual(result.addable, ["deepseek-v5-preview"]);
     assert.deepEqual(result.blocked, {});
     assert.ok(result.registered.includes("deepseek-flash"));
-    assert.ok(result.unavailable.includes("deepseek-v4-flash"));
+    assert.ok(!result.unavailable.includes("deepseek-v4-flash"));
     assert.doesNotMatch(output, /Bearer|api[_-]?key/i);
   } finally {
     rmSync(testRoot, { recursive: true, force: true });

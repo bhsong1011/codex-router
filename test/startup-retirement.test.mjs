@@ -25,7 +25,7 @@ const completeStartup = new AsyncFunction("context", `
   const { FRONTEND, SOURCE_ROOT, run, process, waitForHealth, loopback, PORTS,
     STARTUP_CHILD_HEALTH_TIMEOUT_MS, clearStartupTimeouts,
     attemptAntigravityProbePromotionAfterReadiness, antigravityStartup,
-    children, console, path, loadPublisher } = context;
+    children, console, path, loadPublisher, stopAccountUsage } = context;
   let shuttingDown = false;
   let stopNativeCatalogWatch = () => {};
   const SIGKILL_AFTER_MS = 1;
@@ -80,6 +80,7 @@ function scenario({ pending = true, promotion = true, failure, shutdownDuringLoa
       pendingSessionGeneration: SESSION_GENERATION,
     } : {},
     children: [child],
+    stopAccountUsage: () => {},
     console: { error: (message) => { errors.push(message); } },
     path,
     loadPublisher: async () => {

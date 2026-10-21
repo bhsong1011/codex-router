@@ -89,9 +89,9 @@ test("an explicit model selection changes only the supplied provider models", ()
     `${JSON.stringify({
       version: 1,
       hidden: ["deepseek/deepseek-v4-pro", "kimi-oauth/k3"],
-      visible: ["deepseek/deepseek-v4-flash"],
+      visible: ["deepseek/deepseek-flash"],
       seeded: [
-        "deepseek/deepseek-v4-flash",
+        "deepseek/deepseek-flash",
         "deepseek/deepseek-v4-pro",
         "kimi-oauth/k3",
       ],
@@ -100,12 +100,12 @@ test("an explicit model selection changes only the supplied provider models", ()
   );
 
   setModelSelection(
-    ["deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro"],
+    ["deepseek/deepseek-flash", "deepseek/deepseek-v4-pro"],
     ["deepseek/deepseek-v4-pro"],
   );
 
   const picker = modelPickerSnapshot();
-  assert.deepEqual(picker.hidden, ["deepseek/deepseek-v4-flash", "kimi-oauth/k3"]);
+  assert.deepEqual(picker.hidden, ["deepseek/deepseek-flash", "kimi-oauth/k3"]);
   assert.deepEqual(picker.visible, ["deepseek/deepseek-v4-pro"]);
 });
 
@@ -125,18 +125,18 @@ test("a picker decision preserves legacy visibility until catalog migration", ()
     `${JSON.stringify({
       version: 1,
       hidden: ["deepseek/deepseek-v4-pro"],
-      seeded: ["deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro"],
+      seeded: ["deepseek/deepseek-flash", "deepseek/deepseek-v4-pro"],
     })}\n`,
     { mode: 0o600 },
   );
   const legacy = modelPickerSnapshot();
   assert.equal(legacy.hasExplicitVisibility, false);
-  assert.deepEqual(legacy.visible, ["deepseek/deepseek-v4-flash"]);
+  assert.deepEqual(legacy.visible, ["deepseek/deepseek-flash"]);
 
-  setModelVisible("deepseek/deepseek-v4-flash", true);
+  setModelVisible("deepseek/deepseek-flash", true);
   const current = modelPickerSnapshot();
   assert.equal(current.hasExplicitVisibility, false);
-  assert.deepEqual(current.visible, ["deepseek/deepseek-v4-flash"]);
+  assert.deepEqual(current.visible, ["deepseek/deepseek-flash"]);
 });
 
 // The exact shape a pre-allowlist build left behind: `hidden` and `seeded`
@@ -153,7 +153,7 @@ function writeLegacyState(state) {
 }
 
 test("model and bulk picker changes preserve unrelated implicit legacy choices", () => {
-  const target = "deepseek/deepseek-v4-flash";
+  const target = "deepseek/deepseek-flash";
   const implicit = "kimi-oauth/k3";
   const explicit = "opencode-go/gpt-5.6-sol";
   const alreadyHidden = "opencode-go/kimi-k3";
@@ -191,7 +191,7 @@ test("model and bulk picker changes preserve unrelated implicit legacy choices",
 });
 
 test("visibility writes on missing or invalid state create an opt-in picker", () => {
-  const target = "deepseek/deepseek-v4-flash";
+  const target = "deepseek/deepseek-flash";
   const unrelated = "kimi-oauth/k3";
   const operations = [
     (visible) => setModelVisible(target, visible),
@@ -252,7 +252,7 @@ test("the legacy picker migration runs once and then leaves the file alone", () 
 });
 
 test("a complete legacy migration freezes choices when every known model was already decided", () => {
-  const known = "deepseek/deepseek-v4-flash";
+  const known = "deepseek/deepseek-flash";
   const added = "kimi-oauth/k3";
   const nativeVariant = "gpt-5.6-sol-1m";
   for (const visible of [false, true]) {
@@ -282,7 +282,7 @@ test("an empty catalog cannot complete the legacy visibility migration", () => {
   writeLegacyState({
     version: 1,
     hidden: ["gpt-5.6-sol-1m"],
-    seeded: ["deepseek/deepseek-v4-flash", "gpt-5.6-sol-1m"],
+    seeded: ["deepseek/deepseek-flash", "gpt-5.6-sol-1m"],
     order: "routed-first",
   });
   const previous = readFileSync(MODEL_PICKER_STATE_PATH, "utf8");
@@ -329,8 +329,8 @@ test("an explicit model selection does not turn a legacy file into an allowlist"
   });
 
   setModelSelection(
-    ["deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro"],
-    ["deepseek/deepseek-v4-flash"],
+    ["deepseek/deepseek-flash", "deepseek/deepseek-v4-pro"],
+    ["deepseek/deepseek-flash"],
   );
 
   // Recording an allowlist here would answer for every provider this call
@@ -340,7 +340,7 @@ test("an explicit model selection does not turn a legacy file into an allowlist"
   const picker = modelPickerSnapshot();
   assert.equal(picker.hasExplicitVisibility, false);
   assert.deepEqual(picker.hidden, ["deepseek/deepseek-v4-pro"]);
-  assert.ok(picker.visible.includes("deepseek/deepseek-v4-flash"));
+  assert.ok(picker.visible.includes("deepseek/deepseek-flash"));
 });
 
 test("a migration does not overwrite a destination decided outside seeded", () => {

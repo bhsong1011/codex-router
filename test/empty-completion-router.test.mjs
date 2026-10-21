@@ -522,7 +522,7 @@ test("a large initial event preserves a namespaced tool call without retrying", 
     { type: "response.output_item.done", output_index: 0, item: tool },
     { type: "response.completed", response: { id: "r-large", output: [tool] } },
   ].map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
-  for (const model of [TURN_BODY.model, "deepseek/deepseek-v4.1-flash"]) {
+  for (const model of [TURN_BODY.model, "deepseek/deepseek-flash"]) {
     const paths = [];
     const gw = await gateway((request, response) => {
       paths.push(request.url);

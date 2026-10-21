@@ -264,9 +264,8 @@ Linux installations support the Codex CLI.
 | Kimi K3 (OAuth) | `kimi-oauth/k3` | Existing Kimi Code CLI OAuth session |
 | Kimi K3 (API) | `kimi-api/kimi-k3` | Separately billed Kimi Platform API key |
 | Kimi K3 (China API) | `kimi-api-cn/kimi-k3` | Separately billed Moonshot **China** platform key |
-| DeepSeek V4 Flash (API) | `deepseek/deepseek-v4-flash` | DeepSeek API key |
 | DeepSeek V4 Pro (API) | `deepseek/deepseek-v4-pro` | DeepSeek API key |
-| DeepSeek V4.1 Flash (API) | `deepseek/deepseek-v4.1-flash` | DeepSeek API key |
+| deepseek-flash | `deepseek/deepseek-flash` | DeepSeek API key |
 | Grok 4.5 (OAuth) | `grok-oauth/grok-4.5` | Official Grok CLI OAuth session |
 | Grok 4.5 (API) | `grok-api/grok-4.5` | Separately billed xAI API key |
 | Claude Opus 4.8 (API) | `anthropic-api/claude-opus-4.8` | Separately billed Anthropic API key |
@@ -375,7 +374,7 @@ results; the router does not take search env knobs or request-side filter
 config. Install the official CLI and authenticate before enabling the route:
 
 Other routed providers can use Codex's client-side (standalone) web search when
-the selected model has been verified for it. DeepSeek V4 Flash is enabled on
+the selected model has been verified for it. `deepseek-flash` is enabled on
 its direct API and opencode Go routes. A compatible model declares
 `"searchTool": { "mode": "standalone" }` in its registry or user-model
 metadata. This capability is resolved from the selected model/provider pair;
@@ -1240,7 +1239,7 @@ picker. The router snapshots the prior Codex default, reapplies your router
 choice after an update or repair, and restores that prior default when cleared:
 
 ```sh
-./bin/control router-default set deepseek/deepseek-v4-flash
+./bin/control router-default set deepseek/deepseek-flash
 ./bin/control router-default clear
 ```
 
