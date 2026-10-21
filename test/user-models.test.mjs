@@ -6,9 +6,12 @@ import { test } from "node:test";
 
 const stateDir = mkdtempSync(path.join(os.tmpdir(), "user-models-test-"));
 process.env.CODEX_ROUTER_STATE_DIR = stateDir;
+process.env.MODEL_ROUTER_STATE_DIR = stateDir;
+process.env.MODEL_ROUTER_USER_MODELS = path.join(stateDir, "user-models.json");
 
 const {
   userModelEntry,
+  userModelEntryFromCatalog,
   readUserModels,
   writeUserModels,
   hasDefaultUserModelReasoning,
@@ -41,6 +44,16 @@ test("userModelEntry fills conservative picker metadata", () => {
 });
 
 
+test("OpenCode Free Muse Spark curation uses the official picker label", () => {
+  const entry = userModelEntry({
+    providerId: "opencode-free-responses",
+    upstreamId: "muse-spark-1.3-contributor-free",
+    priority: 100,
+    metadata: { isFree: true },
+  });
+  assert.equal(entry.displayName, "Muse Spark 1.3 Contributor (OpenCode Free)");
+});
+
 test("curation metadata can set sizing and the effort ladder", () => {
   const entry = userModelEntry({
     providerId: "deepseek",
@@ -57,6 +70,7 @@ test("curation metadata can set sizing and the effort ladder", () => {
       ],
       defaultEffort: "medium",
       serviceTiers: [{ id: "priority", name: "Fast" }],
+      supportsSearchHistory: true,
       requiresTrailingUserTurn: true,
       isFree: true,
     },
@@ -66,6 +80,7 @@ test("curation metadata can set sizing and the effort ladder", () => {
   assert.equal(entry.reasoningLevels.length, 3);
   assert.equal(entry.defaultEffort, "medium");
   assert.deepEqual(entry.serviceTiers, [{ id: "priority", name: "Fast" }]);
+  assert.equal(entry.supportsSearchHistory, true);
   assert.equal(entry.requiresTrailingUserTurn, true);
   assert.equal(entry.isFree, true);
 });
@@ -96,6 +111,28 @@ test("curation metadata preserves only explicit endpoint capabilities", () => {
   });
   assert.deepEqual(entry.supportedEndpoints, ["/embeddings"]);
   assert.equal(entry.endpoint, undefined);
+});
+
+test("curation and protected JSON retain an explicit reasoning tag policy", () => {
+  const entries = ["preserve", "legacy-inline", "hy4-nonce"].map((reasoningTagPolicy, priority) =>
+    userModelEntry({ providerId: "custom", upstreamId: `policy-${priority}/hy4-preview`, priority: 100 + priority,
+      metadata: { reasoningTagPolicy } }));
+  assert.deepEqual(entries.map((entry) => entry.reasoningTagPolicy), ["preserve", "legacy-inline", "hy4-nonce"]);
+  writeUserModels(entries);
+  assert.deepEqual(readUserModels(), entries);
+  const explicit = userModelEntry({ providerId: "custom", upstreamId: "model", priority: 100,
+    reasoningTagPolicy: "preserve", metadata: { reasoningTagPolicy: "legacy-inline" } });
+  assert.equal(explicit.reasoningTagPolicy, "preserve", "explicit caller policy wins over catalog metadata");
+  assert.equal(userModelEntry({ providerId: "custom", upstreamId: "default", priority: 100 }).reasoningTagPolicy, undefined);
+});
+
+test("verified catalog conversion preserves an explicit tag policy without inventing one", () => {
+  const catalogModel = { id: "model", adapter: "vertex-openai-chat", priority: 100,
+    displayName: "Model", description: "Verified support catalog record", capabilities: {} };
+  assert.equal(userModelEntryFromCatalog({ providerId: "vertex", catalogModel }).reasoningTagPolicy, undefined);
+  const entry = userModelEntryFromCatalog({ providerId: "vertex",
+    catalogModel: { ...catalogModel, reasoningTagPolicy: "preserve" } });
+  assert.equal(entry.reasoningTagPolicy, "preserve");
 });
 
 test("curation metadata cannot replace identity or routing fields", () => {
@@ -136,6 +173,16 @@ test("user models round-trip through the protected state file", () => {
   writeUserModels(entries);
   assert.deepEqual(readUserModels(), entries);
   assert.ok(USER_MODELS_PATH.startsWith(stateDir));
+});
+
+test("readUserModels accepts a file saved with a UTF-8 byte-order mark", () => {
+  // PowerShell and Notepad on Windows write UTF-8 with a BOM (#887); a failed
+  // parse here would silently drop every curated model.
+  const entries = [
+    userModelEntry({ providerId: "deepseek", upstreamId: "deepseek-bom-test", priority: 100 }),
+  ];
+  writeFileSync(USER_MODELS_PATH, `﻿${JSON.stringify({ version: 1, models: entries }, null, 2)}\n`);
+  assert.deepEqual(readUserModels(), entries);
 });
 
 test("readUserModels returns an empty list when the file is absent or invalid", () => {
@@ -233,6 +280,10 @@ test("registry merges valid user models and skips collisions", async () => {
       ...userModelEntry({ providerId: "deepseek", upstreamId: "deepseek-bad-search", priority: 106 }),
       searchTool: { mode: "emulated" },
     },
+    {
+      ...userModelEntry({ providerId: "deepseek", upstreamId: "deepseek-bad-search-history", priority: 120 }),
+      supportsSearchHistory: "yes",
+    },
     // Standalone search is Codex-side execution; it remains an explicit
     // per-model opt-in rather than a provider-wide default.
     {
@@ -321,6 +372,7 @@ test("registry merges valid user models and skips collisions", async () => {
   assert.ok(!slugs.includes("no-such-provider/x-model"));
   assert.ok(!slugs.includes("deepseek/deepseek-blank-nux"));
   assert.ok(!slugs.includes("deepseek/deepseek-bad-search"));
+  assert.ok(!slugs.includes("deepseek/deepseek-bad-search-history"));
   assert.ok(slugs.includes("deepseek/deepseek-standalone-search"));
   assert.ok(!slugs.includes("deepseek/deepseek-bad-detail"));
   assert.ok(!slugs.includes("deepseek/deepseek-bad-trailing-turn"));
@@ -341,6 +393,21 @@ test("registry merges valid user models and skips collisions", async () => {
   assert.ok(registry.USER_MODEL_WARNINGS.some((warning) => (
     /opencode-go\/grok-4\.5/.test(warning) && /collides with an existing model alias/.test(warning)
   )));
+  // The router cites why a slug has no route (#689), so each skipped entry's
+  // reason is kept by slug, including the ones dropped after the merge settles.
+  assert.match(
+    registry.USER_MODELS_SKIPPED.get("deepseek/deepseek-self-certified"),
+    /may not declare multiAgentVersion v2/,
+  );
+  assert.match(
+    registry.USER_MODELS_SKIPPED.get("no-such-provider/x-model"),
+    /references unknown provider no-such-provider/,
+  );
+  assert.match(
+    registry.USER_MODELS_SKIPPED.get("deepseek/deepseek-bad-upgrade"),
+    /upgrades to unknown model no-such\/model/,
+  );
+  assert.equal(registry.USER_MODELS_SKIPPED.has("deepseek/deepseek-user-test"), false);
   const merged = registry.MODEL_BY_SLUG.get("deepseek/deepseek-user-test");
   assert.equal(merged.listed, true);
   assert.equal(merged.availabilityNux, "Now available through your DeepSeek key.");

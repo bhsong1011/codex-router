@@ -19,6 +19,7 @@ import {
   providerNeedsNoKey,
   RUNTIME_PROVIDERS,
   RUNTIME_PROVIDER_WARNINGS,
+  USER_MODELS_SKIPPED,
 } from "./model-registry.mjs";
 import { grokOAuthStatus } from "./grok-oauth-status.mjs";
 import {
@@ -36,9 +37,15 @@ import { serviceFollowsHostApps } from "./presence-state.mjs";
 import { waitForRouterHealth } from "./router-health.mjs";
 import {
   CALLER_SECRET_PATH,
+  CLAUDE_CATALOG_PATH,
+  CLAUDE_LAUNCHER_PATH,
   CODEX_AGENTS_DIR,
   CODEX_HOME,
   CONFIG_PATH,
+  CURSOR_CATALOG_PATH,
+  CURSOR_LAUNCHER_PATH,
+  CURSOR_PUBLIC_SECRET_PATH,
+  CURSOR_STATE_DB_PATH,
   DSH_CATALOG_PATH,
   DSH_SETTINGS_PATH,
   GEMINI_CATALOG_PATH,
@@ -47,6 +54,7 @@ import {
   LITELLM_CONFIG_PATH,
   MERGED_CATALOG_PATH,
   NATIVE_CATALOG_PATH,
+  OPENCLAW_CATALOG_PATH,
   PORTS,
   SEARCH_SIDECARS_PATH,
   SOURCE_ROOT,
@@ -59,6 +67,7 @@ import {
 } from "./skills-install.mjs";
 import { discoveryDisabled } from "./discovery-mode.mjs";
 import { credentialLabel } from "./provider-credentials.mjs";
+import { resolveAvailabilityCache, withdrawnListedRoutes } from "./model-catalog-cache.mjs";
 import { providerApiKeyPoolsSnapshot } from "./provider-api-key-pool.mjs";
 import {
   effectiveProviderCredentialStatus,
@@ -265,7 +274,12 @@ function repair() {
   // environment. Homebrew has already validated its package-owned tree above,
   // so its repair only regenerates configuration and services.
   const posixArguments = homebrewManaged ? [] : ["--force-deps"];
-  const windowsArguments = homebrewManaged ? ["-CheckoutInstall"] : ["-CheckoutInstall", "-ForceDeps"];
+  const windowsArguments = [
+    "-CheckoutInstall",
+    "-Target",
+    TARGET,
+    ...(homebrewManaged ? [] : ["-ForceDeps"]),
+  ];
   const result = process.platform === "win32"
     ? spawnSync(
         "powershell.exe",
@@ -379,7 +393,15 @@ const privacyTarget = codexTarget
   ? CONFIG_PATH
   : TARGET === "gemini"
     ? GEMINI_ENV_PATH
-    : DSH_SETTINGS_PATH;
+    : TARGET === "cursor"
+      ? CURSOR_CATALOG_PATH
+      : TARGET === "claude"
+        ? CLAUDE_CATALOG_PATH
+        : TARGET === "openclaw"
+          ? OPENCLAW_CATALOG_PATH
+      : DSH_SETTINGS_PATH;
+const cursorAgentOnly = TARGET === "cursor" &&
+  !existsSync(CURSOR_CATALOG_PATH) && existsSync(CURSOR_LAUNCHER_PATH);
 const configMode = existsSync(privacyTarget)
   ? statSync(privacyTarget).mode & 0o777
   : undefined;
@@ -389,16 +411,25 @@ const codexConfigText = codexTarget && existsSync(CONFIG_PATH)
 const codexConfigCarriesCallerCapability =
   codexTarget && redactCallerUrl(codexConfigText) !== codexConfigText;
 const privacyRequired = !codexTarget || codexConfigCarriesCallerCapability;
-const configProtected =
-  configMode !== undefined && (!privacyRequired || privateFileIsProtected(privacyTarget));
+const configProtected = cursorAgentOnly || (
+  configMode !== undefined && (!privacyRequired || privateFileIsProtected(privacyTarget))
+);
 add(
   configProtected ? "ok" : "fail",
   codexTarget
     ? "Codex config privacy"
     : TARGET === "gemini"
       ? "Gemini environment privacy"
+      : TARGET === "cursor"
+        ? "Cursor router-state privacy"
+        : TARGET === "claude"
+          ? "Claude router-state privacy"
+          : TARGET === "openclaw"
+            ? "OpenClaw router-state privacy"
       : "Harness settings privacy",
-  configMode === undefined
+  cursorAgentOnly
+    ? "agent-only; no Cursor App router-state document"
+    : configMode === undefined
     ? "missing"
     : codexTarget && !privacyRequired
       ? "router credentials stay outside config.toml"
@@ -424,7 +455,13 @@ const routedTransportActive = codexTarget
   ? routedCatalogConfigured(existsSync(CONFIG_PATH) ? readFileSync(CONFIG_PATH, "utf8") : "")
   : TARGET === "gemini"
     ? existsSync(GEMINI_CATALOG_PATH)
-    : existsSync(DSH_CATALOG_PATH);
+    : TARGET === "cursor"
+      ? existsSync(CURSOR_CATALOG_PATH) || existsSync(CURSOR_LAUNCHER_PATH)
+      : TARGET === "claude"
+        ? existsSync(CLAUDE_CATALOG_PATH) && existsSync(CLAUDE_LAUNCHER_PATH)
+        : TARGET === "openclaw"
+          ? existsSync(OPENCLAW_CATALOG_PATH)
+      : existsSync(DSH_CATALOG_PATH);
 // An install made with --no-provider --no-discovery is idle on purpose: the
 // selection is an explicit empty list and the discovery marker is set. That
 // state is what the operator asked for, so the empty selection and the empty
@@ -437,17 +474,29 @@ try {
   requiredRoutedModels = selectedConfiguredListedModels();
   catalogRoutedModels = routedTransportActive ? requiredRoutedModels : [];
   requiredModels = new Set(catalogRoutedModels.map((model) => model.slug));
+  // Registry selection and generic providers are two lists. A Poe-only
+  // install writes `enabled-providers.json` as `[]` and still serves curated
+  // generic routes, so naming only the registry file here reported
+  // "Enabled providers: none" while the Poe row below said OK (#774).
+  const enabledGenericIds = [...RUNTIME_PROVIDERS.values()]
+    .filter((provider) => provider.generic === true && genericProviderConfigured(provider.id))
+    .map((provider) => provider.id);
+  const enabledNames = [...selection.providers, ...enabledGenericIds];
   add(
-    selection.providers.length ? "ok" : idleInstall ? "warn" : "fail",
+    enabledNames.length ? "ok" : idleInstall ? "warn" : "fail",
     "Enabled providers",
-    selection.providers.length
-      ? `${selection.providers.join(", ")}${selection.explicit ? "" : " (legacy show-all mode)"}`
+    enabledNames.length
+      ? `${enabledNames.join(", ")}${
+        selection.explicit || enabledGenericIds.length ? "" : " (legacy show-all mode)"
+      }`
       : idleInstall
         ? "none (idle install: --no-provider)"
         : "none",
-    idleInstall
-      ? "Run ./bin/setup without --no-provider to enable a provider."
-      : "Run ./bin/setup --guided and choose at least one provider.",
+    enabledNames.length
+      ? undefined
+      : idleInstall
+        ? "Run ./bin/setup without --no-provider to enable a provider."
+        : "Run ./bin/setup --guided and choose at least one provider.",
   );
   // The router no longer refuses to serve on a selection file it cannot fully
   // resolve, so the damage has to be reported here instead of as a 502.
@@ -553,6 +602,50 @@ add(
     ? `${unroutable.length} offered model(s) have no gateway route: ${unroutable.join(", ")}`
     : `${catalogRoutedModels.length} routed models`,
   "Run ./bin/doctor --fix from the owning checkout, then fully quit and reopen Codex.",
+);
+// A provider that answers its catalog without a listed id has withdrawn it;
+// the static card keeps offering a turn that deterministically fails. Warn
+// only, and only on a fresh successful answer: the operator decides what to
+// remove, a failed or stale fetch must never hide a working route, and a
+// returning model clears this on the next catalog refresh. Never consults
+// credentials or the network; it reads the cached provider lists.
+let withdrawnRoutes = [];
+if (catalogReadable && !discoveryDisabled()) {
+  try {
+    const seenProviders = new Set();
+    const caches = {};
+    const listed = [];
+    for (const model of catalogModels) {
+      if (model?.visibility !== "list") continue;
+      const registered = MODEL_BY_SLUG.get(String(model.slug));
+      const provider = registered?.provider;
+      const upstreamModel = registered?.upstreamModel;
+      if (typeof provider !== "string" || !provider) continue;
+      listed.push({
+        slug: String(model.slug),
+        provider,
+        upstreamModel: typeof upstreamModel === "string" ? upstreamModel : "",
+      });
+      if (!seenProviders.has(provider)) {
+        seenProviders.add(provider);
+        // A local override may serve a known endpoint under its own provider
+        // id; the endpoint owner's cached list still settles availability.
+        caches[provider] = resolveAvailabilityCache(provider, { providers: PROVIDERS });
+      }
+    }
+    withdrawnRoutes = withdrawnListedRoutes(listed, caches);
+  } catch {
+    // A cache this build cannot read is evidence of nothing; fail open.
+    withdrawnRoutes = [];
+  }
+}
+add(
+  withdrawnRoutes.length ? "warn" : "ok",
+  "Listed routes match provider catalogs",
+  withdrawnRoutes.length
+    ? `${withdrawnRoutes.length} listed route(s) no longer advertised: ${withdrawnRoutes.map((route) => `${route.slug} (${route.provider})`).join(", ")}`
+    : "all listed routes are advertised by their providers",
+  "The provider withdrew the model; remove or replace the route, then refresh the catalog.",
 );
 // Warn, not fail: an understated window still routes, and the operator may be
 // running a plan whose real ceiling is genuinely lower than the vendor's. What
@@ -661,7 +754,7 @@ if (!failoverSettings.enabled) {
       : `on, ${failoverCounts.subscription} model(s) on your own providers -- no free model is curated, so nothing cheaper is tried first`,
     failoverCounts.free
       ? "Run ./bin/model-router codex control failover chain <model-slug,...> to choose the order yourself."
-      : "Free catalogs change without notice so none are checked in. Run ./bin/model-router codex curate-models opencode-free to give failover a free first stop.",
+      : "Free catalogs change without notice so none are checked in. Run ./bin/model-router codex curate-models opencode-free to give failover a free first stop -- OpenCode now serves most of its free tier only to its own client, so that command offers the few ids that still answer this router and names the rest as blocked.",
   );
 }
 // The same list the catalog writes definitions from, so a model switched off
@@ -788,6 +881,25 @@ add(
         : `mode ${callerSecretMode.toString(8)}`,
   "Run ./bin/doctor --fix; this capability is generated locally and is not a provider key.",
 );
+
+if (TARGET === "cursor") {
+  const cursorSecretMode = existsSync(CURSOR_PUBLIC_SECRET_PATH)
+    ? statSync(CURSOR_PUBLIC_SECRET_PATH).mode & 0o777
+    : undefined;
+  const cursorSecretValid = readableSecret(CURSOR_PUBLIC_SECRET_PATH, validCallerSecret);
+  add(
+    cursorSecretValid && privateFileIsProtected(CURSOR_PUBLIC_SECRET_PATH) ? "ok" : "fail",
+    "Cursor public edge key",
+    cursorSecretMode === undefined
+      ? "missing"
+      : !cursorSecretValid
+        ? "invalid"
+        : process.platform === "win32"
+          ? "current-user Windows ACL"
+          : `mode ${cursorSecretMode.toString(8)}`,
+    "Run ./bin/model-router cursor doctor --fix; this capability is generated locally and is not a provider key.",
+  );
+}
 
 // Tool-result retention is the one place this router keeps model-visible
 // *content* on disk rather than counts and bytes, and it has no eviction and no
@@ -989,6 +1101,20 @@ for (const warning of RUNTIME_PROVIDER_WARNINGS) {
   );
 }
 
+// A skipped user model is still in the picker catalog, but the router has no
+// route for its slug and refuses it with `unrouted_model` (#689). A skipped
+// entry whose slug survives as an alias of a checked-in route is a migration,
+// not a problem, so only slugs that ended up with no route are reported.
+for (const [slug, reason] of USER_MODELS_SKIPPED) {
+  if (MODEL_BY_SLUG.has(slug)) continue;
+  add(
+    "warn",
+    `User model ${slug}`,
+    `skipped when the model registry loaded: ${reason}`,
+    "Fix or remove the entry in user-models.json, then restart the router with bin/control service restart.",
+  );
+}
+
 for (const provider of RUNTIME_PROVIDERS.values()) {
   if (provider.generic !== true) continue;
   const configured = genericProviderConfigured(provider.id);
@@ -1065,6 +1191,8 @@ for (const provider of PROVIDERS.values()) {
         ? `${provider.displayName} anonymous endpoint`
       : provider.authMode === "per-model"
         ? `${provider.displayName} per-model endpoints`
+      : provider.credential?.resolver
+        ? `${provider.displayName} credentials`
       : `${provider.displayName} ${credentialNoun}`,
     status.configured ? status.source : "not configured",
     provider.keyless
@@ -1075,7 +1203,9 @@ for (const provider of PROVIDERS.values()) {
         ? provider.anonymousNote || "No key needed; only the provider's free models are available."
       : provider.authMode === "per-model"
         ? "Each model here names its own endpoint; a model that needs a key reports it on its own row."
-      : `Run ./bin/provider-key ${provider.id} set.`,
+      : provider.credential?.resolver
+        ? status.setup || "Configure Vertex project/location and Google Application Default Credentials."
+        : `Run ./bin/provider-key ${provider.id} set.`,
   );
   // A credential that resolves says nothing about whether the account's plan
   // may use the API. Only warn once the provider is actually selected, so the
@@ -1193,6 +1323,137 @@ if (TARGET === "gemini") {
       "Inspect $DSH_HOME/settings.yaml, then run ./bin/model-router dsh enable.",
     );
   }
+} else if (TARGET === "cursor") {
+  try {
+    const cursor = childJson("cursor-config-manager.mjs", ["status"]);
+    add(
+      cursor.appConfigured ? "ok" : cursor.agentConfigured ? "warn" : "fail",
+      "Cursor App routing config",
+      cursor.appConfigured
+        ? `${cursor.publishedModels.length} models / ${cursor.publishedAliases.length} effort choices in ${cursor.stateDb}; ${cursor.publicBaseUrl}`
+        : cursor.agentConfigured
+          ? "Cursor App is not connected; Cursor Agent is ready locally"
+        : cursor.running
+          ? "Cursor is running with stale or incomplete router settings"
+          : `router settings are missing or stale in ${cursor.stateDb}`,
+      "Fully quit Cursor, then use Harness > Connect. The managed path asks for a hostname and configures the named tunnel itself.",
+    );
+    add(
+      cursor.launcherInstalled && cursor.cursorAgent.available ? "ok" : "fail",
+      "Cursor Agent launcher",
+      cursor.launcherInstalled
+        ? cursor.cursorAgent.available
+          ? `${cursor.launcher}; ${cursor.cursorAgent.version || cursor.cursorAgent.command}`
+          : `${cursor.launcher} is installed, but ${cursor.cursorAgent.command} is unavailable`
+        : `${cursor.launcher} is missing`,
+      "Install Cursor Agent, then use Harness > Set up & open. The local agent does not require Cursor App to quit.",
+    );
+    if (cursor.installed) {
+      const tunnel = childJson("cursor-cloudflare-tunnel.mjs", ["status"]);
+      add(
+        cursor.tunnelProvider === "cloudflare" ? (tunnel.ready ? "ok" : "fail") : "ok",
+        "Cursor App named tunnel",
+        cursor.tunnelProvider === "cloudflare"
+          ? tunnel.ready
+            ? `${tunnel.hostname}; app-only edge on 127.0.0.1:${PORTS.cursorPublic}`
+            : `managed tunnel is incomplete; next action: ${tunnel.nextAction}`
+          : "stable public endpoint is managed outside Codex Router",
+        "Use Harness > Cursor to install cloudflared, sign in once, and reconnect the hostname.",
+      );
+      const drift = childJson("cursor-config-manager.mjs", ["drift"]);
+      add(
+        !drift.missing?.length && !drift.added?.length && !drift.aliasesStale ? "ok" : "warn",
+        "Cursor App catalog freshness",
+        !drift.missing?.length && !drift.added?.length && !drift.aliasesStale
+          ? `published ${cursor.publishedModels.length} models across ${cursor.publishedAliases.length} effort choices`
+          : `missing ${drift.missing?.join(", ") || "none"}; added ${drift.added?.join(", ") || "none"}; ` +
+            `picker aliases ${drift.aliasesStale ? "need the current Cursor-safe format" : "current"}`,
+        `Fully quit Cursor, then reconnect it from Harness. Cursor owns ${CURSOR_STATE_DB_PATH} while running.`,
+      );
+    } else {
+      add(
+        "ok",
+        "Cursor Agent catalog",
+        `${cursor.routableModels.length} routed models are read live at launch`,
+        "No republish is needed for Cursor Agent.",
+      );
+    }
+  } catch (error) {
+    add(
+      "fail",
+      "Cursor routing config",
+      error instanceof Error ? error.message : String(error),
+      "Fully quit Cursor, inspect its settings database, then run ./bin/model-router cursor enable.",
+    );
+  }
+} else if (TARGET === "claude") {
+  try {
+    const claude = childJson("claude-code-config-manager.mjs", ["status"]);
+    add(
+      claude.installed && claude.baseUrlManaged ? "ok" : "fail",
+      "Claude Code routing config",
+      claude.installed
+        ? `${claude.publishedModels.length} codex_router/anthropic/... models; ${claude.baseUrl}`
+        : "router-owned launcher or model snapshot is missing",
+      "Run ./bin/model-router claude enable.",
+    );
+    add(
+      claude.claude.available ? "ok" : "fail",
+      "Claude Code CLI",
+      claude.claude.available ? claude.claude.version || claude.claude.command : "official claude CLI not found",
+      "Install Claude Code, then run ./bin/model-router claude enable.",
+    );
+    const drift = childJson("claude-code-config-manager.mjs", ["drift"]);
+    add(
+      !drift.missing?.length && !drift.added?.length ? "ok" : "warn",
+      "Claude Code catalog freshness",
+      !drift.missing?.length && !drift.added?.length
+        ? `${claude.publishedModels.length} published models match the routed catalog`
+        : `missing ${drift.missing?.join(", ") || "none"}; added ${drift.added?.join(", ") || "none"}`,
+      "Run ./bin/model-router claude enable to republish.",
+    );
+  } catch (error) {
+    add("fail", "Claude Code routing config", error instanceof Error ? error.message : String(error), "Run ./bin/model-router claude enable.");
+  }
+} else if (TARGET === "openclaw") {
+  try {
+    const openclaw = childJson("openclaw-config-manager.mjs", ["status"]);
+    add(
+      openclaw.installed && openclaw.providerInstalled && openclaw.baseUrlManaged && openclaw.configValid ? "ok" : "fail",
+      "OpenClaw routing config",
+      openclaw.configError
+        ? openclaw.configError
+        : openclaw.providerInstalled
+        ? `${openclaw.publishedModels} models in models.providers.codex-router; ${openclaw.baseUrl || "unmanaged endpoint"}`
+        : "the router-owned OpenClaw provider is missing",
+      "Run ./bin/model-router openclaw enable.",
+    );
+    add(
+      openclaw.cliInstalled ? "ok" : "fail",
+      "OpenClaw CLI",
+      openclaw.cliInstalled ? openclaw.cli || "openclaw" : "not installed",
+      "Use Harness > OpenClaw > Set up, or run ./bin/model-router openclaw enable.",
+    );
+    add(
+      openclaw.configProtected ? "ok" : "fail",
+      "OpenClaw config privacy",
+      openclaw.configProtected ? `${openclaw.config} is private` : openclaw.config || "config path unavailable",
+      "Run ./bin/model-router openclaw enable; its provider carries the local caller capability.",
+    );
+    add(
+      openclaw.catalogFresh ? "ok" : "warn",
+      "OpenClaw catalog freshness",
+      `published ${openclaw.publishedModels}, routable ${openclaw.routableModels}`,
+      "Run ./bin/model-router openclaw enable to republish.",
+    );
+  } catch (error) {
+    add(
+      "fail",
+      "OpenClaw routing config",
+      error instanceof Error ? error.message : String(error),
+      "Run ./bin/model-router openclaw enable.",
+    );
+  }
 } else try {
   const config = childJson("config-manager.mjs", ["status"]);
   add(
@@ -1238,6 +1499,66 @@ if (TARGET === "gemini") {
     error instanceof Error ? error.message : String(error),
     "Inspect ~/.codex/config.toml, then run ./bin/doctor --fix.",
   );
+}
+
+// The five document-configured harnesses are published *into* rather than
+// installed *as*, so they belong to no `MODEL_ROUTER_TARGET` and would
+// otherwise be checked by no doctor run at all. They are reported here
+// whenever their publication marker says this router wrote into one of them,
+// whichever target this command happens to be running under.
+try {
+  const { routedHarnesses } = await import("./routed-harness-catalog.mjs");
+  const { ROUTED_HARNESS_CATALOG_PATHS } = await import("./paths.mjs");
+  for (const harness of routedHarnesses()) {
+    if (!existsSync(ROUTED_HARNESS_CATALOG_PATHS[harness.id])) continue;
+    const publishHint = `Run ./bin/control client-setup ${harness.id} to republish.`;
+    try {
+      const status = childJson("routed-harness-manager.mjs", [harness.id, "status"]);
+      add(
+        status.installed && status.providerInstalled && status.baseUrlManaged && status.configValid
+          ? "ok"
+          : "fail",
+        `${harness.displayName} routing config`,
+        status.configError
+          ? status.configError
+          : status.providerInstalled
+            ? `${status.publishedModels} models in ${harness.providerPath.join(".")}; ${status.baseUrl || "unmanaged endpoint"}`
+            : `the router-owned provider is missing from ${status.document}`,
+        publishHint,
+      );
+      add(
+        status.cliInstalled && !status.cliOutdated ? "ok" : "warn",
+        `${harness.displayName} CLI`,
+        !status.cliInstalled
+          ? "not installed"
+          : status.cliOutdated
+            ? `${status.cliVersion} predates ${status.cliMinimumVersion}, the first release that reads the published provider`
+            : status.cli || harness.executables[0],
+        `Use Harness > ${harness.displayName} > Set up, or install it from ${harness.siteUrl}.`,
+      );
+      add(
+        status.documentProtected ? "ok" : "fail",
+        `${harness.displayName} config privacy`,
+        status.documentProtected ? `${status.document} is private` : status.document,
+        `${publishHint} Its provider carries the local caller capability.`,
+      );
+      add(
+        status.catalogFresh ? "ok" : "warn",
+        `${harness.displayName} catalog freshness`,
+        `published ${status.publishedModels}, routable ${status.routableModels}`,
+        publishHint,
+      );
+    } catch (error) {
+      add(
+        "fail",
+        `${harness.displayName} routing config`,
+        error instanceof Error ? error.message : String(error),
+        publishHint,
+      );
+    }
+  }
+} catch {
+  // Never let a diagnostic be the thing that fails the doctor.
 }
 
 const legacy = detectLegacyInstallations();

@@ -21,6 +21,59 @@ If a recognized older Kimi router is reported:
 
 Neither command prints credential values. Repair refuses unknown router owners.
 
+## New native models (GPT-6 Astra, GPT-7, etc.)
+
+**Uninstall is never required** to see new OpenAI/Codex native models. While its merged catalog is installed, the router conditionally refreshes the signed-in account catalog itself, watches the resulting model fingerprint plus a lightweight fingerprint of the resolved Codex executable, and republishes when either source changes. A failed or unavailable account request leaves the prior cache untouched and falls back to that cache plus the bundled catalog. Discovery-disabled installs make no account request. Drift is checked on startup and periodically while the router stays running.
+
+The periodic check defaults to five minutes. To check once per day, set
+`CODEX_ROUTER_NATIVE_CATALOG_POLL_INTERVAL_MS=86400000`. Accepted values are
+integer milliseconds from `300000` to `2147483647`; invalid values retain the
+five-minute default. This changes only the periodic check: startup still checks
+immediately, the account-cache freshness TTL remains five minutes, and a manual
+`refresh-catalog` still forces a refresh. A longer interval can delay automatic
+discovery of account or executable changes until the next check.
+
+Pass the setting when installing the service; the macOS, Linux, and Windows
+renderers persist its normalized value. For an existing service, set it in the
+launchd environment, systemd environment, or Windows launcher and reload the
+service definition. A process restart alone does not reload a changed launchd
+property list. Restart the router after changing its environment.
+
+**Codex full quit/reopen is still required** to reload the catalog file. Codex reads `model_catalog_json` once at startup; the router cannot make Codex hot-reload.
+
+Expected flow:
+1. OpenAI releases new native (e.g., GPT-7)
+2. Router observes a changed account catalog, or Codex replaces its bundled/runtime executable
+3. Router detects drift on startup or a periodic check → republishes automatically
+4. Fully quit and reopen Codex → new native appears in picker
+
+No uninstall needed. The router stays installed while merging ALL natives + routed models.
+
+### A new native still does not appear
+
+The account model endpoint gates its list on the Codex **client version**: an
+older client is simply not offered a newly released model. The router asks with
+the version of the Codex CLI it resolves, so a stale `codex` earlier on `PATH`
+than the Codex you actually run will fetch the shorter list.
+
+The router refuses to overwrite Codex's cache with that shorter list and logs:
+
+```
+[codex-router] The resolved Codex CLI is older than the client that wrote the account model cache
+```
+
+Fix it by updating that Codex, or by pointing the router at the right one:
+
+```sh
+CODEX_BIN=/path/to/the/codex/you/run ./bin/refresh-catalog
+```
+
+Check which binary and version the router resolves:
+
+```sh
+./bin/model-router codex doctor
+```
+
 ## State directory belongs to another checkout
 
 If `doctor` reports a state ownership failure, you are running from a clone
@@ -138,6 +191,27 @@ official CLI build that Windows allows, use the API-key provider instead:
 An OAuth session created while the executable was allowed is not a durable
 workaround. The router invokes the official CLI again near token expiry, so the
 session eventually stops refreshing if Windows blocks the executable later.
+
+## Windows reports that process containment is unavailable
+
+Commands that can mutate router state run inside a kill-on-close Windows Job
+Object. The owner is compiled in-memory by Windows PowerShell before the target
+command starts. If the error names `ConstrainedLanguage`, `Add-Type`, AppLocker,
+or WDAC, the local application-control policy does not permit that safety
+boundary. The router fails before launching the mutation; `-ExecutionPolicy
+Bypass` does not and must not override system application control.
+
+Check the effective language mode without exposing credentials:
+
+```powershell
+powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$ExecutionContext.SessionState.LanguageMode'
+```
+
+`FullLanguage` is required. Keep the policy enabled and ask the machine
+administrator to allow the reviewed checkout/helper through the organization's
+normal trusted-script policy, or run the router on a supported host where the
+boundary is permitted. Do not work around the failure by disabling AppLocker,
+WDAC, or antivirus protection.
 
 ## An API key is missing or invalid
 
@@ -308,7 +382,16 @@ emits a status sentence, and never calls a tool. On turns following a user
 message, attempt 1 still streams live; when the client offered tools and the
 short-text/token trigger fires, the forwarder retries once and appends a
 retry tool call onto the same stream. On turns following a tool result, the
-stricter certified-repair path below stages the response before sending it.
+stricter certified-repair path opens the response as soon as xAI returns its
+headers and relays reasoning, but stages the short visible answer until the
+terminal event proves it is safe.
+After a conversation has exhibited that shape once, later user-message turns
+buffer only a short visible prefix up to the same text threshold. Headers and
+preceding reasoning remain live, and a tool call or longer answer releases the
+prefix; if the upstream stream aborts instead, Codex receives the terminal
+stream error without first recording another partial progress sentence. Unaffected
+conversation IDs retain the fully live path, and the evidence set is bounded
+in memory.
 
 The trigger is a shape, not a diagnosis, and it is worth knowing which turns
 pay for it. After a tool result, every no-tool prose response is held and
@@ -324,11 +407,38 @@ is correct." is not talked into a call the client would then run. Raise
 `CODEX_ROUTER_GROK_PROGRESS_ONLY_MAX_TEXT` to fire less often on that
 user-message path; those settings do not weaken the post-tool invariant.
 
+For a quiet worker, run `bin/control activity <thread-id>` from the installed
+checkout (on Windows, `codex-router.ps1 activity <thread-id>` from
+`%LOCALAPPDATA%\codex-router`). The command reads the capability-protected `/v1/activity` endpoint;
+unauthenticated `/health` keeps its existing compact contract. Active requests
+remain visible until their handlers release resources, independently of tray
+record retention. The snapshot includes router-upstream attempt count, raw byte
+timestamps, normalized Responses event timestamps, observed phase, and recent
+outcomes (128 entries, ten minutes, in memory). These observations do not identify raw provider timing or retries inside
+LiteLLM/xAI. Metrics cover the main Responses dispatch/stream; uninstrumented
+subpaths such as compaction/embeddings show `unobserved` and omit attempt count.
+An HTTP 200 envelope with a failed/incomplete response event is still `failed`.
+Untyped Grok gateway error envelopes become a safe terminal `error` event;
+later empty message closes or success markers are discarded.
+No prompt, answer, tool arguments, or credentials are retained.
+An unavailable probe reports `unknown`, not an empty/completed worker. A changed
+instance ID means the router restarted and lost its recent history. A cancellation
+records a client disconnect or an execution deadline; a disconnect cannot identify
+whether the user or a parent agent initiated it. Wait timeouts and quiet streams
+are not authorization to replace a worker. Consult its native task state and
+confirm that the old writer has stopped before starting another.
+
 Both attempts are billed. The usage returned to Codex reports only the
 selected attempt's context size, while the local ledger retains the aggregate
 as billed input/output tokens. The response sets
 `progress_only_retried: true`, and the log line `progress-only-retried=true`
-is never gated on `MODEL_ROUTER_QUIET`. To disable the invariant and see the
+is never gated on `MODEL_ROUTER_QUIET`. That line includes `attempt_*` and
+`repair_*` header, first-event, and total durations plus each request's
+`x-grok-req-id`. A failure while reading either stream emits
+`upstream-phase-failed=true` with the same safe fields. `headers_ms` shows how
+long xAI took to accept the request; `first_event_ms` separates an upstream
+that emitted nothing from output the forwarder deliberately withheld. Prompt
+and response content are never logged. To disable the invariant and see the
 raw first attempt, set `CODEX_ROUTER_GROK_PROGRESS_ONLY_RETRY=0`; this kill
 switch is intentionally unsafe for unattended tool loops.
 
@@ -349,6 +459,58 @@ If a released stream then completes without output, the router withholds its
 terminal frames and emits an explicit `precontent_limit` SSE error first,
 instead of accepting an empty success. These stated mid-stream failures retain
 the already-committed HTTP 200 on the wire but are metered internally as 502.
+
+Grok OAuth uses a separate ten-minute stall bound after the prologue has been
+released, including while reasoning is in progress. A pause longer than the
+initial 30-second prologue budget is not by itself an empty completion.
+`CODEX_ROUTER_GROK_STREAM_STALL_MS` accepts a positive millisecond value to
+adjust this bound; invalid values, and values too large for a Node timer, retain
+the ten-minute default. The headers-only budget, parser byte limits,
+cancellation, and prohibition on replaying a visible stream still apply. Other
+provider routes retain their existing stall bound.
+
+Every hop on the Grok path is sized from that bound plus one minute, and never
+below what the hop allowed before: the router's pool to the gateway, the
+gateway's `stream_timeout` for Grok deployments, and the forwarder's pool to
+xAI. Each of them used to end a silent stream first -- the two Undici pools
+after five minutes, with `UND_ERR_BODY_TIMEOUT`. Codex itself abandons a stream
+after five minutes without a data event (`stream_idle_timeout_ms`) and sends the
+turn again, which bills a second attempt; SSE comment keep-alives do not reset
+that timer. While a Grok stream is silent after its `response.created`, the
+router therefore relays a `response.in_progress` event that carries only the
+response's own id, model, and creation time. It is sent only between complete
+events and never after a terminal event. `CODEX_ROUTER_GROK_HEARTBEAT_MS` sets
+the interval (default 60000, at most 240000). Other routes receive no heartbeat.
+The gateway's Grok `stream_timeout` is written into the LiteLLM configuration
+from the environment of whichever process renders it, including a model
+curation run. After changing `CODEX_ROUTER_GROK_STREAM_STALL_MS`, restart the
+service so the router and gateway use the same bound.
+
+A failure the upstream states before any content (`error`, `response.failed`,
+or `response.incomplete`) is released to the client at once and is never
+retried as an empty completion. On the WebSocket edge, if the gateway keeps its
+stream open for more than five seconds after such a failure, the router stops
+waiting so the client's next request is not queued behind it; that turn is then
+recorded as canceled (status 0) rather than with the provider's failure status.
+When the forwarder rejects a failed Grok
+attempt, its `upstream-terminal-failed=true` log line carries any
+provider-reported `input_tokens` and `output_tokens`; the router's usage row for
+that attempt has no token counts.
+
+Z.ai Coding Plan (`zai-coding`) reasoning streams have an independent three-minute
+idle deadline after the prologue is released. GLM can pause between reasoning
+events for more than thirty seconds, so applying the short prelude budget here
+can close a healthy turn before `response.completed`. Set
+`CODEX_ROUTER_ZAI_CODING_STREAM_STALL_MS` to an integer from `1` to `240000`
+milliseconds to override the `180000` default. Pass it when installing the
+service; the macOS, Linux, and Windows renderers persist the normalized value.
+For an existing service, set it in the launchd environment, systemd environment,
+or Windows launcher and reload that service definition; a process restart alone
+does not reload a changed launchd property list.
+Invalid values retain the default. This deadline stays below the shared transport
+and Codex client idle bounds; it adds no heartbeat. Headers-only responses retain
+the initial prelude budget, empty completions retain their guard, and a visible
+stream is never replayed. Grok's separate deadline and other routes are unchanged.
 
 Operators diagnosing an unusually slow upstream can temporarily change the
 30-second bound with `CODEX_ROUTER_EMPTY_COMPLETION_PRELUDE_MS` and the 1 MiB
@@ -386,6 +548,39 @@ This removes only the marked block and current service; it preserves the
 selected model, profiles, provider credentials, and ChatGPT login. If native
 models work again, inspect router health and create a support bundle.
 
+## Native GPT turns fail with a 502 naming a connect timeout
+
+`The local router could not complete the request: timed out connecting to
+chatgpt.com` means the router's own TCP connect never completed. The diagnosis
+names the host it could not reach; this is the network path, not the credential
+and not the model.
+
+The connect phase is bounded at 3s (`CODEX_ROUTER_CONNECT_TIMEOUT_MS`, clamped
+0.5–30s) and the retry loop's default budget is derived from that bound
+(`3 x connectTimeout`), so a single blip is absorbed before the caller sees
+anything. A 502 that still reaches the user means every attempt failed inside
+that budget.
+
+Check, in order:
+
+- whether other traffic to the same host works from this machine
+  (`Test-NetConnection chatgpt.com -Port 443`, or `curl -sS -o /dev/null -w
+  '%{time_connect}\n' https://chatgpt.com/`), and whether it fails on one
+  interface but not another: a wired port and a Wi-Fi adapter on the same LAN
+  are two different paths, and a path that fails only on one of them is a
+  cabling/port/NIC problem, not an upstream one;
+- whether the configured DNS server answers at all (`Resolve-DnsName
+  chatgpt.com`);
+- the burst pattern in `~/.codex/codex-router/router.log`
+  (`grep UND_ERR_CONNECT_TIMEOUT` beside the `status=502` timing lines) and
+  whether another machine behind the same gateway shows the same window. The
+  log is the only place the cause is named.
+
+The proxy hint appears whenever the failure looks unreachable and no proxy is
+configured; it is not evidence that one is needed. Raising the budget buys
+attempts, not time on the wire — a path that is unreachable for minutes will
+still surface. Fix the path, and keep the bound small.
+
 ## Another process owns ports 4200–4203
 
 macOS/Linux:
@@ -406,6 +601,29 @@ migrates only recognized earlier repository services and otherwise stops with a
 conflict.
 
 ## The background service is stopped
+
+Repeated automatic startup probe timeouts or unavailable Windows identity
+probes pause the next attempt for 1, 2, 4, 8, then at most 15 minutes. The service
+log says `backing off` and Windows may report `LastTaskResult=0x45` (exit 69).
+Configuration, credential, child-exit and mismatched-identity failures still
+need repair; the cooldown does not make them healthy.
+
+Use `node src/service.mjs start` or `node src/service.mjs restart` to reset the
+cooldown. A reset that fails reports an error before launching. A replacement
+also resets after the old service stops, so an old failure cannot hold it back.
+`bin/start --foreground` (Windows: `codex-router.ps1 start --foreground`) keeps
+its existing lifecycle lock and neither reads nor changes managed cooldown.
+
+To disable automatic cooldown persistently, set
+`CODEX_ROUTER_DISABLE_STARTUP_BACKOFF=1` when installing or regenerating the
+service definition; `0` restores it. Merely setting it in a shell before
+starting an already-installed service does not change that service's recorded
+environment. A direct payload run reads the shell setting; foreground startup
+always bypasses the cooldown.
+
+If an install reports that automatic startup is deferred, its service remains
+registered and the command returns temporary-failure status 75. Inspect the
+service log, resolve the startup problem, and use start or restart to reset it.
 
 macOS:
 
@@ -466,17 +684,11 @@ Legacy migration rollback is separate:
 
 The generated mode-`600` JSON includes versions, doctor checks, service state,
 provider presence, config ownership, and file metadata. It excludes credential
-values, prompts, responses, and log contents.
-
-Only when log context is necessary:
-
-```sh
-./bin/support-bundle --include-logs
-```
-
-The log tail is mechanically redacted but may still contain private prompt or
-response text. Inspect it before uploading or attaching it anywhere. The tool
-never uploads a bundle automatically.
+values, prompts, responses, and log contents on every invocation. The legacy
+`--include-logs` option remains accepted for script compatibility, but is a
+deprecated no-op: an old log may contain a credential that was later rotated
+or deleted, so discovering only current values cannot prove a historical tail
+safe. The tool never uploads a bundle automatically.
 
 ## Responses WebSocket does not connect
 

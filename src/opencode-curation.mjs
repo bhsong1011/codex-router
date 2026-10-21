@@ -25,11 +25,12 @@
 // compaction fires before a completion can overrun the window the entry just
 // declared. Where it does not, the id keeps the conservative default and says
 // so in its own description rather than declaring a window a full-length
-// answer can walk off the end of. Two live free ids are therefore absent from
-// this table entirely, because neither their window nor an effort ladder
-// survives that test: `mimo-v2.5-free` (200,000 window, 32,000 output, so
-// 0.85 leaves 30,000) and `nemotron-3.5-lightning-free` (262,144 window and a
-// 262,144 output limit, which no ratio can reserve room for). Both publish an
+// answer can walk off the end of. Three live free ids are therefore absent
+// from this table entirely, because neither their window nor an effort ladder
+// survives that test: `mimo-v2.5-free` and `mimo-v2.6-flash-free` (each a
+// 200,000 window against a 32,000 output limit, so 0.85 leaves 30,000) and
+// `nemotron-3.5-lightning-free` (262,144 window and a 262,144 output limit,
+// which no ratio can reserve room for). All three publish an
 // empty `reasoning_options`. They keep the stock "conservative default
 // metadata" description, which is this repository's existing way of saying
 // every value in the entry is a default rather than a documented capability.
@@ -39,6 +40,22 @@
 // config/zai/coding/glm-5.3.json). A future figure in Zen's own /models
 // response is still preferred by curate-models, because that one describes the
 // served route first-hand.
+
+// Most of that catalog is no longer reachable from here at all. OpenCode
+// answers a free-tier request that did not come from its own client with
+// `FreeTierError: OpenCode's free tier can only be used from within OpenCode`,
+// so the id is refused before any of the metadata above matters. That is an
+// access policy the provider states in the error, not a protocol gap this
+// router can adapt to, and the ids it covers are listed in
+// OPENCODE_FREE_CLIENT_GATED below.
+//
+// Separately, `hy3-free` and `laguna-s-2.1-free` have been withdrawn from
+// Zen's /models response, which now answers `ModelError: Model hy3-free is not
+// supported`. They stay listed and documented here: discovery reads the live
+// catalog, so it cannot offer a withdrawn id whatever this file says, while an
+// operator who curated either one before the withdrawal still has the entry
+// and `normalizeCurationModels` reads these records to keep its window and
+// ladder right.
 
 const UNDOCUMENTED_EFFORTS =
   "OpenCode documents no effort control for this free id -- its `reasoning_options` in " +
@@ -50,8 +67,49 @@ const OPENCODE_FREE_MODELS = Object.freeze({
     contextWindow: 1_048_576,
     outputLimit: 131_072,
     reasoningLevels: Object.freeze(["minimal", "low", "medium", "high", "xhigh"]),
+    requestProfile: "auto-tool-choice",
+    // Meta's Console upstream refuses a tool schema whose $refs cycle,
+    // losing the whole turn to a 400 that names no tool.
+    toolSchemaRecursion: "flatten",
+    // OpenCode's models.dev record for this exact free id publishes
+    // modalities.input including image (plus video/pdf/audio the picker does
+    // not name) and attachment: true. Without this, scripted curation keeps
+    // the generic text-only default and Codex refuses image paste.
+    inputModalities: Object.freeze(["text", "image"]),
+    // The `-free` suffix is the tier, not the model. Carrying it in the label
+    // put this route in a family of its own, apart from the paid routes to the
+    // same model. `isFree` is where the price distinction belongs; the picker
+    // already renders it as a badge on the route.
+    displayName: "Muse Spark 1.2 Contributor (OpenCode Free)",
+    isFree: true,
     summary:
       "Muse Spark 1.2 Contributor Free through OpenCode Zen's anonymous Responses route.",
+    contextNote:
+      "The 1,048,576-token window is OpenCode's own published figure for this exact free id " +
+      "(the `opencode` provider in models.dev/api.json), not the paid model's: that dataset " +
+      "publishes a smaller window on free ids whose route is capped below their paid twin, " +
+      "and this one is not. Zen's /models endpoint publishes no context limits.",
+    reasoningNote:
+      "The minimal/low/medium/high/xhigh ladder is that same record's `reasoning_options` " +
+      "for this free id; Zen's /models endpoint advertises no effort control.",
+  }),
+  "muse-spark-1.3-contributor-free": Object.freeze({
+    contextWindow: 1_048_576,
+    outputLimit: 131_072,
+    reasoningLevels: Object.freeze(["minimal", "low", "medium", "high", "xhigh"]),
+    requestProfile: "auto-tool-choice",
+    // Meta's Console upstream refuses a tool schema whose $refs cycle,
+    // losing the whole turn to a 400 that names no tool.
+    toolSchemaRecursion: "flatten",
+    // OpenCode's models.dev record for this exact free id publishes
+    // modalities.input including image (plus video/pdf/audio the picker does
+    // not name) and attachment: true. Without this, scripted curation keeps
+    // the generic text-only default and Codex refuses image paste.
+    inputModalities: Object.freeze(["text", "image"]),
+    displayName: "Muse Spark 1.3 Contributor (OpenCode Free)",
+    isFree: true,
+    summary:
+      "Muse Spark 1.3 Contributor Free through OpenCode Zen's anonymous Responses route.",
     contextNote:
       "The 1,048,576-token window is OpenCode's own published figure for this exact free id " +
       "(the `opencode` provider in models.dev/api.json), not the paid model's: that dataset " +
@@ -119,6 +177,38 @@ const OPENCODE_FREE_MODELS = Object.freeze({
   }),
 });
 
+// Free ids OpenCode serves only to its own client. Curation refuses these
+// rather than handing the operator a picker entry that fails on its first
+// request -- the same fail-closed rule the unverified-protocol branch below
+// applies, for a cause that is the provider's policy rather than this
+// router's coverage.
+//
+// Probed 2026-09-23 against https://opencode.ai/zen/v1 in the exact shape the
+// router uses: no credential (`opencode-free` is in the registry's
+// ANONYMOUS_ENDPOINTS), the `x-opencode-session` header this repository
+// attaches, Chat Completions for the primary ids and Responses for the Muse
+// pair. Every id below answered FreeTierError. The list is per id and not a
+// blanket provider rule because `deepseek-v4-flash-free` cleared the same
+// gate on the same run, so it stays curatable.
+const OPENCODE_FREE_CLIENT_GATED = Object.freeze([
+  "big-pickle",
+  "mimo-v2.5-free",
+  "mimo-v2.6-flash-free",
+  "muse-spark-1.2-contributor-free",
+  "muse-spark-1.3-contributor-free",
+  "nemotron-3-ultra-free",
+  "nemotron-3.5-lightning-free",
+]);
+
+function clientGatedReason(upstreamModel) {
+  return (
+    `OpenCode serves ${upstreamModel} only to its own client: the same request from this `
+    + `router is answered "OpenCode's free tier can only be used from within OpenCode". `
+    + `That is OpenCode's access policy rather than a router compatibility limitation, so `
+    + `the id cannot be curated into a route that works.`
+  );
+}
+
 const CURATION_ROUTES = Object.freeze({
   "commandcode": Object.freeze({
     providers: Object.freeze(["commandcode", "commandcode-messages"]),
@@ -126,6 +216,7 @@ const CURATION_ROUTES = Object.freeze({
     messagesProvider: "commandcode-messages",
     messagesModels: Object.freeze([
       "claude-fable-5",
+      "claude-fable-5-1",
       "claude-haiku-4-5-20251001",
       "claude-opus-4-8",
       "claude-opus-5",
@@ -140,15 +231,20 @@ const CURATION_ROUTES = Object.freeze({
       "Qwen/Qwen3.7-Plus",
       "Qwen/Qwen3.8-Flash",
       "Qwen/Qwen3.8-Max",
+      "Qwen/Qwen3.8-Max-0902",
       "deepseek/deepseek-v4-flash",
       "deepseek/deepseek-v4-pro",
+      "deepseek/deepseek-v4.1-flash",
       "google/gemini-3.5-flash",
       "google/gemini-3.7-flash",
+      "google/gemini-3.8-flash",
       "gpt-5.5",
       "gpt-5.6-luna",
       "gpt-5.6-sol",
       "gpt-5.6-terra",
       "meta/muse-spark-1.2",
+      "meta/muse-spark-1.3",
+      "meta/muse-spark-1.3-contributor",
       "moonshotai/Kimi-K2.7-Code",
       "moonshotai/Kimi-K2.7-Code-Highspeed",
       "moonshotai/Kimi-K3",
@@ -163,7 +259,12 @@ const CURATION_ROUTES = Object.freeze({
       "thinkingmachines/inkling-small",
       "xai/grok-4.5",
       "xai/grok-4.6",
+      "xai/grok-4.7",
       "xiaomi/mimo-v2.5-pro",
+      "xiaomi/mimo-v2.6-flash",
+      "xiaomi/mimo-v2.6-pro",
+      "xiaomi/mimo-v2.6-pro-ultraspeed",
+      "z-ai/glm-5.3-flash",
       "zai-org/GLM-5.2",
       "zai-org/GLM-5.2-Fast",
       "zai-org/GLM-5.3",
@@ -185,6 +286,7 @@ const CURATION_ROUTES = Object.freeze({
       "qwen3.6-plus",
       "qwen3.7-max",
       "qwen3.7-plus",
+      "qwen3.8-flash",
       "qwen3.8-max",
     ]),
     responsesProvider: "opencode-go-responses",
@@ -192,12 +294,15 @@ const CURATION_ROUTES = Object.freeze({
       "gpt-5.6-luna",
       "grok-4.5",
       "grok-4.6",
+      "grok-4.7",
       "muse-spark-1.2-contributor",
+      "muse-spark-1.3-contributor",
     ]),
     primaryModels: Object.freeze([
       "deepseek-v4-flash",
       "deepseek-v4-flash-vision-exp",
       "deepseek-v4-pro",
+      "deepseek-v4.1-flash",
       "glm-5",
       "glm-5.1",
       "glm-5.2",
@@ -212,7 +317,10 @@ const CURATION_ROUTES = Object.freeze({
       "longcat-2.0",
       "mimo-v2.5",
       "mimo-v2.5-pro",
+      "mimo-v2.6-flash",
+      "mimo-v2.6-pro",
       "qwen3.5-plus",
+      "step-5-preview-free",
       "x-preview-f",
     ]),
     models: Object.freeze({}),
@@ -221,17 +329,36 @@ const CURATION_ROUTES = Object.freeze({
     providers: Object.freeze(["opencode-free", "opencode-free-responses"]),
     protocols: Object.freeze(["Chat", "Responses"]),
     responsesProvider: "opencode-free-responses",
-    responsesModels: Object.freeze(["muse-spark-1.2-contributor-free"]),
+    responsesModels: Object.freeze([
+      "muse-spark-1.2-contributor-free",
+      "muse-spark-1.3-contributor-free",
+    ]),
     primaryModels: Object.freeze([
       "big-pickle",
       "deepseek-v4-flash-free",
       "hy3-free",
       "laguna-s-2.1-free",
       "mimo-v2.5-free",
+      "mimo-v2.6-flash-free",
       "nemotron-3-ultra-free",
       "nemotron-3.5-lightning-free",
     ]),
+    clientGatedModels: OPENCODE_FREE_CLIENT_GATED,
     models: OPENCODE_FREE_MODELS,
+  }),
+  "opencode-zen": Object.freeze({
+    providers: Object.freeze([
+      "opencode-zen",
+      "opencode-zen-messages",
+      "opencode-zen-responses",
+    ]),
+    protocols: Object.freeze(["Chat", "Messages", "Responses"]),
+    messagesProvider: "opencode-zen-messages",
+    messagesModels: Object.freeze([]),
+    responsesProvider: "opencode-zen-responses",
+    responsesModels: Object.freeze([]),
+    primaryModels: Object.freeze([]),
+    models: Object.freeze({}),
   }),
 });
 
@@ -250,9 +377,45 @@ export function curationProviderIds(providerId) {
   return [...(CURATION_ROUTES[primary]?.providers || [primary])];
 }
 
+function zenFamilyRoute(upstreamModel) {
+  const id = String(upstreamModel || "").toLowerCase();
+  if (id.includes("gemini")) {
+    return {
+      blockedReason:
+        `The provider catalog lists ${upstreamModel}. `
+        + `OpenCode Zen serves Gemini over Google's native protocol, which this router has no adapter for, `
+        + `so it cannot be added safely.`,
+    };
+  }
+  if (id.includes("claude")) {
+    return { providerId: "opencode-zen-messages" };
+  }
+  if (id.includes("gpt-") || id.includes("grok-") || id.includes("muse-")) {
+    return { providerId: "opencode-zen-responses" };
+  }
+  return { providerId: "opencode-zen" };
+}
+
 function curatedModelRouteSelection(providerId, upstreamModel, { existingProvider } = {}) {
   const primary = curationPrimaryProviderId(providerId);
   const route = CURATION_ROUTES[primary];
+  if (primary === "opencode-zen") {
+    return zenFamilyRoute(upstreamModel);
+  }
+  // Refused before the protocol is considered: an id the provider will not
+  // serve to this router has no working route whichever wire it speaks.
+  //
+  // Only a fresh candidate is refused. normalizeCurationModels resolves every
+  // row an operator already curated through here too, and answering those with
+  // a block would strand them: curation never removes a model from a user's
+  // config, and a stored row still has to reach its documented provider so the
+  // Muse migration below and the metadata upgrades keep working on it. So a
+  // gated id keeps its entry in `responsesModels`/`primaryModels`; what the
+  // gate withholds is the route's first appearance, which is the request that
+  // would fail.
+  if (!existingProvider && route?.clientGatedModels?.includes(upstreamModel)) {
+    return { blockedReason: clientGatedReason(upstreamModel) };
+  }
   if (route?.responsesModels.includes(upstreamModel)) {
     return { providerId: route.responsesProvider };
   }
@@ -322,6 +485,42 @@ export function curatedModelOutputLimit(providerId, upstreamModel) {
 export function curatedModelReasoningLevels(providerId, upstreamModel) {
   const levels = curatedModelRecord(providerId, upstreamModel)?.reasoningLevels;
   return levels ? [...levels] : undefined;
+}
+
+// A documented, model-specific wire repair for curated routes. This is kept
+// beside the same exact-id metadata as context and effort because applying it
+// provider-wide would weaken forced tool choices for unrelated models.
+export function curatedModelRequestProfile(providerId, upstreamModel) {
+  return curatedModelRecord(providerId, upstreamModel)?.requestProfile;
+}
+
+// A stable picker label for ids whose upstream name is opaque. Curation reads
+// this when building user-model entries, and the registry applies it to
+// existing curated rows that still carry the generic "(curated)" fallback.
+export function curatedModelDisplayName(providerId, upstreamModel) {
+  return curatedModelRecord(providerId, upstreamModel)?.displayName;
+}
+
+// Whether this module documents the id as a free tier. Read alongside the
+// display name so an entry curated before the tag existed still shows the
+// badge: the price is a fact about the route, not about when it was curated.
+// Undefined rather than false for an undocumented id, so a stored flag stands.
+export function curatedModelIsFree(providerId, upstreamModel) {
+  return curatedModelRecord(providerId, upstreamModel)?.isFree;
+}
+
+// Applied for the same reason the name and the free tag are: an entry curated
+// before this was documented carries none of them, and re-curating is not
+// something an installed machine should have to do to stop losing turns.
+export function curatedModelToolSchemaRecursion(providerId, upstreamModel) {
+  return curatedModelRecord(providerId, upstreamModel)?.toolSchemaRecursion;
+}
+
+// Same overlay rule as the free tag: Zen's id-only /models catalog never
+// advertises modalities, so scripted curation stored text-only until this
+// module carried OpenCode's published image input for the free Muse ids.
+export function curatedModelInputModalities(providerId, upstreamModel) {
+  return curatedModelRecord(providerId, upstreamModel)?.inputModalities;
 }
 
 // The picker text that carries the sourcing for every value this module knows

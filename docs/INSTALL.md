@@ -20,6 +20,9 @@ Required software:
 - `uv`, or Python 3.10+ with `venv`
 - Git for managed one-command installation and rollback
 - At least one Kimi OAuth, Kimi API, or DeepSeek API credential
+- On Windows, Windows PowerShell in `FullLanguage` mode with application-control
+  policy that permits `Add-Type`. The bounded process-tree owner fails before
+  launching a mutation command when that host capability is unavailable.
 
 The installer does not silently install a system package manager or runtime.
 When a prerequisite is missing, install it from its official source and rerun
@@ -79,13 +82,21 @@ Windows the matching options are `-WithTray` and `-NoTray`.
 
 On macOS one `Codex Router.app` bundle is placed in `~/Applications`. It keeps
 the Swift-native menu-bar tray and embeds the Electron Control Center, so the
-build needs the Swift toolchain plus the Node runtime the router already
-requires; a missing toolchain skips the step with guidance instead of failing
-setup. Opening the app shows the Control Center, while a supervised login start
-keeps only the native tray visible. On Windows the packaged Electron Control
-Center owns both the native tray and the full window and is registered as the
-single `Codex Router Tray` logon task. Linux uses the same packaged Control
-Center and native Electron tray. Neither platform requires Rust.
+build needs the full Xcode app plus the Node runtime the router already
+requires. The standalone Command Line Tools are insufficient for the SwiftUI
+macro plug-ins used by recent macOS SDKs and do not provide the `xcodebuild`
+needed by the WidgetKit extension. The build honors `DEVELOPER_DIR` and the
+Xcode selected under **Xcode → Settings → Locations → Command Line Tools**. If
+that selection names the standalone tools, a standard
+`/Applications/Xcode.app` or `/Applications/Xcode-beta.app` is used for this
+build only; nonstandard installations can be selected with `DEVELOPER_DIR`.
+A missing full Xcode installation skips the companion with guidance instead of
+failing the already-installed router. Opening the app shows the Control Center,
+while a supervised login start keeps only the native tray visible. On Windows
+the packaged Electron Control Center owns both the native tray and the full
+window and is registered as the single `Codex Router Tray` logon task. Linux
+uses the same packaged Control Center and native Electron tray. Neither
+platform requires Rust.
 Guided setup walks through numbered steps: a provider list you toggle by
 number (`a` selects all, `n` clears, Enter continues) with a live
 ready/needs-key/needs-sign-in status per provider, credential onboarding for
@@ -140,52 +151,71 @@ The OAuth token remains in `~/.grok/auth.json` and is sent only to xAI's Grok
 CLI inference proxy. The separate `grok-api` provider continues to use a
 separately billed xAI API key.
 
-Antigravity OAuth is not self-service in public builds. It requires the client
-secret paired with the integration's OAuth client ID; the project does not
-distribute that secret, and a Google AI Pro/Ultra subscription, Gemini API key,
-Google account, or existing `agy` CLI login cannot retrieve it. Do not use a
-made-up placeholder. See
-[#393](https://github.com/duolahypercho/codex-router/issues/393) for the missing
-acquisition path.
-
-Proceed only when the operator of a provisioned integration has supplied its
-matching `ANTIGRAVITY_CLIENT_SECRET` privately. Never paste it into chat, an
-issue, a command argument, or a tracked file. Sign in first, then enable the
-provider; the login command does not replace or disable any provider already
-selected. The login may provision a Google Cloud project for the signed-in
-account when none exists.
+Antigravity OAuth uses a router-managed browser sign-in; it does not require a
+Gemini API key or a separate CLI. **The Google Cloud project behind your OAuth
+client must be allowlisted for `cloudcode-pa.googleapis.com`, a private Google
+API.** Most projects are not allowlisted, and you cannot enable this API
+yourself: it requires the producer-side `servicemanagement.services.bind`
+permission, so `gcloud services enable` fails even for the project owner.
+Sign-in will succeed, but the live probe will fail with `SERVICE_DISABLED` if
+your project is not allowlisted. If your project is not allowlisted, this
+provider cannot currently be used. Sign in, run the explicit live compatibility
+probe, then enable the provider; these commands do not replace or disable any
+other provider already selected.
 
 macOS/Linux:
 
-Set the supplied integration client secret in the private environment used for
-both installation and sign-in. Re-run the installer with that environment so
-the generated service definition preserves it for token refreshes. Login fails
-before opening Google consent if it is absent.
+Create a Google OAuth **Desktop app** client in a Google Cloud project you own.
+In Google Cloud Console, configure **APIs & Services > OAuth consent screen**
+for your account with a truthful name such as **Codex Router**, not Antigravity
+(including a test user when applicable), then choose **APIs & Services >
+Credentials > Create credentials > OAuth client ID > Desktop app**.
+Keep the resulting pair in that private browser tab. The login command binds
+`127.0.0.1` on an OS-assigned port, then opens a local page where you enter the
+matching pair. Only a loopback URL reaches the OS browser command; neither
+client value enters argv or terminal output. Do not reuse the official `agy`
+or Antigravity credential store.
+
+An older incompatible router record is preserved until you explicitly run
+`providers disconnect antigravity-oauth`; sign-in never overwrites or reuses
+it automatically.
 
 ```sh
-test -n "$ANTIGRAVITY_CLIENT_SECRET"
 ./bin/model-router codex providers login antigravity-oauth
+./bin/model-router codex providers probe antigravity-oauth --live --yes
 ./bin/model-router codex providers enable antigravity-oauth
 ```
 
 Windows PowerShell:
 
 ```powershell
-if (-not $env:ANTIGRAVITY_CLIENT_SECRET) {
-  throw 'ANTIGRAVITY_CLIENT_SECRET is not set'
-}
 .\model-router.ps1 codex providers login antigravity-oauth
+.\model-router.ps1 codex providers probe antigravity-oauth --live --yes
 .\model-router.ps1 codex providers enable antigravity-oauth
 ```
 
-Bring-your-own OAuth client overrides exist for development, but are not yet a
-supported persistent installation flow.
+The client pair and tokens are stored together in the router's owner-only state
+directory and can be removed from the desktop connection panel or with
+`providers disconnect antigravity-oauth`. They are not copied into the service
+definition. The live probe sends a small prompt and uses provider quota; add
+`--provision-project` only if you explicitly authorize project creation. It
+creates nothing unless a successful, schema-valid bootstrap response explicitly
+advertises the tier to provision; auth errors, server errors, malformed
+responses, and missing tiers fail closed. It identifies itself as Codex Router,
+and the provider remains disabled unless
+Google accepts that truthful identity. This is an unofficial compatibility
+path over Google's internal Antigravity service, so model availability and wire
+behavior may change independently of the public Gemini API.
 
-The access and refresh tokens are stored in the router's owner-only state
-directory and can be removed from the desktop connection panel. This is an
-unofficial compatibility path over Google's internal Antigravity service, so
-model availability and wire behavior may change independently of the public
-Gemini API.
+A successful probe records a nonpublishable pending generation and restarts an
+installed router service. Startup may boot that exact proof, then promotes it
+only after the complete local stack is healthy; restart failure or process
+death leaves it disabled. Earlier v2 proof records without activation metadata
+are unverified and must pass this explicit live probe again. The Antigravity
+forwarder is intentionally absent
+before proof exists, so an unrelated process occupying its unused port cannot
+break the rest of the router. A foreground development router must be restarted
+by its operator; the command reports this instead of claiming the route is live.
 
 Windows:
 
@@ -515,7 +545,11 @@ value — the update is kept, because none of those say anything about the code
 that was just fetched, and discarding it means the next attempt repeats the
 same failure with the same code. Rolling back there is what made a setup-path
 bug impossible to fix by updating: the fix was fetched and then thrown away.
-Any other non-zero exit still restores the previous revision. Re-run setup to
+Any other non-zero exit still restores the previous revision, leaving HEAD
+detached at that commit so the running service keeps the last known-good
+tree. The next `install.sh` / `install.ps1` run, or `./bin/update`, switches
+back to `main` before fetching; a named non-`main` branch is still refused.
+Re-run setup to
 continue, or `./bin/rollback` (`./codex-router.ps1 rollback` on Windows) to
 return to the retained revision deliberately.
 

@@ -389,6 +389,13 @@ button {
   font-weight: 520;
 }
 
+.primary-nav .badge {
+  min-height: 16px;
+  padding: 1px 5px;
+  font-size: 7px;
+  letter-spacing: 0.035em;
+}
+
 .nav-group-label {
   margin: 14px 8px 4px;
   color: var(--ink-faint);
@@ -502,6 +509,13 @@ button {
 .title-tabs span {
   color: var(--ink-subtle);
   font-size: 10.5px;
+}
+
+.title-tabs .badge {
+  min-height: 17px;
+  padding: 1px 5px;
+  color: var(--warning);
+  font-size: 7.5px;
 }
 
 .titlebar-spacer {
@@ -1857,6 +1871,23 @@ progress::-webkit-progress-value { border-radius: 999px; background: var(--accen
 .settings-actions,
 .maintenance-actions {
   margin-top: 13px;
+}
+
+.subscription-account-create {
+  margin-bottom: 15px;
+}
+
+.subscription-account-row {
+  min-height: 60px;
+  padding-block: 16px;
+}
+
+.subscription-account-row > .settings-actions {
+  flex-shrink: 0;
+  align-self: center;
+  gap: 10px;
+  margin-top: 0;
+  padding-block: 4px;
 }
 
 .surface-summary {

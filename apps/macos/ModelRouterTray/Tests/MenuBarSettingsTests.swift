@@ -6,6 +6,105 @@ import Testing
 
 @Suite("Menu bar settings", .serialized)
 struct MenuBarSettingsTests {
+  @Test("the borderless tray panel accepts text-field focus")
+  @MainActor
+  func trayPanelCanBecomeKeyWithoutBecomingMain() {
+    let panel = TrayInputPanel(
+      contentRect: .zero,
+      styleMask: [.borderless, .nonactivatingPanel],
+      backing: .buffered,
+      defer: false
+    )
+    #expect(panel.canBecomeKey)
+    #expect(!panel.canBecomeMain)
+    #expect(panel.styleMask.contains(.nonactivatingPanel))
+  }
+
+  @Test("the visible tray keeps enabled controls in their colored key state")
+  func trayControlsUseKeyAppearance() {
+    #expect(TrayControlAppearance.activeState == .key)
+  }
+
+  @Test("visible unverified subagent models remain selectable")
+  func subagentTogglePolicyKeepsTheVerificationPathReachable() {
+    #expect(!TraySubagentTogglePolicy.isDisabled(certification: "unknown"))
+    #expect(!TraySubagentTogglePolicy.isDisabled(certification: "v2"))
+    #expect(TraySubagentTogglePolicy.isDisabled(certification: "v1"))
+  }
+
+  @Test("subagent switches follow the effective router selection")
+  func subagentSelectionDoesNotSnapBackToRegistryProvenance() {
+    #expect(TraySubagentSelectionPolicy.isOn(
+      certification: "unknown",
+      mode: "selected",
+      explicitlyEnabled: true,
+      explicitlyDisabled: false
+    ))
+    #expect(TraySubagentSelectionPolicy.isOn(
+      certification: "unknown",
+      mode: "all",
+      explicitlyEnabled: false,
+      explicitlyDisabled: false
+    ))
+    #expect(!TraySubagentSelectionPolicy.isOn(
+      certification: "unknown",
+      mode: "proven",
+      explicitlyEnabled: false,
+      explicitlyDisabled: false
+    ))
+    #expect(TraySubagentSelectionPolicy.isOn(
+      certification: "v2",
+      mode: "proven",
+      explicitlyEnabled: false,
+      explicitlyDisabled: false
+    ))
+    #expect(!TraySubagentSelectionPolicy.isOn(
+      certification: "v2",
+      mode: "all",
+      explicitlyEnabled: true,
+      explicitlyDisabled: true
+    ))
+    #expect(!TraySubagentSelectionPolicy.isOn(
+      certification: "v1",
+      mode: "selected",
+      explicitlyEnabled: true,
+      explicitlyDisabled: false
+    ))
+  }
+
+  @Test("picker-hidden models remain independently selectable as subagents")
+  func pickerVisibilityDoesNotDisableSubagents() {
+    #expect(!TraySubagentTogglePolicy.isDisabled(certification: "unknown"))
+    #expect(TraySubagentSelectionPolicy.isOn(
+      certification: "unknown",
+      mode: "selected",
+      explicitlyEnabled: true,
+      explicitlyDisabled: false
+    ))
+  }
+
+  @Test("global click dismissal preserves tray controls")
+  func globalClickDismissalIgnoresPanelAndStatusItem() {
+    let panel = NSRect(x: 100, y: 100, width: 320, height: 500)
+    let statusItem = NSRect(x: 390, y: 610, width: 30, height: 20)
+
+    #expect(!TrayPanelClickPolicy.shouldClose(
+      screenPoint: NSPoint(x: 400, y: 350),
+      panelFrame: panel,
+      statusItemFrame: statusItem
+    ))
+    #expect(!TrayPanelClickPolicy.shouldClose(
+      screenPoint: NSPoint(x: 400, y: 615),
+      panelFrame: panel,
+      statusItemFrame: statusItem
+    ))
+    #expect(TrayPanelClickPolicy.shouldClose(
+      screenPoint: NSPoint(x: 50, y: 50),
+      panelFrame: panel,
+      statusItemFrame: statusItem
+    ))
+  }
+
   @Test("activity dot keeps an explicit state color")
   func activityDotUsesNonTemplateImage() {
     let image = MenuBarActivityDotImage.make(state: .generating, size: 6)
@@ -89,21 +188,87 @@ struct MenuBarSettingsTests {
     #expect(settings.customIconPath == nil)
   }
 
-  @Test("standard mode keeps a reserved width even when the name is hidden")
-  func standardWidthIsReserved() {
+  @Test("standard mode sizes to its content instead of reserving the full slot")
+  func standardWidthTracksContent() {
     #expect(MenuBarLayoutMetrics.standardIconSize == 15)
     #expect(MenuBarLayoutMetrics.iconOnlyIconSize == MenuBarLayoutMetrics.standardIconSize)
-    #expect(MenuBarLayoutMetrics.statusItemWidth(displayMode: .standard) == 180)
-    #expect(MenuBarLayoutMetrics.statusItemWidth(displayMode: .iconOnly) == 22)
     #expect(MenuBarLayoutMetrics.statusItemHeight(displayMode: .standard) == 22)
     #expect(MenuBarLayoutMetrics.statusItemHeight(displayMode: .iconOnly) == 22)
+    #expect(MenuBarLayoutMetrics.statusItemWidth(displayMode: .iconOnly) == 22)
+
+    // Hiding the model name is the case issue #646 called out: the slot used to
+    // stay 180 points wide around a single 15pt mark.
+    let iconOnlyContent = MenuBarLayoutMetrics.standardContentWidth(
+      iconStyle: .router,
+      showModelName: false,
+      nameText: "Sonnet",
+      detailText: ""
+    )
+    #expect(iconOnlyContent < MenuBarLayoutMetrics.standardMaximumWidth)
+    #expect(iconOnlyContent >= MenuBarLayoutMetrics.standardMinimumWidth)
+
+    // A short label must still be narrower than a long one.
+    let short = MenuBarLayoutMetrics.standardContentWidth(
+      iconStyle: .router,
+      showModelName: true,
+      nameText: "GPT",
+      detailText: ""
+    )
+    let long = MenuBarLayoutMetrics.standardContentWidth(
+      iconStyle: .router,
+      showModelName: true,
+      nameText: "Claude Opus 4.1 Extended Thinking",
+      detailText: "88% · 4h"
+    )
+    #expect(short > iconOnlyContent)
+    #expect(long > short)
+
+    // ...and an overlong one still truncates rather than growing without bound.
+    #expect(long == MenuBarLayoutMetrics.standardMaximumWidth)
+    #expect(
+      MenuBarLayoutMetrics.statusItemWidth(
+        displayMode: .standard,
+        standardContentWidth: long
+      ) == MenuBarLayoutMetrics.standardMaximumWidth
+    )
+
+    // A caller that cannot measure yet keeps the historical full slot.
+    #expect(MenuBarLayoutMetrics.statusItemWidth(displayMode: .standard) == 180)
+  }
+
+  @Test("the indicator style measures its dot, not the full mark")
+  func indicatorStyleMeasuresTheDot() {
+    let indicator = MenuBarLayoutMetrics.standardContentWidth(
+      iconStyle: .indicator,
+      showModelName: true,
+      nameText: "GPT",
+      detailText: ""
+    )
+    let mark = MenuBarLayoutMetrics.standardContentWidth(
+      iconStyle: .router,
+      showModelName: true,
+      nameText: "GPT",
+      detailText: ""
+    )
+    #expect(indicator < mark)
+    // A pulse scales the glyph in place, so the slot has to grow with it.
+    let pulsing = MenuBarLayoutMetrics.standardContentWidth(
+      iconStyle: .indicator,
+      showModelName: true,
+      nameText: "GPT",
+      detailText: "",
+      pulsing: true
+    )
+    #expect(pulsing > indicator)
   }
 
   @Test("the icon-only mark stays inside the native square during a pulse")
   func iconOnlyPulseKeepsScaledContentInsideBounds() {
     #expect(MenuBarLayoutMetrics.statusItemWidth(displayMode: .iconOnly, pulsing: true) == 22)
     #expect(MenuBarLayoutMetrics.statusItemHeight(displayMode: .iconOnly, pulsing: true) == 22)
-    #expect(MenuBarLayoutMetrics.statusItemWidth(displayMode: .standard, pulsing: true) == 180)
+    #expect(
+      MenuBarLayoutMetrics.statusItemWidth(displayMode: .standard, pulsing: true) == 180
+    )
     #expect(MenuBarLayoutMetrics.statusItemHeight(displayMode: .standard, pulsing: true) == 22)
   }
 

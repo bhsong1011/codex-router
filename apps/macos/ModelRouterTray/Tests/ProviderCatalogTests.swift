@@ -60,14 +60,49 @@ struct ProviderCatalogTests {
       source.contains("const PROVIDER_ID = /^[a-z0-9][a-z0-9-]{0,80}$/;"),
       "PROVIDER_ID in ipc.mjs changed; update ProviderCatalogInput to match"
     )
-    #expect(source.contains("const CATALOG_MUTATION_TIMEOUT_MS = 330_000;"))
+    #expect(source.contains("const CATALOG_MUTATION_TIMEOUT_MS = 1_320_000;"))
     #expect(source.contains("{ timeoutMs: 45_000 }"))
   }
 
   @Test("the tray's script timeouts are the Electron budgets")
   func timeoutsMatchElectron() {
     #expect(RouterScriptWatchdog.discoveryTimeout == 45)
-    #expect(RouterScriptWatchdog.catalogMutationTimeout == 330)
+    #expect(RouterScriptWatchdog.catalogMutationTimeout == 1_320)
+    #expect(RouterScriptWatchdog.catalogPublicationOperationTimeout == 1_280)
+    #expect(RouterScriptWatchdog.catalogControlOperationTimeout == 1_300)
+    #expect(RouterScriptWatchdog.processTreeCleanupReserve == 10)
+    #expect(RouterScriptWatchdog.antigravityOperationTimeout == 600)
+    #expect(RouterScriptWatchdog.antigravityRunnerTimeout == 660)
+    #expect(RouterScriptWatchdog.ordinaryOperationTimeout == 840)
+    #expect(RouterScriptWatchdog.defaultControlTimeout == 900)
+    #expect(
+      RouterScriptWatchdog.controlTimeout(arguments: ["credential", "deepseek"])
+        == 1_320
+    )
+    #expect(
+      RouterScriptWatchdog.controlTimeout(
+        arguments: ["probe-provider", "antigravity-oauth", "--live", "--yes"]
+      ) == 660
+    )
+    #expect(
+      RouterScriptWatchdog.controlTimeout(arguments: ["login", "antigravity-oauth"]) == 660
+    )
+    #expect(RouterScriptWatchdog.controlTimeout(arguments: ["providers", "--json"]) == 900)
+    #expect(
+      RouterScriptWatchdog.operationTimeout(arguments: ["credential", "deepseek"])
+        == 1_300
+    )
+    #expect(
+      RouterScriptWatchdog.operationTimeout(
+        arguments: ["probe-provider", "antigravity-oauth", "--live", "--yes"]
+      ) == 600
+    )
+    #expect(
+      RouterScriptWatchdog.operationOwnerTimeout(
+        arguments: ["probe-provider", "antigravity-oauth", "--live", "--yes"]
+      ) == 610
+    )
+    #expect(RouterScriptWatchdog.operationOwnerTimeout(arguments: ["providers", "--json"]) == 850)
   }
 
   @Test("credential boundaries supersede only their in-flight catalog reads")
@@ -88,17 +123,31 @@ struct ProviderCatalogTests {
   func bulkReloadPreservesFailures() {
     var failed = ProviderCatalogReloadBatch()
     failed.record(.failed("deepseek: provider unavailable"), sourceID: "deepseek")
-    #expect(failed.message == "Catalog reload failed: deepseek: provider unavailable")
+    // Expectation built from the same table as the message: the batch reports
+    // through `routerFormat`, so a hard-coded English string would only pass
+    // on a machine whose preferred language is English.
+    #expect(
+      failed.message
+        == routerFormat("Catalog reload failed: %@", "deepseek: provider unavailable")
+    )
 
     var partial = ProviderCatalogReloadBatch()
     partial.record(.loaded, sourceID: "deepseek")
     partial.record(.failed("opencode-go: unauthorized"), sourceID: "opencode-go")
-    #expect(partial.message.contains("Reloaded 1 catalog; 1 failed"))
-    #expect(partial.message.contains("opencode-go: unauthorized"))
+    #expect(
+      partial.message
+        == routerFormat("%d reloaded; %d failed: %@", 1, 1, "opencode-go: unauthorized")
+    )
 
     var superseded = ProviderCatalogReloadBatch()
     superseded.record(.superseded, sourceID: "opencode-zen")
-    #expect(superseded.message.contains("superseded by a credential change"))
+    #expect(
+      superseded.message
+        == routerFormat(
+          "Catalog reload failed: %@",
+          routerFormat("%@: reload superseded by a credential change", "opencode-zen")
+        )
+    )
   }
 
   // MARK: - Decoding the discovery payload

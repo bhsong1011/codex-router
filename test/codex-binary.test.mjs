@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  codexBinaryFingerprint,
   codexCandidatePaths,
   findCodexBinary,
   linuxDesktopAppBundledCodex,
@@ -60,6 +61,14 @@ test("returns undefined for empty finder output", () => {
   assert.equal(preferSpawnablePath(["", "   "], "darwin"), undefined);
 });
 
+test("macOS prefers the user's standalone Codex CLI over app-bundled copies", () => {
+  const home = "/Users/example";
+  const candidates = codexCandidatePaths({ platform: "darwin", home });
+  const standalone = path.join(home, ".local", "bin", "codex");
+  assert.ok(candidates.indexOf(standalone) < candidates.indexOf("/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex"));
+  assert.ok(candidates.indexOf(standalone) < candidates.indexOf("/Applications/Codex.app/Contents/Resources/codex"));
+});
+
 test("prefers the Linux desktop app's bundled CLI over a standalone CLI", () => {
   const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-linux-desktop-cli-"));
   const bundled = path.join(testRoot, "resources", "codex");
@@ -73,6 +82,31 @@ test("prefers the Linux desktop app's bundled CLI over a standalone CLI", () => 
     );
     const candidates = codexCandidatePaths({ platform: "linux", linuxDesktopRoots: [testRoot] });
     assert.ok(candidates.indexOf(bundled) < candidates.indexOf("/usr/local/bin/codex"));
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Codex binary fingerprint changes when the executable identity changes", () => {
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-binary-fingerprint-"));
+  const firstPath = path.join(testRoot, "first", "codex.exe");
+  const secondPath = path.join(testRoot, "second", "codex.exe");
+  mkdirSync(path.dirname(firstPath), { recursive: true });
+  mkdirSync(path.dirname(secondPath), { recursive: true });
+  writeFileSync(firstPath, "same bytes");
+  writeFileSync(secondPath, "same bytes");
+
+  try {
+    const first = codexBinaryFingerprint(firstPath);
+    const second = codexBinaryFingerprint(secondPath);
+    assert.match(first, /^[a-f0-9]{64}$/);
+    assert.match(second, /^[a-f0-9]{64}$/);
+    assert.notEqual(first, second, "version-hashed install path contributes to identity");
+
+    const beforeMutation = codexBinaryFingerprint(firstPath);
+    writeFileSync(firstPath, "different bytes");
+    const afterMutation = codexBinaryFingerprint(firstPath);
+    assert.notEqual(beforeMutation, afterMutation, "replaced binary invalidates identity");
   } finally {
     rmSync(testRoot, { recursive: true, force: true });
   }

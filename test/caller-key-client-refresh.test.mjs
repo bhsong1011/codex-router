@@ -41,6 +41,40 @@ test("Codex capability refresh changes only managed caller URLs", () => {
   assert.ok(after.includes(`# copied example must stay ${oldBase}`));
 });
 
+test("Codex capability refresh updates the rollback-compatible signed provider block", () => {
+  const before = [
+    `openai_base_url = ${JSON.stringify(oldBase)}`,
+    "",
+    "# BEGIN codex-router-provider-managed",
+    "[model_providers.codex-router]",
+    `base_url = ${JSON.stringify(oldBase)}`,
+    "# END codex-router-provider-managed",
+    "",
+    "# BEGIN codex-router-signed-provider-managed",
+    "[model_providers.codex-router-signed]",
+    `base_url = ${JSON.stringify(oldBase)}`,
+    "# END codex-router-signed-provider-managed",
+    "",
+  ].join("\n");
+  const after = refreshCodexCallerCapabilityContents(before, newBase, { port: 4202 });
+  assert.equal((after.match(new RegExp(newSecret, "g")) || []).length, 3);
+  assert.doesNotMatch(after, new RegExp(oldSecret));
+  assert.deepEqual(
+    refreshCodexCallerCapabilityState({
+      version: 1,
+      managedProvider: "codex-router-signed",
+      previousPresent: true,
+      previousModelProvider: "openai",
+    }, newBase, { port: 4202 }),
+    {
+      version: 1,
+      managedProvider: "codex-router-signed",
+      previousPresent: true,
+      previousModelProvider: "openai",
+    },
+  );
+});
+
 test("Codex capability state refresh preserves policy and ownership", () => {
   const before = {
     version: 3, mode: "provider-table", managedProvider: "example-provider",
@@ -87,6 +121,31 @@ test("DSH capability refresh preserves route models and default policy byte-for-
   assert.equal(refreshed.credentials, credentials.replace(oldSecret, newSecret));
   assert.match(refreshed.settings, /keep-model/);
   assert.match(refreshed.settings, /vendor\/model/);
+});
+
+test("DSH capability refresh leaves the harness's own records untouched", () => {
+  // Rotation reads the same credentials document, so two stored records must
+  // not trip it either.
+  const route = buildDshRoute({ baseUrl: oldBase, models: [] });
+  const settings = applyRouteToSettings("", route);
+  const records =
+    "records:\n  client-connection/a:\n    kind: grant\n    payload: first\n  client-connection/b:\n    kind: grant\n    payload: second\n";
+  const credentials = applyCredential(`${records}version: 1\n`, "CODEX_ROUTER_CALLER_KEY", oldSecret);
+  const refreshed = refreshDshCallerCapabilityDocuments({ settings, credentials, baseUrl: newBase, secret: newSecret, port: 4202 });
+  assert.equal(refreshed.credentials, credentials.replace(oldSecret, newSecret));
+  assert.ok(refreshed.credentials.startsWith(records));
+});
+
+test("DSH capability rotation refuses malformed or duplicate records", () => {
+  const route = buildDshRoute({ baseUrl: oldBase, models: [] });
+  const settings = applyRouteToSettings("", route);
+  const prefix = `version: 1\nrefs:\n  CODEX_ROUTER_CALLER_KEY: ${oldSecret}\nrecords:\n  client-connection/session:\n    kind: grant\n    payload:\n`;
+  for (const payload of ["      token: [unfinished\n", '      token: "unfinished\n', "      token: first\n      token: second\n"]) {
+    assert.throws(
+      () => refreshDshCallerCapabilityDocuments({ settings, credentials: prefix + payload, baseUrl: newBase, secret: newSecret, port: 4202 }),
+      /ambiguous YAML/,
+    );
+  }
 });
 
 test("Gemini capability refresh preserves whether a default model was published", () => {

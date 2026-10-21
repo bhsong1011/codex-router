@@ -8,8 +8,22 @@ const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-targets-"));
 process.env.CODEX_HOME = path.join(testRoot, "codex");
 process.env.CODEX_ROUTER_STATE_DIR = path.join(testRoot, "state");
 
-const { installedTargets } = await import("../src/target-integration.mjs");
-const { CONFIG_PATH, DSH_CATALOG_PATH, NATIVE_CATALOG_PATH } = await import("../src/paths.mjs");
+const {
+  installedTargets,
+  publicationFailure,
+  refreshTargetPickerIfInstalled,
+  runTargetPublicationProcess,
+} = await import("../src/target-integration.mjs");
+const { safeFailure } = await import("../apps/control-center/electron/command-runner.mjs");
+const {
+  CONFIG_PATH,
+  CLAUDE_CATALOG_PATH,
+  CURSOR_CATALOG_PATH,
+  DSH_CATALOG_PATH,
+  NATIVE_CATALOG_PATH,
+  OPENCLAW_CATALOG_PATH,
+  ROUTED_HARNESS_CATALOG_PATHS,
+} = await import("../src/paths.mjs");
 
 function stageFile(filePath, contents) {
   mkdirSync(path.dirname(filePath), { recursive: true });
@@ -17,7 +31,10 @@ function stageFile(filePath, contents) {
 }
 
 function clearStagedFiles() {
-  for (const filePath of [CONFIG_PATH, DSH_CATALOG_PATH, NATIVE_CATALOG_PATH]) {
+  for (const filePath of [
+    CONFIG_PATH, CLAUDE_CATALOG_PATH, CURSOR_CATALOG_PATH, DSH_CATALOG_PATH, NATIVE_CATALOG_PATH,
+    OPENCLAW_CATALOG_PATH, ...Object.values(ROUTED_HARNESS_CATALOG_PATHS),
+  ]) {
     rmSync(filePath, { force: true });
   }
 }
@@ -83,6 +100,125 @@ test("the harness catalog snapshot still marks the dsh integration", () => {
   }
 });
 
+test("publication refuses an aborted shared activation before touching a client", async () => {
+  const controller = new AbortController();
+  const aborted = new Error("planned publication abort");
+  controller.abort(aborted);
+  await assert.rejects(
+    refreshTargetPickerIfInstalled({
+      signal: controller.signal,
+      deadline: Date.now() + 10_000,
+    }),
+    (error) => error === aborted,
+  );
+});
+
+test("each target publisher owns a finite tree and contracts its child deadline", async () => {
+  let invocation;
+  const deadline = Date.now() + 60_000;
+  await runTargetPublicationProcess("catalog.mjs", [], {
+    sourceRoot: "/stable/router",
+    executable: "/runtime/node",
+    environment: { SENTINEL: "present" },
+    deadline,
+    run: async (command, args, options) => {
+      invocation = { command, args, options };
+      return { status: 0, stdout: "", stderr: "" };
+    },
+  });
+  assert.equal(invocation.command, "/runtime/node");
+  assert.deepEqual(invocation.args, [path.join("/stable/router", "src", "catalog.mjs")]);
+  assert.equal(invocation.options.deadline, deadline);
+  assert.equal(invocation.options.env.SENTINEL, "present");
+  assert.equal(
+    invocation.options.env.CODEX_ROUTER_OPERATION_DEADLINE_MS,
+    String(deadline - 10_000),
+  );
+});
+
+test("target publication uses the configured stable Node runtime", async () => {
+  let invocation;
+  await runTargetPublicationProcess("catalog.mjs", [], {
+    sourceRoot: "/stable/router",
+    environment: { CODEX_ROUTER_NODE_BIN: "/stable/node" },
+    run: async (command, args, options) => {
+      invocation = { command, args, options };
+      return { status: 0, stdout: "", stderr: "" };
+    },
+  });
+  assert.equal(invocation.command, "/stable/node");
+  assert.equal(invocation.options.env.CODEX_ROUTER_NODE_BIN, "/stable/node");
+});
+
+test("target publication honors and caps an injected operation environment", async () => {
+  let invocation;
+  const now = Date.now();
+  await runTargetPublicationProcess("catalog.mjs", [], {
+    sourceRoot: "/stable/router",
+    executable: "/runtime/node",
+    environment: { CODEX_ROUTER_OPERATION_TIMEOUT_MS: "600000" },
+    run: async (_command, _args, options) => {
+      invocation = options;
+      return { status: 0, stdout: "", stderr: "" };
+    },
+  });
+  assert.ok(invocation.deadline >= now);
+  assert.ok(invocation.deadline <= Date.now() + 300_000);
+  assert.equal(
+    Number(invocation.env.CODEX_ROUTER_OPERATION_DEADLINE_MS),
+    invocation.deadline - 10_000,
+  );
+});
+
+test("the Cursor publication snapshot marks the Cursor integration", () => {
+  try {
+    stageFile(CURSOR_CATALOG_PATH, "{}");
+    assert.deepEqual(installedTargets(), ["cursor"]);
+
+    stageFile(CONFIG_PATH, "# BEGIN codex-router-managed\n# END codex-router-managed\n");
+    assert.deepEqual(installedTargets(), ["codex", "cursor"]);
+  } finally {
+    clearStagedFiles();
+  }
+});
+
+test("the Claude publication snapshot marks the Claude Code integration", () => {
+  try {
+    stageFile(CLAUDE_CATALOG_PATH, "{}");
+    assert.deepEqual(installedTargets(), ["claude"]);
+    stageFile(CONFIG_PATH, "# BEGIN codex-router-managed\n# END codex-router-managed\n");
+    assert.deepEqual(installedTargets(), ["codex", "claude"]);
+  } finally {
+    clearStagedFiles();
+  }
+});
+
+test("the OpenClaw publication snapshot marks the OpenClaw integration", () => {
+  try {
+    stageFile(OPENCLAW_CATALOG_PATH, "{}");
+    assert.deepEqual(installedTargets(), ["openclaw"]);
+    stageFile(CONFIG_PATH, "# BEGIN codex-router-managed\n# END codex-router-managed\n");
+    assert.deepEqual(installedTargets(), ["codex", "openclaw"]);
+  } finally {
+    clearStagedFiles();
+  }
+});
+
+test("target publication expands PATH for GUI-spawned client publishers", async () => {
+  let invocation;
+  await runTargetPublicationProcess("catalog.mjs", [], {
+    sourceRoot: "/stable/router",
+    executable: "/runtime/node",
+    environment: { PATH: "/usr/bin:/bin:/usr/sbin:/sbin" },
+    run: async (_command, _args, options) => {
+      invocation = options;
+      return { status: 0, stdout: "", stderr: "" };
+    },
+  });
+  assert.match(invocation.env.PATH, /\.local[\\/]bin/);
+  assert.match(invocation.env.PATH, /(?:^|[;:])(?:\/usr\/local\/bin|[A-Za-z]:\\Users\\[^;]+\\\.local\\bin)/);
+});
+
 test.after(() => {
   rmSync(testRoot, { recursive: true, force: true });
 });
@@ -101,4 +237,73 @@ test("a config that exists but cannot be read still counts as installed", () => 
     rmSync(CONFIG_PATH, { recursive: true, force: true });
     clearStagedFiles();
   }
+});
+
+test("a routed harness publication keeps the shared plane installed", () => {
+  try {
+    // opencode, pi, omp, Command Code, and Hermes are published *into* rather
+    // than installed *as*, so they are no `MODEL_ROUTER_TARGET`. They still
+    // hold the shared service open: `bin/disable` retires it only once this
+    // list is empty, and omitting them is how turning Codex off would stop
+    // opencode working.
+    stageFile(ROUTED_HARNESS_CATALOG_PATHS.opencode, "{}");
+    assert.deepEqual(installedTargets(), ["opencode"]);
+    stageFile(ROUTED_HARNESS_CATALOG_PATHS.hermes, "{}");
+    assert.deepEqual(installedTargets(), ["opencode", "hermes"]);
+    stageFile(CONFIG_PATH, "# BEGIN codex-router-managed\n# END codex-router-managed\n");
+    assert.deepEqual(installedTargets(), ["codex", "opencode", "hermes"]);
+  } finally {
+    clearStagedFiles();
+  }
+});
+
+// What the harness publisher printed when it refused its credentials document.
+// Every publisher catches its own error and prints only the message.
+const REFUSAL =
+  'Refusing to edit the harness credentials document: "records" holds a nested mapping, ' +
+  "so this file is not a credential reference document.";
+const STOPPED = "DeepSeek Harness was not updated, and any client after it was skipped.";
+
+test("a failed publication names its client and the stop, then the publisher's report", async () => {
+  await assert.rejects(
+    runTargetPublicationProcess("dsh-config-manager.mjs", ["install"], {
+      client: "DeepSeek Harness",
+      run: async () => ({ status: 1, signal: null, stdout: "", stderr: `${REFUSAL}\n` }),
+    }),
+    { message: `${STOPPED}\n${REFUSAL}` },
+  );
+});
+
+test("a publisher's report is relayed whole, and a silent failure says how it ended", () => {
+  // A wrapper's context and every line under it stay, not just one of them.
+  const wrapped = "OpenClaw config command failed:\nError: first line\nsecond line";
+  assert.equal(
+    publicationFailure("OpenClaw", { status: 1, stderr: `${wrapped}\n` }),
+    `OpenClaw was not updated, and any client after it was skipped.\n${wrapped}`,
+  );
+  assert.equal(
+    publicationFailure("Gemini CLI", { status: 3, stderr: "" }),
+    "Gemini CLI was not updated, and any client after it was skipped.\nClient publication exited with status 3.",
+  );
+  assert.equal(
+    publicationFailure("Codex", { status: null, signal: "SIGTERM", stderr: "" }),
+    "Codex was not updated, and any client after it was skipped.\nThe publisher was stopped by SIGTERM.",
+  );
+});
+
+test("the Control Center keeps the client name when it hides a credential line", () => {
+  // The UI drops every error line that mentions a credential, which is how the
+  // whole cause used to vanish. The client line must survive that filter, and
+  // a cause without such a word must still follow it. The control process dies
+  // on the rethrown error, so the UI parses its crash banner.
+  const banner = (message) =>
+    `file:///router/src/target-integration.mjs:93\n          ^\n\nError: ${message}\n    at x (y:1:1)\n`;
+  assert.equal(
+    safeFailure(banner(publicationFailure("DeepSeek Harness", { status: 1, stderr: REFUSAL }))),
+    STOPPED,
+  );
+  assert.equal(
+    safeFailure(banner(publicationFailure("Codex", { status: 1, stderr: "catalog is locked" }))),
+    "Codex was not updated, and any client after it was skipped. catalog is locked",
+  );
 });

@@ -6,6 +6,7 @@ const {
   parseRateLimitHeaders,
   requestQuotaFromRateLimitHeaders,
   resetAt,
+  retryAfterSeconds,
 } = await import(
   "../src/rate-limit-headers.mjs"
 );
@@ -26,6 +27,72 @@ test("reset values normalize from every documented shape", () => {
   assert.equal(resetAt("", NOW), undefined);
   assert.equal(resetAt("soon", NOW), undefined);
   assert.equal(resetAt(undefined, NOW), undefined);
+});
+
+test("reset timestamps stay within the Date range after conversion", () => {
+  const maximum = 8_640_000_000_000_000;
+  assert.equal(resetAt(String(maximum), NOW), maximum);
+  assert.equal(resetAt("2400000000h", 0), maximum);
+  assert.equal(resetAt("1ms", maximum - 1), maximum);
+  assert.equal(resetAt("1ms", maximum), undefined);
+  assert.equal(resetAt("1", maximum), undefined);
+  assert.equal(resetAt("1790769660", NOW), 1_790_769_660_000);
+  assert.equal(resetAt("1790769660000", NOW), 1_790_769_660_000);
+});
+
+test("invalid reset headers preserve counters without inventing a cooldown", () => {
+  const invalidValues = [
+    "8640000000000001",
+    "1e20",
+    "999999999999999h",
+    `${"9".repeat(305)}h`, // A finite component whose unit conversion overflows.
+    `${"9".repeat(309)}h`, // The component itself overflows; it must not become zero.
+    `1h${"9".repeat(309)}m`,
+    `${"9".repeat(309)}s`,
+    `${"9".repeat(309)}ms`,
+  ];
+  for (const value of invalidValues) {
+    assert.equal(resetAt(value, NOW), undefined, value);
+    const headers = new Headers({
+      "x-ratelimit-limit-requests": "100",
+      "x-ratelimit-remaining-requests": "0",
+      "x-ratelimit-reset-requests": value,
+      "retry-after": value,
+    });
+    const snapshot = parseRateLimitHeaders(headers, { now: NOW });
+    assert.deepEqual(snapshot, { requests: { limit: 100, remaining: 0 } }, value);
+    assert.equal(cooldownUntil(snapshot), undefined, value);
+    assert.equal(retryAfterSeconds(headers, { now: NOW }), undefined, value);
+    assert.equal(
+      parseRateLimitHeaders(new Headers({ "retry-after": value }), { now: NOW }),
+      undefined,
+      value,
+    );
+    assert.deepEqual(requestQuotaFromRateLimitHeaders(headers, { now: NOW }), {
+      unit: "requests",
+      limit: 100,
+      remaining: 0,
+      observedAt: new Date(NOW).toISOString(),
+    }, value);
+  }
+});
+
+test("an invalid request reset leaves valid token and retry windows intact", () => {
+  const snapshot = parseRateLimitHeaders(new Headers({
+    "x-ratelimit-limit-requests": "100",
+    "x-ratelimit-remaining-requests": "0",
+    "x-ratelimit-reset-requests": "1e20",
+    "x-ratelimit-limit-tokens": "9000",
+    "x-ratelimit-remaining-tokens": "0",
+    "x-ratelimit-reset-tokens": "60",
+    "retry-after": "120",
+  }), { now: NOW });
+  assert.deepEqual(snapshot, {
+    requests: { limit: 100, remaining: 0 },
+    tokens: { limit: 9000, remaining: 0, resetAt: new Date(NOW + 60_000).toISOString() },
+    retryAt: new Date(NOW + 120_000).toISOString(),
+  });
+  assert.equal(cooldownUntil(snapshot), new Date(NOW + 120_000).toISOString());
 });
 
 test("openai-compatible headers become a normalized snapshot", () => {
@@ -138,4 +205,32 @@ test("cooldown only triggers on real exhaustion", () => {
   // An explicit retry-after is honored on its own.
   assert.equal(cooldownUntil({ retryAt: "2026-07-25T12:09:00.000Z" }), "2026-07-25T12:09:00.000Z");
   assert.equal(cooldownUntil(undefined), undefined);
+});
+
+test("retry-after reads RFC forms and the extensions providers actually send", () => {
+  const seconds = (value) =>
+    retryAfterSeconds(new Headers(value === undefined ? {} : { "retry-after": value }), {
+      now: NOW,
+    });
+  // delay-seconds, the form most OpenAI-compatible providers send.
+  assert.equal(seconds("120"), 120);
+  // HTTP-date, equally legal and what a gateway in front of the origin sends.
+  assert.equal(seconds("Sat, 25 Jul 2026 12:05:00 GMT"), 300);
+  // Zero is a non-negative integer, so it is a provider saying "now" rather
+  // than a provider saying nothing. The two must stay distinguishable here;
+  // whether "now" is worth wording belongs to the caller.
+  assert.equal(seconds("0"), 0);
+  // A window that elapsed before the response was read says the same thing.
+  assert.equal(seconds("Sat, 25 Jul 2026 11:59:00 GMT"), 0);
+  // Not RFC grammar -- delay-seconds is an integer -- but providers do send
+  // fractions, and `resetAt` has always read them. A sub-second wait keeps its
+  // second rather than rounding into the zero that means "no wait".
+  assert.equal(seconds("0.2"), 1);
+  // Nothing usable, so the caller keeps its own judgement rather than
+  // inheriting a window the provider never named.
+  assert.equal(seconds(undefined), undefined);
+  assert.equal(seconds("soon"), undefined);
+  assert.equal(seconds("-5"), undefined);
+  assert.equal(retryAfterSeconds(undefined, { now: NOW }), undefined);
+  assert.equal(retryAfterSeconds({}, { now: NOW }), undefined);
 });

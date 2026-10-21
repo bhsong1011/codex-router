@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import os from "node:os";
@@ -13,6 +13,7 @@ import {
   parseAntigravitySseEvent,
   requestAntigravityUpstream,
 } from "../src/antigravity-oauth-forwarder.mjs";
+import { writePrivateJson } from "../src/file-security.mjs";
 import { openPort } from "./port-pool.mjs";
 
 const encoder = new TextEncoder();
@@ -20,19 +21,23 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const internalKey = "test-antigravity-internal-key-with-sufficient-length";
 
 async function stopChild(child) {
-  if (child.exitCode !== null) return;
+  if (child.exitCode !== null || child.signalCode !== null) return;
   child.kill("SIGTERM");
   await new Promise((resolve) => child.once("exit", resolve));
 }
 
 async function closeServer(server) {
+  if (!server.listening) return;
   server.closeAllConnections?.();
   await new Promise((resolve) => server.close(resolve));
 }
 
-async function startMockUpstream(handler) {
+async function startMockUpstream(handler, t) {
   const port = await openPort();
   const server = http.createServer(handler);
+  // Setup may throw before its explicit try/finally (for example an ACL write).
+  // Register ownership immediately, so a failed test cannot retain this socket.
+  t.after(() => closeServer(server));
   await new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, "127.0.0.1", resolve);
@@ -40,10 +45,39 @@ async function startMockUpstream(handler) {
   return { server, url: `http://127.0.0.1:${port}` };
 }
 
-function writeTestToken(directory) {
+test("upstream fixture releases its listener when setup throws before finally", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "antigravity-setup-failure-"));
+  try {
+    const probe = path.join(directory, "setup-failure.test.mjs");
+    writeFileSync(probe, [
+      'import test from "node:test";',
+      'import http from "node:http";',
+      'const openPort = async () => 0;',
+      closeServer.toString(),
+      startMockUpstream.toString(),
+      'test("synthetic setup failure", async (t) => { await startMockUpstream((_request, response) => response.end(), t); throw new Error("synthetic setup rejection"); });',
+    ].join("\n"));
+    // Direct execution runs node:test in this process. A timeout can therefore
+    // retire the entire probe without leaving a separate test worker behind.
+    const result = spawnSync(process.execPath, [probe], {
+      encoding: "utf8", timeout: 10_000, windowsHide: true,
+    });
+    assert.equal(result.error, undefined, "failed setup must not leave an open server until the child timeout");
+    assert.equal(result.status, 1, "the original setup failure must still fail the test");
+    assert.match(result.stdout + result.stderr, /synthetic setup rejection/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+function writeTestToken(directory, { verified = true, overrides = {} } = {}) {
   const tokenPath = path.join(directory, "antigravity-oauth.json");
-  writeFileSync(tokenPath, JSON.stringify({
-    version: 1,
+  writePrivateJson(tokenPath, {
+    version: 3,
+    managed_by: "codex-router",
+    session_generation: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    client_id: "operator-owned.apps.googleusercontent.com",
+    client_secret: "test-client-secret",
     access_token: "test-access-token",
     refresh_token: "test-refresh-token",
     expires_at: Math.floor(Date.now() / 1_000) + 3_600,
@@ -52,7 +86,20 @@ function writeTestToken(directory) {
     project_source: "managed",
     project_checked_at: Date.now(),
     token_type: "Bearer",
-  }), { mode: 0o600 });
+    ...(verified
+      ? {
+        probe_version: 1,
+        probe_verified_at: Date.now(),
+        probe_model: "gemini-3.1-pro",
+        probe_activation: {
+          version: 1,
+          state: "active",
+          generation: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        },
+      }
+      : {}),
+    ...overrides,
+  });
   return tokenPath;
 }
 
@@ -67,7 +114,7 @@ function startForwarder(port, upstreamUrl, tokenPath, extraEnv = {}) {
         MODEL_ROUTER_TARGET: "codex",
         MODEL_ROUTER_INTERNAL_KEY: internalKey,
         MODEL_ROUTER_ANTIGRAVITY_OAUTH_PORT: String(port),
-        ANTIGRAVITY_TOKEN_PATH: tokenPath,
+        MODEL_ROUTER_STATE_DIR: path.dirname(tokenPath),
         ANTIGRAVITY_ENDPOINT: upstreamUrl,
         ANTIGRAVITY_PROD_ENDPOINT: upstreamUrl,
         MODEL_ROUTER_QUIET: "1",
@@ -116,9 +163,9 @@ function errorFrame(body) {
   return undefined;
 }
 
-async function exerciseStreamFailure(upstreamHandler, expected, extraEnv = {}) {
+async function exerciseStreamFailure(t, upstreamHandler, expected, extraEnv = {}) {
   const directory = mkdtempSync(path.join(os.tmpdir(), "antigravity-stream-error-"));
-  const upstream = await startMockUpstream(upstreamHandler);
+  const upstream = await startMockUpstream(upstreamHandler, t);
   const port = await openPort();
   const child = startForwarder(port, upstream.url, writeTestToken(directory), extraEnv);
   const base = `http://127.0.0.1:${port}`;
@@ -163,17 +210,46 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-test("rejects an omitted forced Claude tool locally before OAuth or upstream work", async () => {
+function beginSlowChatRequest(base) {
+  let responseResolve;
+  let responseReject;
+  const responsePromise = new Promise((resolve, reject) => {
+    responseResolve = resolve;
+    responseReject = reject;
+  });
+  const target = new URL(`${base}/v1/chat/completions`);
+  const request = http.request({
+    hostname: target.hostname,
+    port: target.port,
+    path: target.pathname,
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${internalKey}`,
+      "Content-Type": "application/json",
+      "Transfer-Encoding": "chunked",
+    },
+  }, (response) => {
+    response.setEncoding("utf8");
+    let body = "";
+    response.on("data", (chunk) => { body += chunk; });
+    response.on("end", () => responseResolve({ status: response.statusCode, body }));
+  });
+  request.once("error", responseReject);
+  request.write('{"model":"gemini-3.1-pro","messages":[');
+  return { request, responsePromise };
+}
+
+test("rejects an omitted forced Claude tool locally before OAuth or upstream work", async (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "antigravity-local-shape-"));
   let upstreamCalls = 0;
   const upstream = await startMockUpstream((_request, response) => {
     upstreamCalls += 1;
     response.writeHead(500);
     response.end();
-  });
+  }, t);
   const port = await openPort();
-  const missingTokenPath = path.join(directory, "missing-token.json");
-  const child = startForwarder(port, upstream.url, missingTokenPath);
+  const tokenPath = writeTestToken(directory);
+  const child = startForwarder(port, upstream.url, tokenPath);
   const base = `http://127.0.0.1:${port}`;
   try {
     await waitForForwarder(base, child);
@@ -281,6 +357,267 @@ test("bounds an upstream body that stops producing data", async () => {
   );
 });
 
+test("terminal grace is one absolute window even while later SSE members trickle", async () => {
+  let interval;
+  let cancelled = false;
+  let sawTerminal = false;
+  let handled = 0;
+  const body = new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode('data: {"terminal":true}\n\n'));
+      controller.enqueue(encoder.encode('data: {"trailer":true}\n\n'));
+      interval = setInterval(() => {
+        controller.enqueue(encoder.encode('data: {"trailer":true}\n\n'));
+      }, 5);
+    },
+    cancel() {
+      cancelled = true;
+      clearInterval(interval);
+    },
+  });
+  const controller = new AbortController();
+  const safetyTimer = setTimeout(() => {
+    controller.abort(new Error("terminal grace was reset by trailer traffic"));
+  }, 250);
+  try {
+    await consumeAntigravitySseStream(body, async (payload) => {
+      handled += 1;
+      if (payload.terminal) sawTerminal = true;
+    }, {
+      idleTimeoutMs: 100,
+      terminalGraceMs: 30,
+      isTerminal: () => sawTerminal,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(safetyTimer);
+  }
+  assert.equal(cancelled, true);
+  assert.ok(handled > 1, "the grace window should inspect trailers that have already arrived");
+});
+
+test("the local boundary refuses unverified sessions without upstream traffic", async (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "antigravity-unverified-"));
+  let upstreamCalls = 0;
+  const upstream = await startMockUpstream((_request, response) => {
+    upstreamCalls += 1;
+    response.writeHead(500).end();
+  }, t);
+  const port = await openPort();
+  const child = startForwarder(
+    port,
+    upstream.url,
+    writeTestToken(directory, { verified: false }),
+  );
+  const base = `http://127.0.0.1:${port}`;
+  try {
+    await waitForForwarder(base, child);
+    const response = await fetch(`${base}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${internalKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gemini-3.1-pro",
+        messages: [{ role: "user", content: "must remain local" }],
+      }),
+    });
+    assert.equal(response.status, 403);
+    assert.equal((await response.json()).error.code, "antigravity_probe_required");
+    assert.equal(upstreamCalls, 0);
+  } finally {
+    await stopChild(child);
+    await closeServer(upstream.server);
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a slow request body cannot cross a session replacement", async (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "antigravity-slow-session-"));
+  let upstreamCalls = 0;
+  const upstream = await startMockUpstream((_request, response) => {
+    upstreamCalls += 1;
+    response.writeHead(500).end();
+  }, t);
+  const port = await openPort();
+  const tokenPath = writeTestToken(directory);
+  const child = startForwarder(port, upstream.url, tokenPath);
+  const base = `http://127.0.0.1:${port}`;
+  try {
+    await waitForForwarder(base, child);
+    const slow = beginSlowChatRequest(base);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    writeTestToken(directory, {
+      overrides: {
+        session_generation: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        access_token: "replacement-access",
+        refresh_token: "replacement-refresh",
+      },
+    });
+    slow.request.end('{"role":"user","content":"must stay local"}]}');
+    const result = await slow.responsePromise;
+    assert.equal(result.status, 409);
+    assert.equal(JSON.parse(result.body).error.code, "oauth_session_changed");
+    assert.equal(upstreamCalls, 0);
+  } finally {
+    await stopChild(child);
+    await closeServer(upstream.server);
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a slow request body cannot outlive proof invalidation", async (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "antigravity-slow-proof-"));
+  let upstreamCalls = 0;
+  const upstream = await startMockUpstream((_request, response) => {
+    upstreamCalls += 1;
+    response.writeHead(500).end();
+  }, t);
+  const port = await openPort();
+  const tokenPath = writeTestToken(directory);
+  const child = startForwarder(port, upstream.url, tokenPath);
+  const base = `http://127.0.0.1:${port}`;
+  try {
+    await waitForForwarder(base, child);
+    const slow = beginSlowChatRequest(base);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    writeTestToken(directory, { verified: false });
+    slow.request.end('{"role":"user","content":"must stay local"}]}');
+    const result = await slow.responsePromise;
+    assert.equal(result.status, 403);
+    assert.equal(JSON.parse(result.body).error.code, "antigravity_probe_required");
+    assert.equal(upstreamCalls, 0);
+  } finally {
+    await stopChild(child);
+    await closeServer(upstream.server);
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a 401 retry cannot cross a disconnect-reconnect session generation", async (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "antigravity-401-generation-"));
+  let upstreamCalls = 0;
+  const tokenPath = writeTestToken(directory);
+  const upstream = await startMockUpstream((_request, response) => {
+    upstreamCalls += 1;
+    writeTestToken(directory, {
+      overrides: {
+        session_generation: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        access_token: "replacement-access",
+        refresh_token: "replacement-refresh",
+      },
+    });
+    response.writeHead(401, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ error: { message: "expired" } }));
+  }, t);
+  const port = await openPort();
+  const child = startForwarder(port, upstream.url, tokenPath);
+  const base = `http://127.0.0.1:${port}`;
+  try {
+    await waitForForwarder(base, child);
+    const response = await fetch(`${base}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${internalKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gemini-3.1-pro",
+        messages: [{ role: "user", content: "do not cross accounts" }],
+      }),
+    });
+    assert.equal(response.status, 409);
+    assert.equal((await response.json()).error.code, "oauth_session_changed");
+    assert.equal(upstreamCalls, 1);
+  } finally {
+    await stopChild(child);
+    await closeServer(upstream.server);
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a 401 retry cannot outlive proof invalidation in the same session", async (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "antigravity-401-proof-"));
+  let upstreamCalls = 0;
+  const tokenPath = writeTestToken(directory);
+  const upstream = await startMockUpstream((_request, response) => {
+    upstreamCalls += 1;
+    writeTestToken(directory, { verified: false });
+    response.writeHead(401, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ error: { message: "expired" } }));
+  }, t);
+  const port = await openPort();
+  const child = startForwarder(port, upstream.url, tokenPath);
+  const base = `http://127.0.0.1:${port}`;
+  try {
+    await waitForForwarder(base, child);
+    const response = await fetch(`${base}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${internalKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gemini-3.1-pro",
+        messages: [{ role: "user", content: "do not retry stale proof" }],
+      }),
+    });
+    assert.equal(response.status, 403);
+    assert.equal((await response.json()).error.code, "antigravity_probe_required");
+    assert.equal(upstreamCalls, 1);
+  } finally {
+    await stopChild(child);
+    await closeServer(upstream.server);
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("endpoint fallback reasserts the exact active proof before another attempt", async (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "antigravity-fallback-proof-"));
+  let dailyCalls = 0;
+  let productionCalls = 0;
+  const tokenPath = writeTestToken(directory);
+  const daily = await startMockUpstream((_request, response) => {
+    dailyCalls += 1;
+    writeTestToken(directory, { verified: false });
+    response.writeHead(503, { "Content-Type": "application/json" });
+    response.end("{}");
+  }, t);
+  const production = await startMockUpstream((_request, response) => {
+    productionCalls += 1;
+    response.writeHead(500).end();
+  }, t);
+  const port = await openPort();
+  const child = startForwarder(port, daily.url, tokenPath, {
+    ANTIGRAVITY_PROD_ENDPOINT: production.url,
+  });
+  const base = `http://127.0.0.1:${port}`;
+  try {
+    await waitForForwarder(base, child);
+    const response = await fetch(`${base}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${internalKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gemini-3.1-pro",
+        messages: [{ role: "user", content: "do not fall back after revocation" }],
+      }),
+    });
+    assert.equal(response.status, 403);
+    assert.equal((await response.json()).error.code, "antigravity_probe_required");
+    assert.equal(dailyCalls, 1);
+    assert.equal(productionCalls, 0);
+  } finally {
+    await stopChild(child);
+    await closeServer(daily.server);
+    await closeServer(production.server);
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("falls back only after an explicit retryable response and reuses the body", async () => {
   const calls = [];
   const serializedBody = JSON.stringify({ requestId: "agent-stable" });
@@ -350,8 +687,8 @@ test("preserves provider statuses and safe retry headers", () => {
   }
 });
 
-test("ends a started stream with an OpenAI error frame for an embedded 429", async () => {
-  await exerciseStreamFailure((_request, response) => {
+test("ends a started stream with an OpenAI error frame for an embedded 429", async (t) => {
+  await exerciseStreamFailure(t, (_request, response) => {
     response.writeHead(200, { "Content-Type": "text/event-stream" });
     response.write(sse({
       response: { candidates: [{ content: { parts: [{ text: "partial" }] } }] },
@@ -366,8 +703,8 @@ test("ends a started stream with an OpenAI error frame for an embedded 429", asy
   });
 });
 
-test("ends a started stream with an OpenAI error frame after an idle timeout", async () => {
-  await exerciseStreamFailure((_request, response) => {
+test("ends a started stream with an OpenAI error frame after an idle timeout", async (t) => {
+  await exerciseStreamFailure(t, (_request, response) => {
     response.writeHead(200, { "Content-Type": "text/event-stream" });
     response.write(sse({
       response: { candidates: [{ content: { parts: [{ text: "partial" }] } }] },
@@ -381,8 +718,8 @@ test("ends a started stream with an OpenAI error frame after an idle timeout", a
   });
 });
 
-test("ends a started stream with an OpenAI error frame after a clean incomplete EOF", async () => {
-  await exerciseStreamFailure((_request, response) => {
+test("ends a started stream with an OpenAI error frame after a clean incomplete EOF", async (t) => {
+  await exerciseStreamFailure(t, (_request, response) => {
     response.writeHead(200, { "Content-Type": "text/event-stream" });
     response.end(sse({
       response: { candidates: [{ content: { parts: [{ text: "partial" }] } }] },

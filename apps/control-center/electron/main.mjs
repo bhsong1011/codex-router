@@ -9,6 +9,7 @@ import {
   Tray,
 } from "electron";
 import path from "node:path";
+import { writeFileSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { registerIpcHandlers } from "./ipc.mjs";
 import {
@@ -23,8 +24,13 @@ import {
 } from "./lifecycle-state.mjs";
 import { controlCenterDestination, controlCenterNavigationURL } from "./navigation.mjs";
 
+import { interfaceLanguageFromLocale, interfaceMenuTemplates, isInterfaceLanguage } from "./interface-menu.mjs";
+
+let interfaceLanguage = "en";
+
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const DEVELOPMENT_ICON = path.resolve(HERE, "..", "assets", "icon.png");
+const DEVELOPMENT_TRAY_TEMPLATE_ICON = path.resolve(HERE, "..", "assets", "trayTemplate.png");
 let mainWindow;
 let tray;
 let mutationLifecycle = {
@@ -32,6 +38,7 @@ let mutationLifecycle = {
   whenMutationsIdle: () => Promise.resolve(),
 };
 let deferredQuit;
+let isQuitting = false;
 let applicationReady = false;
 let windowVisible = false;
 let windowContentReady = false;
@@ -96,6 +103,21 @@ const RENDERER = rendererLocation();
 
 function appIconPath() {
   return app.isPackaged ? path.join(process.resourcesPath, "icon.png") : DEVELOPMENT_ICON;
+}
+
+// macOS status items are template images: a monochrome glyph the menu bar
+// tints and inverts itself. The full-colour 512px app tile belongs to the Dock
+// and the window, not the status area (#829). Electron reads the `Template`
+// filename suffix and the sibling `@2x` face on its own.
+function trayIconImage() {
+  if (process.platform !== "darwin") return nativeImage.createFromPath(appIconPath());
+  const file = app.isPackaged
+    ? path.join(process.resourcesPath, "trayTemplate.png")
+    : DEVELOPMENT_TRAY_TEMPLATE_ICON;
+  const image = nativeImage.createFromPath(file);
+  if (image.isEmpty()) return image;
+  image.setTemplateImage(true);
+  return image;
 }
 
 function showDockForVisibleWindow() {
@@ -187,7 +209,17 @@ function createWindow() {
   createdWindow.on("hide", () => {
     windowVisible = false;
     publishLifecycleState();
-    hideDockForHiddenWindow();
+    // Keep the Dock / Command-Tab tile while Control Center is merely hidden.
+    // Retiring it made Cmd+Tab and the Dock look like the app had quit.
+  });
+  createdWindow.on("close", (event) => {
+    // Close means hide only while a recoverable owner can bring the window
+    // back (embedded macOS host or a live tray). Without that owner, destroy
+    // so the window-all-closed handler can quit instead of stranding an invisible process.
+    if (isQuitting || createdWindow.isDestroyed()) return;
+    if (!(nativeTrayOwnedByHost || trayIsAvailable())) return;
+    event.preventDefault();
+    createdWindow.hide();
   });
   createdWindow.once("closed", () => {
     if (mainWindow !== createdWindow) return;
@@ -196,7 +228,7 @@ function createWindow() {
     showWhenContentReady = false;
     windowVisible = false;
     publishLifecycleState();
-    hideDockForHiddenWindow();
+    if (isQuitting) hideDockForHiddenWindow();
   });
   const loading = RENDERER.development
     ? createdWindow.loadURL(RENDERER.url)
@@ -210,8 +242,8 @@ function revealWindow() {
   if (mainWindow.isMinimized()) mainWindow.restore();
   // The native host is an LSUIElement and never owns a Dock tile. Let its
   // embedded Control Center represent the product in the Dock and Command-Tab
-  // while the actual application window is visible, then retire that tile
-  // when the window closes so the menu-bar host remains unobtrusive.
+  // for as long as this process is alive, including while the window is hidden,
+  // so switching away and back does not make the app look like it quit.
   showDockForVisibleWindow();
   mainWindow.show();
   mainWindow.focus();
@@ -233,6 +265,12 @@ function requestNavigation(navigation) {
   return true;
 }
 
+// Settings… (Command-comma) in this app's own menu lands where the Codex Router
+// tray's Settings item does.
+function openSettings() {
+  requestNavigation(Object.freeze({ destination: "settings", sourceId: undefined }));
+}
+
 function showWindow() {
   if (!mainWindow || mainWindow.isDestroyed()) createWindow();
   showWhenContentReady = true;
@@ -252,16 +290,12 @@ function completeApplicationReadiness() {
 
 function createTray() {
   if (tray && !tray.isDestroyed()) return tray;
-  const image = nativeImage.createFromPath(appIconPath());
-  if (image.isEmpty()) throw new Error(`The tray icon could not be loaded from ${appIconPath()}.`);
+  const image = trayIconImage();
+  if (image.isEmpty()) throw new Error("The tray icon could not be loaded.");
   const createdTray = new Tray(image);
   try {
     createdTray.setToolTip("Codex Router");
-    createdTray.setContextMenu(Menu.buildFromTemplate([
-      { label: "Open Control Center", click: showWindow },
-      { type: "separator" },
-      { label: "Quit Codex Router", click: () => app.quit() },
-    ]));
+    createdTray.setContextMenu(Menu.buildFromTemplate(interfaceMenuTemplates(interfaceLanguage, { showWindow, quit: () => app.quit(), openSettings }).tray));
     createdTray.on("click", showWindow);
   } catch (error) {
     createdTray.destroy();
@@ -269,6 +303,12 @@ function createTray() {
   }
   tray = createdTray;
   return tray;
+}
+
+function updateInterfaceMenus() {
+  const templates = interfaceMenuTemplates(interfaceLanguage, { showWindow, quit: () => app.quit(), openSettings });
+  if (process.platform === "darwin") Menu.setApplicationMenu(Menu.buildFromTemplate(templates.application));
+  if (tray && !tray.isDestroyed()) tray.setContextMenu(Menu.buildFromTemplate(templates.tray));
 }
 
 function trayIsAvailable() {
@@ -299,11 +339,19 @@ if (lifecycleQueryInvocation) {
   // Query contract: one compact JSON object on stdout and status 0, including
   // for absent/stale state. This is directly consumable by jq or
   // ConvertFrom-Json without making "not running" a shell error.
-  process.stdout.write(`${JSON.stringify(queryLifecycleState(lifecycleFile))}\n`, () => app.exit(0));
+  // A packaged GUI may have a pipe that never reports its write callback even
+  // after the small lifecycle document is accepted. Exiting immediately after
+  // the synchronous write handoff keeps rebuild verification from parking a
+  // query helper forever.
+  writeFileSync(1, `${JSON.stringify(queryLifecycleState(lifecycleFile))}\n`);
+  process.exit(0);
 }
 
 const primaryInstance = !lifecycleQueryInvocation && app.requestSingleInstanceLock();
-if (!lifecycleQueryInvocation && (!primaryInstance || quitForUpdateInvocation)) app.quit();
+// These are helper invocations, not application sessions. app.quit() before
+// ready can remain alive in packaged Electron when there is no primary GUI to
+// receive the update request, which blocks the transactional bundle swap.
+if (!lifecycleQueryInvocation && (!primaryInstance || quitForUpdateInvocation)) process.exit(0);
 
 if (primaryInstance) app.on("open-url", (event, url) => {
   event.preventDefault();
@@ -315,6 +363,8 @@ if (primaryInstance && !quitForUpdateInvocation) {
   // lock. The ready bit is raised only after the full Electron boundary is set.
   publishLifecycleState();
   app.whenReady().then(() => {
+    interfaceLanguage = interfaceLanguageFromLocale(app.getLocale());
+    updateInterfaceMenus();
     if (process.platform !== "darwin") {
       Menu.setApplicationMenu(null);
     }
@@ -356,6 +406,11 @@ if (primaryInstance && !quitForUpdateInvocation) {
       shell,
       senderGuard: trustedRendererSender,
     });
+    ipcMain.on("router-control:interface-language", (event, language) => {
+      if (!trustedRendererSender(event) || !isInterfaceLanguage(language)) return;
+      interfaceLanguage = language;
+      updateInterfaceMenus();
+    });
     ipcMain.on("router-control:navigation-ready", (event) => {
       if (!trustedRendererSender(event)) return;
       flushNavigationDestination();
@@ -380,26 +435,32 @@ if (primaryInstance) app.on("second-instance", (_event, commandLine) => {
 });
 
 if (primaryInstance) app.on("before-quit", (event) => {
+  isQuitting = true;
   if (!mutationLifecycle.hasActiveMutations()) return;
   event.preventDefault();
+  isQuitting = false;
   if (!deferredQuit) {
     deferredQuit = mutationLifecycle.whenMutationsIdle().then(() => {
       deferredQuit = undefined;
+      isQuitting = true;
       app.quit();
     });
   }
 });
 
 if (primaryInstance) app.on("will-quit", () => {
+  isQuitting = true;
   applicationReady = false;
   windowVisible = false;
   publishLifecycleState();
+  hideDockForHiddenWindow();
 });
 
 if (primaryInstance) app.on("window-all-closed", () => {
-  // The outer Swift app owns the only macOS tray, so its embedded Electron
-  // child has no useful tray-only lifetime. Windows/Linux (and standalone macOS
-  // development) retain their Electron tray and can reopen the window.
+  // Prefer close-to-hide above. If the window is destroyed anyway, keep the
+  // embedded macOS process (and Windows/Linux tray builds) alive so Dock,
+  // Command-Tab, or the tray can reopen it. Only quit when no recoverable
+  // owner remains.
   if (shouldQuitOnLastWindowClosed({
     platform: process.platform,
     nativeTrayOwnedByHost,

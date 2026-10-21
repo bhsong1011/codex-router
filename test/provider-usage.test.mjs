@@ -1,7 +1,27 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { aggregateProviderUsage } from "../src/provider-usage.mjs";
+test("semantic outcomes determine success while failed generation usage remains metered", () => {
+  const now = Date.now();
+  const events = ["completed", "failed", "incomplete", "canceled", "indeterminate"].map((generationOutcome) => ({
+    at: new Date(now).toISOString(), model: "custom/contract", provider: "custom",
+    meteringVersion: 1, status: 200, httpStatus: 200, generationOutcome,
+    inputTokens: 50, outputTokens: 2, totalTokens: 52,
+  }));
+  const result = aggregateProviderUsage(events, { now });
+  const custom = result.providers.find((provider) => provider.id === "custom");
+  assert.equal(custom.requests, 5);
+  assert.equal(custom.successfulRequests, 1);
+  assert.equal(custom.inputTokens, 250);
+  assert.equal(custom.outputTokens, 10);
+  assert.equal(custom.models[0].successfulRequests, 1);
+  assert.deepEqual(custom.outcomeCounts, { completed: 1, failed: 1, incomplete: 1, canceled: 1, indeterminate: 1 });
+  assert.equal(custom.legacyOutcomeRequests, 0);
+  assert.deepEqual(custom.models[0].outcomeCounts, custom.outcomeCounts);
+});
+
+import { aggregateProviderUsage, tokensGeneratedAfterFirstToken } from "../src/provider-usage.mjs";
+import { mergeTokenUsage } from "../src/response-usage.mjs";
 
 test("protocol variants never appear as separate usage providers", () => {
   const snapshot = aggregateProviderUsage([], { now: Date.parse("2026-07-21T18:00:00Z") });
@@ -170,13 +190,10 @@ test("reports a rolling 24-hour window separately from calendar-day buckets", ()
 });
 
 test("publishes prefix-cache telemetry for the dashboard without inflating it", () => {
-  const localDateKey = (value) => {
-    const date = new Date(value);
-    const year = date.getFullYear();
-    const month = String(date.getMonth() + 1).padStart(2, "0");
-    const day = String(date.getDate()).padStart(2, "0");
-    return `${year}-${month}-${day}`;
-  };
+  // Buckets are keyed by UTC calendar day, the same day space OpenAI's account
+  // stream uses, so a chart can merge the two without misattributing a bar by
+  // the machine's offset from UTC.
+  const utcDateKey = (value) => new Date(value).toISOString().slice(0, 10);
   const now = Date.parse("2026-07-21T18:00:00Z");
   const snapshot = aggregateProviderUsage(
     [
@@ -215,8 +232,8 @@ test("publishes prefix-cache telemetry for the dashboard without inflating it", 
     // request exactly one day earlier is still part of the window.
     last24hCachedInputTokens: 130,
     dailyCachedInputTokens: [
-      { startDate: localDateKey("2026-07-20T18:00:00Z"), cachedInputTokens: 80 },
-      { startDate: localDateKey("2026-07-21T17:00:00Z"), cachedInputTokens: 50 },
+      { startDate: utcDateKey("2026-07-20T18:00:00Z"), cachedInputTokens: 80 },
+      { startDate: utcDateKey("2026-07-21T17:00:00Z"), cachedInputTokens: 50 },
     ],
   });
   const deepseek = snapshot.providers.find((provider) => provider.id === "deepseek");
@@ -226,9 +243,15 @@ test("publishes prefix-cache telemetry for the dashboard without inflating it", 
   assert.equal(deepseek.last24hRegularInputTokens, 20);
   assert.equal(deepseek.last24hCachedInputTokens, 130);
   assert.equal(deepseek.regularInputTokens + deepseek.cachedInputTokens, deepseek.inputTokens);
+  // A provider whose rows never carried cache telemetry has no hit rate, not a
+  // zero one; the per-provider flag lets the dashboard tell them apart (#826).
+  assert.equal(deepseek.cacheTelemetrySeen, true);
+  for (const provider of snapshot.providers) {
+    if (provider.id !== "deepseek") assert.equal(provider.cacheTelemetrySeen, false, provider.id);
+  }
   assert.deepEqual(deepseek.dailyUsageBuckets, [
-    { startDate: localDateKey("2026-07-20T18:00:00Z"), tokens: 100, requests: 1, inputTokens: 100, cachedInputTokens: 80, outputTokens: 0 },
-    { startDate: localDateKey("2026-07-21T17:00:00Z"), tokens: 50, requests: 2, inputTokens: 50, cachedInputTokens: 50, outputTokens: 0 },
+    { startDate: utcDateKey("2026-07-20T18:00:00Z"), tokens: 100, requests: 1, inputTokens: 100, cachedInputTokens: 80, outputTokens: 0 },
+    { startDate: utcDateKey("2026-07-21T17:00:00Z"), tokens: 50, requests: 2, inputTokens: 50, cachedInputTokens: 50, outputTokens: 0 },
   ]);
 });
 
@@ -297,6 +320,70 @@ test("uses billed retry totals without changing the selected response usage", ()
   assert.equal(grok.inputTokens, 301_000);
   assert.equal(grok.outputTokens, 270);
   assert.equal(grok.totalTokens, 301_270);
+});
+
+
+test("a retried turn's billed spend survives the merge into one row", () => {
+  // The two halves of the same turn, as the meter assembles them: each attempt
+  // reports the prompt it processed and, separately, what it billed. The row
+  // that reaches this aggregate has to carry the pair's cost, not one
+  // attempt's -- a turn sent twice is the one case where the difference is the
+  // whole point.
+  const usage = mergeTokenUsage(
+    { inputTokens: 50_000, outputTokens: 100, totalTokens: 50_100, billedInputTokens: 150_000, billedOutputTokens: 135 },
+    { inputTokens: 51_000, outputTokens: 100, totalTokens: 51_100, billedInputTokens: 151_000, billedOutputTokens: 135 },
+  );
+  const now = Date.parse("2026-09-21T12:00:00Z");
+  const snapshot = aggregateProviderUsage(
+    [{
+      meteringVersion: 1,
+      at: "2026-09-21T11:00:00Z",
+      provider: "grok-oauth",
+      model: "grok-oauth/grok-4.6",
+      status: 200,
+      ...usage,
+    }],
+    { days: 7, now },
+  );
+  const grok = snapshot.providers.find((provider) => provider.id === "grok-oauth");
+  assert.equal(grok.inputTokens, 301_000);
+  assert.equal(grok.outputTokens, 270);
+  assert.equal(grok.totalTokens, 301_270);
+});
+
+test("merging mixed billed and raw attempts preserves their separately aggregated spend", () => {
+  const now = Date.parse("2026-10-14T12:00:00Z");
+  const base = {
+    meteringVersion: 1,
+    at: "2026-10-14T11:00:00Z",
+    provider: "grok-oauth",
+    model: "grok-oauth/grok-4.6",
+    status: 200,
+  };
+  const raw = { inputTokens: 100, outputTokens: 20, totalTokens: 120 };
+  const cases = [
+    [{ ...raw, billedInputTokens: 250 }, raw],
+    [raw, { ...raw, billedOutputTokens: 45 }],
+    [{ ...raw, billedInputTokens: 0, billedOutputTokens: 0 }, raw],
+    [{ ...raw, billedInputTokens: 250 }, { ...raw, billedOutputTokens: 45 }],
+    [{ ...raw, billedInputTokens: 250, billedOutputTokens: 45 }, { ...raw, billedInputTokens: 250, billedOutputTokens: 45 }],
+    [raw, raw],
+    [raw, { ...raw, billedInputTokens: 250, billedOutputTokens: 45 }, raw],
+  ];
+  const totals = (usage) => ({ inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, totalTokens: usage.totalTokens });
+  const aggregate = (attempts) => aggregateProviderUsage(attempts.map((usage) => ({ ...base, ...usage })), { now })
+    .providers.find((provider) => provider.id === base.provider);
+  for (const [index, attempts] of cases.entries()) {
+    const separately = aggregate(attempts);
+    for (const ordered of [attempts, [...attempts].reverse()]) {
+      const merged = aggregate([ordered.reduce((usage, attempt) => mergeTokenUsage(usage, attempt))]);
+      assert.deepEqual(totals(merged), totals(separately), `provider totals for case ${index}`);
+      assert.deepEqual(totals(merged.models[0]), totals(separately.models[0]), `model totals for case ${index}`);
+      assert.deepEqual(merged.dailyUsageBuckets.map(({ requests: _requests, ...bucket }) => bucket),
+        separately.dailyUsageBuckets.map(({ requests: _requests, ...bucket }) => bucket), `daily totals for case ${index}`);
+      assert.equal(merged.last24hTokens, separately.last24hTokens, `rolling total for case ${index}`);
+    }
+  }
 });
 
 test("breaks provider usage down by model, heaviest first", () => {
@@ -421,6 +508,51 @@ test("uses only the latest 20 clean generation timings for observed speed", () =
 
   assert.equal(model.speedSampleCount, 20);
   assert.equal(model.observedTokensPerSecond, 50);
+});
+
+test("tok/s counts reasoning tokens exactly when they were generated inside the timed window", () => {
+  const now = Date.parse("2026-07-21T18:00:00Z");
+  // Every event: 4 s total, first token at 1 s, so a 3 s generation window.
+  const base = (model, extra) => ({
+    meteringVersion: 1,
+    at: new Date(now).toISOString(),
+    provider: "opencode-go",
+    model,
+    status: 200,
+    durationMs: 4_000,
+    firstTokenMs: 1_000,
+    ...extra,
+  });
+  const events = [
+    // Reasoning deltas were relayed: the clock started on them, so the 98
+    // reasoning tokens were produced inside the window and stay in the count.
+    base("opencode-go/streamed", { outputTokens: 502, reasoningTokens: 98, totalTokens: 602, reasoningStreamed: true }),
+    // No reasoning delta was relayed: the model thought in silence before the
+    // first visible token, so those 98 tokens belong to TTFT, not the rate.
+    base("opencode-go/silent", { outputTokens: 502, reasoningTokens: 98, totalTokens: 602, reasoningStreamed: false }),
+    // Rows written before the marker existed use the inclusive count.
+    base("opencode-go/legacy", { outputTokens: 502, reasoningTokens: 98, totalTokens: 602 }),
+    // A reasoning count above the output count proves the provider reports
+    // visible tokens only; the inclusive total is rebuilt before deciding.
+    base("opencode-go/exclusive-streamed", { outputTokens: 150, reasoningTokens: 499, totalTokens: 150, reasoningStreamed: true }),
+    base("opencode-go/exclusive-silent", { outputTokens: 150, reasoningTokens: 499, totalTokens: 150, reasoningStreamed: false }),
+  ];
+  const snapshot = aggregateProviderUsage(events, { days: 7, now });
+  const provider = snapshot.providers.find((candidate) => candidate.id === "opencode-go");
+  const rate = (slug) => provider.models.find((model) => model.slug === slug).observedTokensPerSecond;
+  assert.equal(rate("opencode-go/streamed"), 167.3); // 502 / 3 s
+  assert.equal(rate("opencode-go/silent"), 134.7); // (502 - 98) / 3 s
+  assert.equal(rate("opencode-go/legacy"), 167.3); // 502 / 3 s
+  assert.equal(rate("opencode-go/exclusive-streamed"), 216.3); // (150 + 499) / 3 s
+  assert.equal(rate("opencode-go/exclusive-silent"), 50); // 150 / 3 s
+  // Provider totals still count the reported output, not the speed numerator.
+  assert.equal(provider.outputTokens, 502 * 3 + 150 * 2);
+});
+
+test("tokensGeneratedAfterFirstToken treats a missing reasoning count as zero", () => {
+  assert.equal(tokensGeneratedAfterFirstToken({}, 40), 40);
+  assert.equal(tokensGeneratedAfterFirstToken({ reasoningStreamed: false }, 40), 40);
+  assert.equal(tokensGeneratedAfterFirstToken({ reasoningTokens: 0, reasoningStreamed: false }, 40), 40);
 });
 
 test("accepts a response that starts within the first measured millisecond", () => {

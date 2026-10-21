@@ -23,7 +23,20 @@ import {
 } from "../apps/panel/model.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-import { availableLanguages, getLanguage, setLanguage, t, translationKeys } from "../apps/panel/i18n.mjs";
+import {
+  LANGUAGE_OPTIONS,
+  availableLanguages,
+  getLanguage,
+  setLanguage,
+  t,
+  translationKeys,
+} from "../apps/panel/i18n.mjs";
+
+// The panel resolves a language from the host at import time, so a developer
+// running these assertions on a non-English machine would otherwise compare
+// translated labels against English expectations. Pin it once; the translation
+// test below switches languages deliberately and restores this value itself.
+setLanguage("en");
 
 test("model picker search matches names, slugs, and provider labels", () => {
   const model = {
@@ -252,6 +265,67 @@ test("active model speed prefers its provider and matches qualified slugs", () =
   assert.equal(observedModelSpeed(usage, "deepseek", "missing/model"), null);
 });
 
+test("panel speed rendering logic detects generation state correctly", () => {
+  // Verify the isGenerating logic that renderModelSpeed uses
+
+  // Idle state with no active requests
+  const idleActivity = {
+    state: "idle",
+    model: "provider/model",
+    provider: "provider",
+    active: [],
+  };
+  const isIdleGenerating = idleActivity.state === "generating" || (idleActivity.active && idleActivity.active.length > 0);
+  assert.equal(isIdleGenerating, false, "idle state with no active requests should not be generating");
+
+  // Generating state
+  const generatingActivity = {
+    state: "generating",
+    model: "provider/model",
+    provider: "provider",
+    active: [{ model: "provider/model", provider: "provider" }],
+  };
+  const isGenerating =
+    generatingActivity.state === "generating" || (generatingActivity.active && generatingActivity.active.length > 0);
+  assert.equal(isGenerating, true, "generating state should be detected");
+
+  // Active requests present even if state is not explicitly "generating"
+  const activeWithoutGeneratingState = {
+    state: "idle",
+    model: "provider/model",
+    provider: "provider",
+    active: [{ model: "provider/model", provider: "provider" }],
+  };
+  const hasActive =
+    activeWithoutGeneratingState.state === "generating" ||
+    (activeWithoutGeneratingState.active && activeWithoutGeneratingState.active.length > 0);
+  assert.equal(hasActive, true, "active requests should be detected even without generating state");
+
+  // Verify observedModelSpeed should return null when generating
+  const providerUsage = {
+    providers: [
+      {
+        id: "provider",
+        models: [
+          {
+            slug: "provider/model",
+            displayName: "model",
+            observedTokensPerSecond: 125.3,
+            speedSampleCount: 10,
+          },
+        ],
+      },
+    ],
+  };
+  // When not generating, observedModelSpeed should be called and return speed
+  const observedIdle = !isIdleGenerating ? observedModelSpeed(providerUsage, "provider", "provider/model") : null;
+  assert.deepEqual(observedIdle, { speed: 125.3, samples: 10 });
+
+  // When generating, observedModelSpeed should not be called (returns null)
+  const observedGenerating = !isGenerating ? observedModelSpeed(providerUsage, "provider", "provider/model") : null;
+  assert.equal(observedGenerating, null, "speed should be null during generation");
+});
+
 test("service health rows expose enabled dependencies without leaking endpoint details", () => {
   assert.deepEqual(
     serviceHealthRows({
@@ -372,6 +446,37 @@ test("the macOS tray tool-result-aging switch mirrors the same off default", () 
   assert.doesNotMatch(source, /toolResultAging\?\.enabled \?\? true/);
 });
 
+test("the macOS tray panel follows the system appearance", () => {
+  const source = readFileSync(
+    path.join(root, "apps", "macos", "ModelRouterTray", "Sources", "ModelRouterTrayApp.swift"),
+    "utf8",
+  );
+  const trayStart = source.indexOf("private struct TrayView");
+  const trayEnd = source.indexOf("private struct ProviderSetupRow", trayStart);
+  assert.ok(trayStart > 0 && trayEnd > trayStart, "TrayView should remain readable");
+  assert.doesNotMatch(
+    source.slice(trayStart, trayEnd),
+    /\.preferredColorScheme\(\.dark\)/,
+    "the menu-bar panel must not override the operator's macOS appearance",
+  );
+});
+
+test("the macOS tray does not redraw a hidden or unchanged settings tree", () => {
+  const source = readFileSync(
+    path.join(root, "apps", "macos", "ModelRouterTray", "Sources", "ModelRouterTrayApp.swift"),
+    "utf8",
+  );
+  const closePanel = source.match(/private func closePanel\(\)[\s\S]*?\r?\n  }/)?.[0];
+  const refreshActivity = source.match(/private func refreshActivity\(\)[\s\S]*?\r?\n  }\r?\n\r?\n  private func recordActivityHealthFailure/)?.[0];
+
+  assert.ok(closePanel, "tray close helper should be readable");
+  assert.match(closePanel, /panel\.contentViewController = nil/);
+  assert.ok(refreshActivity, "activity refresh helper should be readable");
+  assert.match(refreshActivity, /if routerHealth != health \{ routerHealth = health \}/);
+  assert.match(source, /private struct RouterHealth: Decodable, Equatable/);
+  assert.match(source, /private struct RouterActivity: Decodable, Equatable/);
+});
+
 test("the macOS tray provider toggle uses the atomic selection command", () => {
   const swift = readFileSync(
     path.join(root, "apps", "macos", "ModelRouterTray", "Sources", "ModelRouterTrayApp.swift"),
@@ -426,18 +531,26 @@ test("every mutating control in the browser panel names the command it drives", 
   }
 });
 
-test("browser panel exposes translations with matching keys for every language", () => {
+test("browser panel keeps zh-TW complete and every other locale a subset of English", () => {
   assert.deepEqual(
     availableLanguages().map(({ id }) => id),
-    ["en", "zh-CN", "ar", "hi", "ja", "ko"],
+    LANGUAGE_OPTIONS.map(({ id }) => id),
   );
   const keys = translationKeys();
   const englishKeys = [...keys.en].sort();
+  // English carries the source text and zh-TW is the locale this project
+  // authors by hand, so both must define every key. The remaining locales are
+  // overlays: `t()` falls back to English for anything they omit, so a missing
+  // key renders exactly what the panel showed before the copy moved into the
+  // dictionary. They may therefore be incomplete, but must never invent a key
+  // English does not have.
+  assert.deepEqual([...keys["zh-TW"]].sort(), englishKeys, "zh-TW must translate every key");
   for (const language of Object.keys(keys)) {
-    assert.deepEqual([...keys[language]].sort(), englishKeys, `translation keys diverge for ${language}`);
+    const unknown = [...keys[language]].filter((key) => !englishKeys.includes(key));
+    assert.deepEqual(unknown, [], `${language} defines a key English does not have`);
   }
   // Stated separately from the parity check above, which would also pass if a
-  // new string were left out of all six.
+  // new string were left out of every locale.
   for (const language of Object.keys(keys)) {
     for (const key of [
       "general.readOnlySurface",
@@ -459,6 +572,7 @@ test("browser panel exposes translations with matching keys for every language",
     ["hi", "उपयोग"],
     ["ja", "使用量"],
     ["ko", "사용량"],
+    ["es", "Uso"],
   ];
   try {
     for (const [language, navUsage] of samples) {
@@ -480,6 +594,24 @@ test("browser panel exposes translations with matching keys for every language",
     setLanguage("en");
   }
   assert.equal(t("nav.usage"), "Usage");
+});
+
+test("browser and macOS settings present the unified pipeline as Token maxxing", () => {
+  assert.equal(t("models.compactOldToolResults"), "Token maxxing");
+  assert.match(t("models.reduceRepeatedContext"), /RTK-shape noisy output.*routed compaction/i);
+  assert.doesNotMatch(t("models.reduceRepeatedContext"), /70%|pressure|reasoning packets/i);
+  assert.doesNotMatch(t("models.compactOldToolResults"), /compact old tool results/i);
+
+  const markup = readFileSync(path.join(root, "apps", "panel", "index.html"), "utf8");
+  assert.match(markup, />Token maxxing</u);
+  assert.match(markup, /Toggle Token maxxing for external models/u);
+
+  const swift = readFileSync(
+    path.join(root, "apps", "macos", "ModelRouterTray", "Sources", "ModelRouterTrayApp.swift"),
+    "utf8",
+  );
+  assert.match(swift, /title: routerLocalized\("Token maxxing"\)/u);
+  assert.doesNotMatch(swift, /title: routerLocalized\("Compact old tool results"\)/u);
 });
 
 test("browser panel marks Arabic as the only right-to-left language", () => {

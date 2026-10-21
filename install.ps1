@@ -3,8 +3,10 @@ param(
   [switch]$CheckoutInstall,
   [switch]$PrepareOnly,
   [switch]$ForceDeps,
-  [ValidateSet("codex", "dsh", "gemini")]
+  [ValidateSet("codex", "dsh", "gemini", "cursor", "claude", "openclaw")]
   [string]$Target = "codex",
+  [string]$CursorPublicUrl,
+  [string]$CursorHostname,
   [switch]$Guided,
   [switch]$Auto,
   [string]$Providers,
@@ -30,6 +32,15 @@ param(
 
 $ErrorActionPreference = "Stop"
 $env:MODEL_ROUTER_TARGET = $Target
+if ($CursorPublicUrl) {
+  if ($Target -ne "cursor") { throw "-CursorPublicUrl applies to -Target cursor only." }
+  $env:MODEL_ROUTER_CURSOR_PUBLIC_BASE_URL = $CursorPublicUrl
+}
+if ($CursorHostname) {
+  if ($Target -ne "cursor") { throw "-CursorHostname applies to -Target cursor only." }
+  if ($CursorPublicUrl) { throw "Use either -CursorHostname or -CursorPublicUrl, not both." }
+  $env:MODEL_ROUTER_CURSOR_TUNNEL_HOSTNAME = $CursorHostname
+}
 # Legacy migration replaces an older router's managed Codex config block, and
 # the native catalog is the ChatGPT-plan model list Codex adopts. Neither has a
 # counterpart in DeepSeek Harness, whose integration is one settings section.
@@ -214,7 +225,7 @@ if (-not $CheckoutInstall) {
     Write-Warning "Setup did not finish configuring; the update was kept. Re-run setup to continue, or ./codex-router.ps1 rollback to return to the previous revision."
   } elseif ($SetupExitCode -ne 0 -and $PreviousRevision) {
     & git -C $Repository switch --detach $PreviousRevision 2>$null | Out-Null
-    Write-Warning "Setup failed; the managed source checkout was restored to $PreviousRevision."
+    Write-Warning "Setup failed; the managed source checkout was restored to $PreviousRevision. Re-run this installer to retry the update from main."
   }
   exit $SetupExitCode
 }
@@ -230,18 +241,32 @@ if ([int]$VersionParts[0] -lt 22 -or
     ([int]$VersionParts[0] -eq 22 -and [int]$VersionParts[1] -lt 19)) {
   throw "Node.js 22.19 or newer is required; Node.js 24 LTS is recommended."
 }
+if ($Target -eq "openclaw") {
+  & node (Join-Path $ScriptDirectory "src\openclaw-install.mjs") preflight | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw "OpenClaw requires a supported Node.js release." }
+}
 
 # Each target enables its own client configuration; everything around that one
 # step is the shared router plane.
 $ConfigManager = switch ($Target) {
   "dsh" { "src\dsh-config-manager.mjs" }
   "gemini" { "src\gemini-config-manager.mjs" }
+  "cursor" { "src\cursor-config-manager.mjs" }
+  "claude" { "src\claude-code-config-manager.mjs" }
+  "openclaw" { "src\openclaw-config-manager.mjs" }
   default { "src\config-manager.mjs" }
 }
 $ConfigEnableCommand = if ($Target -eq "codex") { "enable" } else { "install" }
 $ConfigDisableCommand = if ($Target -eq "codex") { "disable" } else { "uninstall" }
 $ConfigEnabled = $false
 $ServiceInstalled = $false
+# `service.mjs install` exits 75 when the service is installed and running but
+# the router did not answer /health inside the readiness budget -- a slow cold
+# start, not a failed install. The rollback must then leave both the service
+# and the client config alone: tearing them out strands a router that comes up
+# healthy moments later and deletes the launchers the install correctly wrote,
+# which is the "installed but missing from disk" of #760.
+$ReadinessTimedOut = $false
 $AdoptionPending = $false
 # The foreign-state override below is set only for a full install, but the
 # finally runs for prepare-only and for failures that happen before that point
@@ -274,6 +299,9 @@ try {
   $ConfigWasEnabled = switch ($Target) {
     "dsh" { (Get-InstallerStateField @($ConfigManager, "status") "routeInstalled") -eq $true }
     "gemini" { (Get-InstallerStateField @($ConfigManager, "status") "installed") -eq $true }
+    "cursor" { (Get-InstallerStateField @($ConfigManager, "status") "appConfigured") -eq $true }
+    "claude" { (Get-InstallerStateField @($ConfigManager, "status") "installed") -eq $true }
+    "openclaw" { (Get-InstallerStateField @($ConfigManager, "status") "installed") -eq $true }
     default { (Get-InstallerStateField @($ConfigManager, "status") "mode") -eq "router" }
   }
   $ServiceWasInstalled = (Get-InstallerStateField @("src\service.mjs", "status") "installed") -eq $true
@@ -461,6 +489,21 @@ try {
     & node src/dsh-config-manager.mjs install | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "DeepSeek Harness republish failed." }
   }
+  if ($Target -ne "cursor" -and (Test-NonEmptyFile (Join-Path $StateRoot "cursor-models.json"))) {
+    $CursorRunning = (Get-InstallerStateField @("src\cursor-config-manager.mjs", "status") "running") -eq $true
+    if (-not $CursorRunning) {
+      & node src/cursor-config-manager.mjs install | Out-Null
+      if ($LASTEXITCODE -ne 0) { throw "Cursor republish failed." }
+    }
+  }
+  if ($Target -ne "claude" -and (Test-NonEmptyFile (Join-Path $StateRoot "claude-models.json"))) {
+    & node src/claude-code-config-manager.mjs install | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Claude Code republish failed." }
+  }
+  if ($Target -ne "openclaw" -and (Test-NonEmptyFile (Join-Path $StateRoot "openclaw-models.json"))) {
+    & node src/openclaw-config-manager.mjs install | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "OpenClaw republish failed." }
+  }
 
   if ($PrepareOnly) {
     Write-Host "Dependencies and generated files are prepared; application configuration was not changed."
@@ -469,6 +512,11 @@ try {
     # an invoked prepare-only install must hand control back so its caller can
     # observe that restoration.
     return
+  }
+
+  if ($Target -eq "openclaw") {
+    & node src/openclaw-install.mjs install | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "OpenClaw installation failed." }
   }
 
   $ConfigEnabled = $true
@@ -489,6 +537,16 @@ try {
   if ($LASTEXITCODE -ne 0) { throw "Install-manifest recording failed." }
   $ServiceInstalled = $true
   & node src/service.mjs install
+  if ($LASTEXITCODE -eq 75) {
+    # Installed and running, just not healthy yet. Stop without rolling
+    # anything back: the service keeps starting and the operator re-checks
+    # rather than reinstalling. Skipping wait-health matters -- it would spend
+    # a second full budget and fail the same way on the same cold start.
+    $ReadinessTimedOut = $true
+    Write-Host "The background service is installed and still starting; the router did not answer within the health wait."
+    Write-Host "Check './codex-router.ps1 status' in a few minutes. Do not re-run the installer -- nothing was rolled back."
+    throw "The router is still starting."
+  }
   if ($LASTEXITCODE -ne 0) { throw "Background-service installation failed." }
   & node src/wait-health.mjs
   if ($LASTEXITCODE -ne 0) { throw "The router did not become healthy." }
@@ -545,14 +603,25 @@ try {
   } elseif ($Target -eq "gemini") {
     Write-Host "Published the selected external model routes to Gemini CLI. The next 'gemini' run picks them up."
     Write-Host "Choose 'Use Gemini API key' once if it asks how to authenticate; the key is this router's local caller capability."
+  } elseif ($Target -eq "cursor") {
+    Write-Host "Published all routed models to Cursor Agent and Cursor App."
+    Write-Host "Run cursor-router-agent for the CLI; fully quit and reopen Cursor for the app."
+  } elseif ($Target -eq "claude") {
+    Write-Host "Published all routed models to Claude Code. Run claude-router and choose a codex_router/anthropic/... model."
+  } elseif ($Target -eq "openclaw") {
+    Write-Host "Installed OpenClaw and published every routed model under its codex-router provider. Run openclaw to start."
   } else {
     Write-Host "Installed the selected external model routes. Fully quit and reopen Codex."
   }
 } catch {
-  # Undo only what this run created. The router health wait can time out on a
-  # cold-starting gateway with a large model set -- retryable, not broken -- and
-  # tearing out a service and disabling a client config that were both working
-  # before the run turns that into an unrouted machine.
+  # Undo only what this run created, and only when the run actually broke
+  # something. The router health wait can time out on a cold-starting gateway
+  # with a large model set -- retryable, not broken -- so a router that is
+  # merely slow to start is left exactly as installed. Gating this on
+  # $ServiceWasInstalled alone covered only a reinstall over a working router;
+  # a first install on a clean machine still had its task and launchers deleted
+  # the moment a cold start overran the wait, which is #760.
+  if ($ReadinessTimedOut) { throw }
   if ($ServiceInstalled -and -not $ServiceWasInstalled) {
     & node src/service.mjs uninstall 2>$null | Out-Null
   }

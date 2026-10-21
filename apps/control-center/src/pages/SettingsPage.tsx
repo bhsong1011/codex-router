@@ -1,9 +1,20 @@
-import { useEffect, useMemo, useState } from "react";
-import { AppWindow, Eye, Moon, RefreshCw, Server, Sun, Wrench } from "lucide-react";
+import { backendText } from "../backend-text";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { AppWindow, Check, Eye, LogIn, Moon, Plus, RefreshCw, Server, ShieldCheck, Sun, Trash2, UserRound, Wrench } from "lucide-react";
 import { Badge, Button, Dialog, InlineNotice, PageHeader, SectionHeading, Toggle } from "../components";
-import { compactNumber } from "../lib";
+import { compactNumber, effortLabel } from "../lib";
 import { LANGUAGE_OPTIONS, type LanguageId, type Translate } from "../i18n";
-import type { ChatGptSessionStatus, DoctorSnapshot, PresenceSnapshot, RouterControlApi, RouterHealth, RouterTarget, VisionEngine } from "../types";
+import type {
+  ChatGptAccountPool,
+  ChatGptSessionStatus,
+  ChatGptSubscriptionAccount,
+  DoctorSnapshot,
+  PresenceSnapshot,
+  RouterControlApi,
+  RouterHealth,
+  RouterTarget,
+  VisionEngine,
+} from "../types";
 import { useOptimisticValues, type RunAction } from "../useOptimisticValues";
 
 // Mirrors RETENTION_MIN/MAX/DEFAULT_TTL_DAYS in src/tool-result-retention.mjs.
@@ -12,6 +23,27 @@ import { useOptimisticValues, type RunAction } from "../useOptimisticValues";
 // than being folded in with the default.
 const RETENTION_DEFAULT_TTL_DAYS = 7;
 const RETENTION_CHOICES = [1, 3, 7, 14, 30, 90];
+
+type AccountOverlay =
+  | { kind: "add"; clientId: string; account: ChatGptSubscriptionAccount }
+  | { kind: "remove"; accountId: string };
+
+function isOptimisticAccountId(id: string): boolean {
+  return id.startsWith("pending:");
+}
+
+function optimisticAccountPlaceholder(label: string, clientId: string): ChatGptSubscriptionAccount {
+  return {
+    id: clientId,
+    state: "active",
+    paused: false,
+    priority: 50,
+    label: label || "New account",
+    subscription: { status: "pending", authenticated: false, usable: false, expired: false },
+    turns: 0,
+    requests: 0,
+  };
+}
 
 function formatBytes(value: number | null | undefined): string {
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return "0 B";
@@ -25,11 +57,13 @@ function formatBytes(value: number | null | undefined): string {
   return `${size >= 10 || unit === 0 ? Math.round(size) : size.toFixed(1)} ${units[unit]}`;
 }
 
-export function SettingsPage({ target, health, presence, chatgptSession, api, theme, onTheme, language, onLanguage, t, refreshing, onRefresh, runAction }: {
+export function SettingsPage({ target, health, presence, chatgptSession, accountPool, accountPoolError, api, theme, onTheme, language, onLanguage, t, refreshing, onRefresh, runAction }: {
   target?: RouterTarget;
   health?: RouterHealth;
   presence?: PresenceSnapshot;
   chatgptSession?: ChatGptSessionStatus;
+  accountPool?: ChatGptAccountPool;
+  accountPoolError?: string;
   api?: RouterControlApi;
   theme: "light" | "dark";
   onTheme: (theme: "light" | "dark") => void;
@@ -37,7 +71,7 @@ export function SettingsPage({ target, health, presence, chatgptSession, api, th
   onLanguage: (language: LanguageId) => void;
   t: Translate;
   refreshing: boolean;
-  onRefresh: () => void;
+  onRefresh: () => Promise<unknown> | void;
   runAction: RunAction;
 }) {
   const [confirmTrayDisable, setConfirmTrayDisable] = useState(false);
@@ -45,6 +79,14 @@ export function SettingsPage({ target, health, presence, chatgptSession, api, th
   const [confirmRepair, setConfirmRepair] = useState(false);
   const [repairing, setRepairing] = useState(false);
   const [repairReport, setRepairReport] = useState<DoctorSnapshot | null>(null);
+  const [newAccountLabel, setNewAccountLabel] = useState("");
+  const [removeAccountId, setRemoveAccountId] = useState<string | null>(null);
+  const [loginPendingId, setLoginPendingId] = useState<string | null>(null);
+  const [loginRetryingId, setLoginRetryingId] = useState<string | null>(null);
+  const [loginError, setLoginError] = useState<string | null>(null);
+  const [accountOverlays, setAccountOverlays] = useState<AccountOverlay[]>([]);
+  const refreshRef = useRef(onRefresh);
+  refreshRef.current = onRefresh;
   const [trayCapability, setTrayCapability] = useState<{ supported?: boolean; why?: string }>();
   useEffect(() => {
     let active = true;
@@ -61,6 +103,44 @@ export function SettingsPage({ target, health, presence, chatgptSession, api, th
     });
     return () => { active = false; };
   }, [api, refreshing]);
+  const observedLoginAttempt = loginPendingId
+    ? accountPool?.loginAttempts?.[loginPendingId]
+    : undefined;
+  const loginAttempt = loginPendingId === loginRetryingId && observedLoginAttempt?.status === "failed"
+    ? undefined
+    : observedLoginAttempt;
+  const loginPendingUsable = loginPendingId
+    ? accountPool?.accounts?.[loginPendingId]?.subscription?.usable === true && !loginAttempt
+    : false;
+  useEffect(() => {
+    if (!loginPendingId) return;
+    if (loginPendingId === loginRetryingId && observedLoginAttempt?.status === "pending") {
+      setLoginRetryingId(null);
+    }
+    if (loginPendingUsable) {
+      setLoginPendingId(null);
+      setLoginRetryingId(null);
+      setLoginError(null);
+      return;
+    }
+    if (loginAttempt?.status === "failed") {
+      setLoginPendingId(null);
+      setLoginRetryingId(null);
+      setLoginError(loginAttempt.error || "Codex login did not complete. Try again.");
+      return;
+    }
+    let cancelled = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      await refreshRef.current();
+      if (!cancelled) timer = window.setTimeout(() => void poll(), 1_500);
+    };
+    timer = window.setTimeout(() => void poll(), 1_500);
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [loginAttempt?.error, loginAttempt?.status, loginPendingId, loginPendingUsable, loginRetryingId, observedLoginAttempt?.status]);
   const trayControlsUnavailable = trayCapability?.supported === false;
   const repairFailures = useMemo(
     () => (repairReport?.checks ?? []).filter((check) => check.status === "fail"),
@@ -81,6 +161,104 @@ export function SettingsPage({ target, health, presence, chatgptSession, api, th
       ? "settings.chatgptSession.status.sharingEnabled"
       : "settings.chatgptSession.status.sharingDisabled")} · ${sessionLoginLabel}`
     : t("settings.chatgptSession.status.unavailable");
+  // Revoked records are cleanup tombstones from older router versions. They
+  // are not usable accounts and must never reappear as "Account 1/2" rows.
+  // Keep paused records visible so a future resume control can explain them.
+  // Add/remove overlays paint immediately; runAction's later refresh replaces
+  // them with authoritative pool state and clears the matching overlays.
+  useEffect(() => {
+    if (accountPoolError || !accountPool) return;
+    setAccountOverlays((current) => {
+      if (!current.length) return current;
+      const next = current.filter((entry) => {
+        if (entry.kind === "add") {
+          return !accountPool.accounts?.[entry.account.id];
+        }
+        const remaining = accountPool.accounts?.[entry.accountId];
+        return Boolean(remaining && remaining.state !== "revoked");
+      });
+      return next.length === current.length ? current : next;
+    });
+  }, [accountPool, accountPoolError]);
+  const subscriptionAccounts = useMemo(() => {
+    const base = Object.values(accountPoolError ? {} : accountPool?.accounts || {})
+      .filter((account) => account.state !== "revoked");
+    const removedIds = new Set(
+      accountOverlays
+        .filter((entry): entry is Extract<AccountOverlay, { kind: "remove" }> => entry.kind === "remove")
+        .map((entry) => entry.accountId),
+    );
+    const visible = base.filter((account) => !removedIds.has(account.id));
+    const visibleIds = new Set(visible.map((account) => account.id));
+    const pendingAdds = accountOverlays
+      .filter((entry): entry is Extract<AccountOverlay, { kind: "add" }> => entry.kind === "add")
+      .map((entry) => entry.account)
+      .filter((account) => !visibleIds.has(account.id));
+    return [...visible, ...pendingAdds];
+  }, [accountOverlays, accountPool, accountPoolError]);
+  const usableSubscriptionAccounts = subscriptionAccounts.filter((account) => account.state === "active" && account.subscription?.usable === true);
+  const activeAccountId = accountPool?.profile?.active;
+  const accountSelection = accountPool?.profile?.desired || activeAccountId || usableSubscriptionAccounts[0]?.id || "";
+
+  const addSubscriptionAccount = async () => {
+    if (!api || accountPoolError) return;
+    const label = newAccountLabel.trim();
+    const clientId = `pending:${crypto.randomUUID()}`;
+    setAccountOverlays((current) => [
+      ...current,
+      { kind: "add", clientId, account: optimisticAccountPlaceholder(label, clientId) },
+    ]);
+    setNewAccountLabel("");
+    let saved = false;
+    try {
+      await runAction(t("app.action.addChatgptAccount"), async () => {
+        const result = await api.addChatGptSubscriptionAccount(label) as {
+          account?: ChatGptSubscriptionAccount;
+        };
+        const created = result?.account;
+        if (created?.id) {
+          setAccountOverlays((current) => current.map((entry) => (
+            entry.kind === "add" && entry.clientId === clientId
+              ? { kind: "add", clientId, account: created }
+              : entry
+          )));
+        } else {
+          // The durable write succeeded but returned no row. Drop the
+          // placeholder so refreshCore's authoritative pool is the only source.
+          setAccountOverlays((current) => current.filter((entry) => !(
+            entry.kind === "add" && entry.clientId === clientId
+          )));
+        }
+        saved = true;
+        return result;
+      });
+    } finally {
+      if (!saved) {
+        setAccountOverlays((current) => current.filter((entry) => !(
+          entry.kind === "add" && entry.clientId === clientId
+        )));
+      }
+    }
+  };
+
+  const removeSubscriptionAccount = async (accountId: string) => {
+    if (!api || !accountId || loginPendingId === accountId) return;
+    setRemoveAccountId(null);
+    setAccountOverlays((current) => [...current, { kind: "remove", accountId }]);
+    let saved = false;
+    try {
+      await runAction(t("app.action.removeChatgptAccount"), async () => {
+        await api.removeChatGptSubscriptionAccount(accountId);
+        saved = true;
+      });
+    } finally {
+      if (!saved) {
+        setAccountOverlays((current) => current.filter((entry) => !(
+          entry.kind === "remove" && entry.accountId === accountId
+        )));
+      }
+    }
+  };
 
   // Repair reinstalls and restarts the service, so it can outlast several
   // ordinary actions. `runAction` owns the toast and the refresh; the report
@@ -160,7 +338,7 @@ export function SettingsPage({ target, health, presence, chatgptSession, api, th
             <div className="settings-list">
               <div className="setting-row">
                 <div><strong>{t("settings.signedRouting.title")}</strong><small>{t("settings.signedRouting.detail")}</small></div>
-                <Toggle checked={optimisticToggles.value("signed-routing", target?.signedRouting === true)} disabled={!api || !target} label={t("settings.signedRouting.title")} onChange={(enabled) => api && void optimisticToggles.mutate("signed-routing", enabled, "Change signed routing", () => api.setSignedRouting(enabled))} />
+                <Toggle checked={optimisticToggles.value("signed-routing", target?.signedRouting === true)} disabled={!api || !target} label={t("settings.signedRouting.title")} onChange={(enabled) => api && void optimisticToggles.mutate("signed-routing", enabled, t("app.action.changeSignedRouting"), () => api.setSignedRouting(enabled))} />
               </div>
               <div className="setting-row">
                 <div>
@@ -183,6 +361,115 @@ export function SettingsPage({ target, health, presence, chatgptSession, api, th
           </section>
 
           <section className="panel-section">
+            <SectionHeading
+              title={t("settings.accounts.title")}
+              description={t("settings.accounts.description")}
+            />
+            {accountPoolError ? (
+              <InlineNotice tone="danger" title={t("settings.accounts.stateUnavailable")}>
+                {t("settings.accounts.stateUnavailableBody", { error: accountPoolError })}
+              </InlineNotice>
+            ) : loginError ? (
+              <InlineNotice tone="danger" title={t("settings.accounts.loginFailed")}>
+                {t("settings.accounts.loginFailedBody", { error: loginError })}
+              </InlineNotice>
+            ) : accountPool?.profile?.pending ? (
+              <InlineNotice tone="neutral" title={t("settings.accounts.switchPending")}>
+                {t("settings.accounts.switchPendingBody")}
+              </InlineNotice>
+            ) : null}
+            <div className="settings-actions subscription-account-create">
+              <input
+                aria-label={t("settings.accounts.newLabelAria")}
+                value={newAccountLabel}
+                maxLength={120}
+                placeholder={t("settings.accounts.labelPlaceholder")}
+                onChange={(event) => setNewAccountLabel(event.target.value)}
+              />
+              <Button
+                variant="secondary"
+                disabled={!api || Boolean(accountPoolError)}
+                onClick={() => void addSubscriptionAccount()}
+              ><Plus aria-hidden size={14} strokeWidth={1.7} /> {t("settings.accounts.add")}</Button>
+            </div>
+            <div className="settings-list">
+              {subscriptionAccounts.map((account) => {
+                const optimisticPending = isOptimisticAccountId(account.id);
+                const accountLoginAttempt = accountPool?.loginAttempts?.[account.id];
+                const status = optimisticPending
+                  ? t("settings.accounts.statusAdding")
+                  : account.subscription?.usable
+                    ? t("settings.accounts.statusReady")
+                    : account.subscription?.expired
+                      ? t("settings.accounts.statusExpired")
+                      : t("settings.accounts.statusSignInRequired");
+                const title = account.subscription?.email || account.label || t("settings.accounts.defaultTitle");
+                const label = account.subscription?.email && account.label ? `${account.label} · ` : "";
+                const usage = account.subscription?.usage;
+                const usageLabel = optimisticPending
+                  ? t("settings.accounts.savingAccount")
+                  : usage && Number.isFinite(usage.remainingPercent)
+                    ? t("settings.accounts.remaining", { period: usage.period, percent: Math.round(usage.remainingPercent) })
+                    : t("settings.accounts.usageUnavailable");
+                return (
+                  <div
+                    className="setting-row subscription-account-row"
+                    key={account.id}
+                    data-optimistic={optimisticPending ? "true" : undefined}
+                  >
+                    <div>
+                      <strong><UserRound aria-hidden size={14} strokeWidth={1.7} /> {title} {accountSelection === account.id ? <Badge tone="accent">{t("settings.accounts.selectedBadge")}</Badge> : null}</strong>
+                      <small>{label}{status}{account.subscription?.expiresInHours !== undefined ? t("settings.accounts.tokenHours", { hours: account.subscription.expiresInHours }) : ""} · {usageLabel}</small>
+                      {accountLoginAttempt?.status === "failed" ? <small>{accountLoginAttempt.error}</small> : null}
+                    </div>
+                    <div className="settings-actions">
+                      <Button
+                        variant={accountSelection === account.id ? "secondary" : "ghost"}
+                        aria-pressed={accountSelection === account.id}
+                        aria-label={accountSelection === account.id ? t("settings.accounts.selectedAria", { name: title }) : t("settings.accounts.selectAria", { name: title })}
+                        disabled={!api || optimisticPending}
+                        onClick={() => api && void runAction(t("app.action.switchChatgptAccount"), () => api.setChatGptAccountSelection(account.id))}
+                      >{accountSelection === account.id ? <><Check aria-hidden size={13} strokeWidth={1.9} /> {t("settings.accounts.selectedBadge")}</> : <><Check aria-hidden size={13} strokeWidth={1.9} /> {t("settings.accounts.select")}</>}</Button>
+                      <Button
+                        variant="ghost"
+                        disabled={!api || optimisticPending || account.state !== "active" || accountLoginAttempt?.retryable === false || (account.subscription?.usable === true && accountLoginAttempt?.status !== "failed") || loginPendingId === account.id}
+                        onClick={() => {
+                          if (!api) return;
+                          setLoginError(null);
+                          setLoginRetryingId(accountLoginAttempt?.status === "failed" ? account.id : null);
+                          setLoginPendingId(account.id);
+                          void runAction(t("app.action.loginChatgptAccount", { name: account.label || t("settings.accounts.defaultTitle") }), async () => {
+                            try {
+                              return await api.loginChatGptSubscriptionAccount(account.id);
+                            } catch (error) {
+                              // App.runAction deliberately owns and swallows
+                              // action failures after showing the toast. Clear
+                              // our local pending owner before rethrowing so a
+                              // launch/pre-handoff failure cannot leave the
+                              // 1.5-second completion poll running forever.
+                              setLoginPendingId(null);
+                              setLoginRetryingId(null);
+                              throw error;
+                            }
+                          });
+                        }}
+                      ><LogIn aria-hidden size={13} strokeWidth={1.7} /> {t("settings.accounts.login")}</Button>
+                      <Button
+                        variant="ghost"
+                        disabled={!api || optimisticPending || account.state === "revoked" || accountLoginAttempt?.retryable === false || accountLoginAttempt?.removable === false || loginPendingId === account.id}
+                        onClick={() => setRemoveAccountId(account.id)}
+                      ><Trash2 aria-hidden size={13} strokeWidth={1.7} /> {t("settings.accounts.remove")}</Button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+            {!accountPoolError && !subscriptionAccounts.length ? (
+              <div className="surface-summary"><ShieldCheck aria-hidden size={20} strokeWidth={1.6} /><div><strong>{t("settings.accounts.emptyTitle")}</strong><small>{t("settings.accounts.emptyBody")}</small></div></div>
+            ) : null}
+          </section>
+
+          <section className="panel-section">
             <SectionHeading title={t("settings.service.title")} description={t("settings.service.description")} />
             <div className="settings-list">
               <div className="setting-row">
@@ -191,7 +478,7 @@ export function SettingsPage({ target, health, presence, chatgptSession, api, th
                   aria-label={t("settings.presence.title")}
                   value={presence?.mode || "always"}
                   disabled={!api}
-                  onChange={(event) => api && void runAction("Change presence mode", () => api.setPresence(event.target.value as "always" | "follow-codex"))}
+                  onChange={(event) => api && void runAction(t("app.action.changePresenceMode"), () => api.setPresence(event.target.value as "always" | "follow-codex"))}
                 >
                   <option value="always">{t("settings.presence.always")}</option>
                   <option value="follow-codex">{t("settings.presence.followCodex")}</option>
@@ -203,7 +490,7 @@ export function SettingsPage({ target, health, presence, chatgptSession, api, th
               </div>
             </div>
             <div className="settings-actions">
-              <Button variant="secondary" disabled={!api} onClick={() => api && void runAction("Start router service", () => api.controlService("start"))}><Server aria-hidden size={14} strokeWidth={1.7} /> {t("settings.action.start")}</Button>
+              <Button variant="secondary" disabled={!api} onClick={() => api && void runAction(t("app.action.startService"), () => api.controlService("start"))}><Server aria-hidden size={14} strokeWidth={1.7} /> {t("settings.action.start")}</Button>
             </div>
           </section>
 
@@ -214,11 +501,11 @@ export function SettingsPage({ target, health, presence, chatgptSession, api, th
                 <div className="settings-list">
                   <div className="setting-row">
                     <div><strong>{t("settings.context.enable.title")}</strong><small>{t("settings.context.enable.detail")}</small></div>
-                    <Toggle checked={toolResultAgingEnabled} disabled={!api || agingLocked} label={t("settings.context.enable.title")} onChange={(enabled) => api && void optimisticToggles.mutate("tool-result-aging", enabled, "Change tool result compaction", () => api.setToolResultAging(enabled))} />
+                    <Toggle checked={toolResultAgingEnabled} disabled={!api || agingLocked} label={t("settings.context.enable.title")} onChange={(enabled) => api && void optimisticToggles.mutate("tool-result-aging", enabled, t("app.action.changeTokenMaxxing"), () => api.setToolResultAging(enabled))} />
                   </div>
                   <div className="setting-row">
                     <div><strong>{t("settings.context.native.title")}</strong><small>{t("settings.context.native.detail")}</small></div>
-                    <Toggle checked={optimisticToggles.value("native-tool-result-aging", aging.nativeEnabled === true)} disabled={!api || agingLocked || !toolResultAgingEnabled} label={t("settings.context.native.title")} onChange={(enabled) => api && void optimisticToggles.mutate("native-tool-result-aging", enabled, "Change native tool result compaction", () => api.setNativeToolResultAging(enabled))} />
+                    <Toggle checked={optimisticToggles.value("native-tool-result-aging", aging.nativeEnabled === true)} disabled={!api || agingLocked || !toolResultAgingEnabled} label={t("settings.context.native.title")} onChange={(enabled) => api && void optimisticToggles.mutate("native-tool-result-aging", enabled, t("app.action.changeNativeCompaction"), () => api.setNativeToolResultAging(enabled))} />
                   </div>
                   <div className="setting-row">
                     <div><strong>{t("settings.context.ttl.title")}</strong><small>{t("settings.context.ttl.detail")}</small></div>
@@ -229,7 +516,7 @@ export function SettingsPage({ target, health, presence, chatgptSession, api, th
                       onChange={(event) => {
                         const raw = event.target.value;
                         const days = raw === "default" ? "default" : Number(raw);
-                        if (api) void runAction("Change retention window", () => api.setToolResultRetentionTtl(days));
+                        if (api) void runAction(t("app.action.changeRetentionWindow"), () => api.setToolResultRetentionTtl(days));
                       }}
                     >
                       <option value="default">{t("settings.context.ttl.default", { days: RETENTION_DEFAULT_TTL_DAYS })}</option>
@@ -263,7 +550,7 @@ export function SettingsPage({ target, health, presence, chatgptSession, api, th
                 <div className="settings-list">
                   <div className="setting-row">
                     <div><strong>{t("settings.vision.enable.title")}</strong><small>{t("settings.vision.enable.detail")}</small></div>
-                    <Toggle checked={optimisticToggles.value("vision-bridge", bridge.enabled === true)} disabled={!api} label={t("settings.vision.enable.title")} onChange={(enabled) => api && void optimisticToggles.mutate("vision-bridge", enabled, "Change vision bridge", () => api.setVisionBridgeEnabled(enabled))} />
+                    <Toggle checked={optimisticToggles.value("vision-bridge", bridge.enabled === true)} disabled={!api} label={t("settings.vision.enable.title")} onChange={(enabled) => api && void optimisticToggles.mutate("vision-bridge", enabled, t("app.action.changeVisionBridge"), () => api.setVisionBridgeEnabled(enabled))} />
                   </div>
                   <div className="setting-row">
                     <div><strong>{t("settings.vision.engine.title")}</strong><small>{t("settings.vision.engine.detail")}</small></div>
@@ -271,7 +558,7 @@ export function SettingsPage({ target, health, presence, chatgptSession, api, th
                       aria-label={t("settings.vision.engine.title")}
                       value={selectedEngine}
                       disabled={!api}
-                      onChange={(event) => api && void runAction("Change vision engine", () => api.setVisionBridgeEngine(event.target.value))}
+                      onChange={(event) => api && void runAction(t("app.action.changeVisionEngine"), () => api.setVisionBridgeEngine(event.target.value))}
                     >
                       {/* No standing "Auto" choice, matching the tray: the ranking behind it
                           scored cost by slug spelling, so it tied across a normal install and
@@ -298,10 +585,10 @@ export function SettingsPage({ target, health, presence, chatgptSession, api, th
                       aria-label={t("settings.vision.effort.title")}
                       value={selectedEffort}
                       disabled={!api || !effortOptions.length}
-                      onChange={(event) => api && void runAction("Change vision effort", () => api.setVisionBridgeEffort(event.target.value))}
+                      onChange={(event) => api && void runAction(t("app.action.changeVisionEffort"), () => api.setVisionBridgeEffort(event.target.value))}
                     >
                       <option value="default">{t("settings.vision.effort.default")}</option>
-                      {effortOptions.map((effort) => <option key={effort} value={effort}>{effort}</option>)}
+                      {effortOptions.map((effort) => <option key={effort} value={effort}>{effortLabel(effort, t)}</option>)}
                     </select>
                   </div>
                 </div>
@@ -320,8 +607,8 @@ export function SettingsPage({ target, health, presence, chatgptSession, api, th
               <div><strong>{t("settings.desktop.tray.title")}</strong><small>{t("settings.desktop.tray.detail")}</small></div>
             </div>
             <div className="settings-actions">
-              <Button variant="secondary" disabled={!api || trayControlsUnavailable} onClick={() => api && void runAction("Enable desktop tray", () => api.controlTray("enable"))}>{t("settings.desktop.enable")}</Button>
-              <Button variant="secondary" disabled={!api || trayControlsUnavailable} onClick={() => api && void runAction("Restart desktop tray", () => api.controlTray("restart"))}>{t("settings.desktop.restart")}</Button>
+              <Button variant="secondary" disabled={!api || trayControlsUnavailable} onClick={() => api && void runAction(t("app.action.enableTray"), () => api.controlTray("enable"))}>{t("settings.desktop.enable")}</Button>
+              <Button variant="secondary" disabled={!api || trayControlsUnavailable} onClick={() => api && void runAction(t("app.action.restartTray"), () => api.controlTray("restart"))}>{t("settings.desktop.restart")}</Button>
               <Button variant="ghost" disabled={!api || trayControlsUnavailable} onClick={() => setConfirmTrayDisable(true)}>{t("settings.desktop.disable")}</Button>
             </div>
             {trayControlsUnavailable ? (
@@ -373,7 +660,7 @@ export function SettingsPage({ target, health, presence, chatgptSession, api, th
                     own remedy is the whole point of showing the report -- a
                     bare "it failed" would send the user back to the terminal
                     the button exists to replace. */}
-                {repairFailures.map((check) => `${check.name}: ${check.detail || ""}${check.fix ? ` — ${check.fix}` : ""}`).join(" · ")}
+                {repairFailures.map((check) => `${backendText(check.name, t)}: ${backendText(check.detail, t)}${check.fix ? ` — ${backendText(check.fix, t)}` : ""}`).join(" · ")}
               </InlineNotice>
             ) : null}
             <InlineNotice tone="neutral" title={t("settings.maintenance.update")}>
@@ -421,8 +708,24 @@ export function SettingsPage({ target, health, presence, chatgptSession, api, th
           <Button variant="secondary" onClick={() => setConfirmTrayDisable(false)}>{t("settings.desktop.confirm.cancel")}</Button>
           <Button variant="danger" disabled={trayControlsUnavailable} onClick={() => {
             setConfirmTrayDisable(false);
-            if (api) void runAction("Disable desktop tray", () => api.controlTray("disable"));
+            if (api) void runAction(t("app.action.disableTray"), () => api.controlTray("disable"));
           }}>{t("settings.desktop.disable")}</Button>
+        </div>
+      </Dialog>
+
+      <Dialog
+        open={Boolean(removeAccountId)}
+        title={t("settings.accounts.removeTitle")}
+        description={t("settings.accounts.removeDescription")}
+        onClose={() => setRemoveAccountId(null)}
+      >
+        <p className="dialog-copy">{t("settings.accounts.removeBody")}</p>
+        <div className="dialog-actions">
+          <Button variant="secondary" onClick={() => setRemoveAccountId(null)}>{t("settings.accounts.removeCancel")}</Button>
+          <Button variant="danger" disabled={!api || !removeAccountId || loginPendingId === removeAccountId} onClick={() => {
+            const id = removeAccountId;
+            if (id) void removeSubscriptionAccount(id);
+          }}>{t("settings.accounts.removeConfirm")}</Button>
         </div>
       </Dialog>
     </>

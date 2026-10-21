@@ -2,7 +2,9 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 
 import { writePrivateJson } from "./file-security.mjs";
+import { curatedModelDisplayName } from "./opencode-curation.mjs";
 import { STATE_DIR } from "./paths.mjs";
+import { VERTEX_ADAPTERS } from "./vertex-adapters.mjs";
 
 // User-curated models live outside the checked-in config/ registry tree so a checkout update
 // never discards them. Entries carry the same shape as registry models;
@@ -49,10 +51,12 @@ export function hasDefaultUserModelReasoning(entry) {
   );
 }
 
-// Curation may adjust presentation, sizing, and effort metadata only;
-// identity and routing fields always come from the provider id and the
+// Curation may adjust presentation, sizing, effort and explicit compatibility
+// metadata; identity and routing fields always come from the provider id and the
 // discovered model id.
 const METADATA_FIELDS = new Set([
+  "repetitionGuard",
+  "displayName",
   "description",
   "contextWindow",
   "autoCompact",
@@ -60,13 +64,17 @@ const METADATA_FIELDS = new Set([
   "reasoningLevels",
   "defaultEffort",
   "serviceTiers",
+  "supportsSearchHistory",
   "supportsReasoningSummaries",
   "defaultReasoningSummary",
   "availabilityNux",
   "upgradeTo",
   "requiresTrailingUserTurn",
+  "goalContinuationGuard",
   "isFree",
+  "toolSchemaRecursion",
   "supportedEndpoints",
+  "reasoningTagPolicy",
 ]);
 
 // Some providers deliberately publish opaque preview ids while documenting a
@@ -77,7 +85,10 @@ const OFFICIAL_MODEL_DISPLAY_NAMES = new Map([
 ]);
 
 export function officialModelDisplayName(providerId, upstreamId) {
-  return OFFICIAL_MODEL_DISPLAY_NAMES.get(`${providerId}/${upstreamId}`);
+  return (
+    OFFICIAL_MODEL_DISPLAY_NAMES.get(`${providerId}/${upstreamId}`) ||
+    curatedModelDisplayName(providerId, upstreamId)
+  );
 }
 
 function gatewaySafe(value) {
@@ -117,7 +128,7 @@ export function defaultUserModelDescription(providerId) {
   return `User-curated ${providerId} model; conservative default metadata that can be edited in the user model file.`;
 }
 
-export function userModelEntry({ providerId, upstreamId, requestProfile, priority, metadata }) {
+export function userModelEntry({ providerId, upstreamId, requestProfile, reasoningTagPolicy, priority, metadata }) {
   const identity = userModelIdentity({ providerId, upstreamId, metadata });
   const entry = {
     ...identity,
@@ -136,13 +147,49 @@ export function userModelEntry({ providerId, upstreamId, requestProfile, priorit
     if (METADATA_FIELDS.has(key)) entry[key] = value;
   }
   if (requestProfile) entry.requestProfile = requestProfile;
+  if (reasoningTagPolicy !== undefined) entry.reasoningTagPolicy = reasoningTagPolicy;
   return entry;
+}
+
+// Vertex curation is different from an ordinary OpenAI-compatible catalog:
+// the support catalog is the reviewed source of wire behavior and
+// presentation metadata. Copy only that verified record so an interactive
+// prompt cannot turn an arbitrary Model Garden id into a routable adapter.
+export function userModelEntryFromCatalog({
+  providerId,
+  catalogModel,
+}) {
+  if (
+    providerId !== "vertex" ||
+    !catalogModel ||
+    typeof catalogModel !== "object" ||
+    !Object.hasOwn(VERTEX_ADAPTERS, catalogModel.adapter)
+  ) {
+    throw new Error("Vertex curation requires a model from the verified support catalog.");
+  }
+  const entry = userModelEntry({
+    providerId,
+    upstreamId: catalogModel.id,
+    requestProfile: catalogModel.requestProfile || VERTEX_ADAPTERS[catalogModel.adapter].requestProfile,
+    reasoningTagPolicy: catalogModel.reasoningTagPolicy,
+    priority: catalogModel.priority,
+    metadata: catalogModel.capabilities,
+  });
+  return {
+    ...entry,
+    adapter: catalogModel.adapter,
+    displayName: catalogModel.displayName,
+    description: catalogModel.description,
+    ...(catalogModel.publisher ? { vertexPublisher: catalogModel.publisher } : {}),
+  };
 }
 
 export function readUserModels() {
   if (!existsSync(USER_MODELS_PATH)) return [];
   try {
-    const payload = JSON.parse(readFileSync(USER_MODELS_PATH, "utf8"));
+    // A leading UTF-8 BOM (Windows editors add one) would otherwise fail the
+    // parse and silently drop every curated model (#887).
+    const payload = JSON.parse(readFileSync(USER_MODELS_PATH, "utf8").replace(/^﻿/, ""));
     return Array.isArray(payload?.models) ? payload.models : [];
   } catch {
     return [];

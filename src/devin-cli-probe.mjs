@@ -216,7 +216,7 @@ async function runFreeStage(report, provider, args, fetchImpl) {
 
   let response;
   try {
-    response = await fetchImpl(requestUrl(baseUrl, proto.SERVICE_PATH, proto.GET_CASCADE_MODEL_CONFIGS), {
+    response = await fetchImpl(requestUrl(baseUrl, proto.SERVICE_PATH, proto.GET_CLI_MODEL_CONFIGS), {
       method: "POST",
       headers: {
         "content-type": "application/proto",
@@ -224,8 +224,14 @@ async function runFreeStage(report, provider, args, fetchImpl) {
         "connect-accept-encoding": "identity",
         authorization: connect.connectAuthorization(session.apiKey),
       },
-      body: wire.encodeMessage(proto.GET_CASCADE_MODEL_CONFIGS_REQUEST, {
-        metadata: { apiKey: session.apiKey, ideName: "windsurf", locale: "en" },
+      body: wire.encodeMessage(proto.GET_CLI_MODEL_CONFIGS_REQUEST, {
+        metadata: {
+          apiKey: session.apiKey,
+          ideName: "chisel",
+          ideVersion: "0.0.0-dev",
+          extensionVersion: "0.0.0-dev",
+          locale: "en",
+        },
       }),
     });
   } catch (error) {
@@ -245,16 +251,25 @@ async function runFreeStage(report, provider, args, fetchImpl) {
         failure.httpStatus === 401
           ? "Run `devin auth login` again, or the Basic `<token>-<token>` authorization scheme this build sends is wrong."
           : failure.code === "unimplemented"
-            ? "`unimplemented` means the service path or method name is wrong, not that the account is at fault."
-            : "Paste the observed line; the connect-code names which assumption broke.",
+            ? `\`unimplemented\` means the service path or method name is wrong, not that the account is at fault. This build asks for ${proto.GET_CLI_MODEL_CONFIGS}; read the method the installed CLI calls out of its own client before changing it.`
+            : failure.code === "invalid_argument"
+              // Issue #770: a CLI account was answered `invalid_argument` --
+              // not `unimplemented` -- by the IDE's `GetCascadeModelConfigs`
+              // after Devin moved its CLI to `GetCliModelConfigs`. The request
+              // shape check above already passed in that report, so a refusal
+              // here with an intact encoding points at the method rather than
+              // at the bytes, and that is worth saying once rather than
+              // leaving the reader to infer it.
+              ? `\`invalid_argument\` with the request-shape check above passing points at the method or its entitlement, not at the encoding. This build asks for ${proto.GET_CLI_MODEL_CONFIGS}; confirm that is still the method the installed CLI calls.`
+              : "Paste the observed line; the connect-code names which assumption broke.",
       ),
     );
     return undefined;
   }
 
   const bytes = new Uint8Array(await response.arrayBuffer());
-  const audit = auditMessage(bytes, proto.GET_CASCADE_MODEL_CONFIGS_RESPONSE);
-  const decoded = wire.decodeMessage(proto.GET_CASCADE_MODEL_CONFIGS_RESPONSE, bytes);
+  const audit = auditMessage(bytes, proto.GET_CLI_MODEL_CONFIGS_RESPONSE);
+  const decoded = wire.decodeMessage(proto.GET_CLI_MODEL_CONFIGS_RESPONSE, bytes);
   const models = (decoded.clientModelConfigs || [])
     .filter((config) => !config.disabled)
     .map((config) => ({
@@ -363,6 +378,7 @@ async function runLiveStage(report, provider, args, context, fetchImpl) {
   let terminator;
   let text = "";
   let thinking = "";
+  const toolCallStream = new turn.ToolCallStream();
   const toolCalls = [];
   let stopReason;
   let usage;
@@ -384,7 +400,15 @@ async function runLiveStage(report, provider, args, context, fetchImpl) {
         const decoded = wire.decodeMessage(proto.GET_CHAT_MESSAGE_RESPONSE, frame.payload);
         if (decoded.deltaText) text += decoded.deltaText;
         if (decoded.deltaThinking) thinking += decoded.deltaThinking;
-        for (const call of decoded.deltaToolCalls || []) toolCalls.push(call);
+        for (const call of decoded.deltaToolCalls || []) {
+          if (!call.name && !call.argumentsJson) continue;
+          const { index, entry } = toolCallStream.accept(call);
+          toolCalls[index] = {
+            ...toolCalls[index], ...call,
+            id: toolCalls[index]?.id || call.id,
+            name: entry.function.name, argumentsJson: entry.function.arguments,
+          };
+        }
         if (decoded.stopReason !== undefined) stopReason = decoded.stopReason;
         if (decoded.usage) usage = provider.turn.usageFrom(decoded.usage);
         if (decoded.actualModelUid) actualModelUid = decoded.actualModelUid;

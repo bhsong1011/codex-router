@@ -11,6 +11,7 @@ import {
   buildNamespaceLookups,
   flattenNamespacedHistory,
   flattenNamespaceTools,
+  flattenToolSearchHistory,
   flattenToolChoice,
   rewriteNamespaceResponsePayload,
   toolSearchRelayAvailable,
@@ -330,7 +331,49 @@ test("Groq refuses when client plus referenced app definitions exceed the cap", 
   );
 });
 
-test("non-Groq providers preserve the normally expanded tool surface", () => {
+test("tool-search capable chat providers keep the client-deferred app surface", () => {
+  const client = largeClientSurface({ plainTools: 2, toolSearch: true });
+  const clientFlattened = flattenNamespaceTools(client);
+  const routed = chatProviderToolSurface(client, "zai-coding");
+
+  assert.equal(toolSearchRelayAvailable(routed.namespaces), true);
+  assert.deepEqual(routed.tools, clientFlattened.tools);
+  assert.equal(
+    routed.tools.some((tool) => tool.name === "codex_app__create_thread"),
+    false,
+  );
+  assert.equal(
+    routed.tools.some((tool) => tool.name === "plugin_management__uninstall_plugin"),
+    false,
+  );
+});
+
+test("tool-search capable chat providers add back only referenced deferred app tools", () => {
+  const client = largeClientSurface({ plainTools: 2, toolSearch: true });
+  const routed = chatProviderToolSurface(client, "zai-coding", {
+    input: [{
+      type: "function_call",
+      namespace: "codex_app",
+      name: "create_thread",
+      call_id: "history-thread",
+      arguments: "{}",
+    }],
+    toolChoice: {
+      type: "function",
+      namespace: "codex_app",
+      name: "send_message_to_thread",
+    },
+  });
+  const names = new Set(routed.tools.map((tool) => tool.name));
+
+  assert.equal(toolSearchRelayAvailable(routed.namespaces), true);
+  assert.equal(names.has("codex_app__create_thread"), true);
+  assert.equal(names.has("codex_app__send_message_to_thread"), true);
+  assert.equal(names.has("codex_app__automation_update"), false);
+  assert.equal(names.has("plugin_management__uninstall_plugin"), false);
+});
+
+test("non-Groq providers without tool search preserve the normally expanded tool surface", () => {
   const client = largeClientSurface();
   const expected = flattenNamespaceTools(mergeCodexAppTools(client).tools);
   const routed = chatProviderToolSurface(client, "openrouter");
@@ -342,4 +385,589 @@ test("non-Groq providers preserve the normally expanded tool surface", () => {
   );
   assert.deepEqual(routed.tools, expected.tools);
   assert.deepEqual([...routed.namespaces], [...expected.namespaces]);
+});
+
+// Issue #626: Command Code answers `HTTP 400: \`name\` must be at most 64
+// characters, got 80` before generation, so the exact reported tool has to
+// reach the provider under a bounded alias and come back as its client
+// identity. The tool below is the 80-character name from that report.
+const COMMAND_CODE_LONG_TOOL =
+  "mcp__openai_api_key_local_confirmation__confirm_openai_api_key_local_destination";
+
+function commandCodeSurface() {
+  return [
+    {
+      type: "function",
+      name: COMMAND_CODE_LONG_TOOL,
+      parameters: { type: "object" },
+    },
+    { type: "namespace", name: "codex_app", tools: [{ type: "function", name: "create_thread" }] },
+  ];
+}
+
+for (const [providerId, upstreamModel] of [
+  ["commandcode"],
+  ["commandcode-messages"],
+  ["openrouter", "meta/muse-spark-1.3-contributor"],
+]) {
+  test(`${providerId} bounds provider-facing tool names to 64 characters`, () => {
+    assert.equal(COMMAND_CODE_LONG_TOOL.length, 80, "regression fixture reproduces issue #626");
+    const routed = chatProviderToolSurface(commandCodeSurface(), providerId, { upstreamModel });
+    const names = routed.tools.map((tool) => tool.name);
+    for (const name of names) {
+      assert.ok(
+        name.length <= 64,
+        `${name} is ${name.length} characters, which the upstream rejects`,
+      );
+    }
+    const alias = names.find((name) => name !== "codex_app__create_thread");
+    assert.ok(alias, "the long client tool must still be offered");
+    assert.notEqual(alias, COMMAND_CODE_LONG_TOOL, "the alias must differ from the client name");
+
+    // The alias is only safe because it is reversible: a call the model makes
+    // under the bounded spelling has to come back as the client's own tool.
+    const restored = rewriteNamespaceResponsePayload(
+      {
+        output: [
+          { type: "function_call", name: alias, arguments: "{}" },
+        ],
+      },
+      buildNamespaceLookups(routed.namespaces),
+    );
+    assert.equal(restored.output[0].name, COMMAND_CODE_LONG_TOOL);
+  });
+
+  test(`${providerId} keeps the bounded alias deterministic across identical surfaces`, () => {
+    const first = chatProviderToolSurface(commandCodeSurface(), providerId, { upstreamModel });
+    const second = chatProviderToolSurface(commandCodeSurface(), providerId, { upstreamModel });
+    assert.deepEqual(
+      first.tools.map((tool) => tool.name),
+      second.tools.map((tool) => tool.name),
+    );
+  });
+}
+
+test("every chat provider aliases a plain flattened spelling away from its app identity", () => {
+  // The same shape the Groq case above covers, on the providers that reach the
+  // other branch. Codex injects its app tools as a `codex_app` namespace and
+  // also sends the flattened spelling, so the two identities collide on the
+  // wire. Without deterministic aliases the tool list carries one name twice,
+  // the client's own `codex_app__create_thread` is unreachable for the turn,
+  // and the past call it made is restored under the namespaced identity Codex
+  // dispatches somewhere else.
+  const client = [
+    { type: "function", name: "shell", parameters: { type: "object" } },
+    { type: "function", name: "codex_app__create_thread", parameters: { type: "object" } },
+  ];
+  const input = [
+    { type: "function_call", name: "codex_app__create_thread", call_id: "plain" },
+    { type: "function_call", namespace: "codex_app", name: "create_thread", call_id: "app" },
+  ];
+  for (const providerId of ["deepseek", "openrouter", "zai", "moonshot"]) {
+    const routed = chatProviderToolSurface(client, providerId, { input });
+    const names = routed.tools
+      .filter((tool) => tool?.type === "function")
+      .map((tool) => tool.name);
+    assert.equal(
+      new Set(names).size,
+      names.length,
+      `${providerId} sent one tool name twice: ${names.join(", ")}`,
+    );
+
+    const history = flattenNamespacedHistory(input, routed.namespaces);
+    assert.notEqual(history[0].name, history[1].name, providerId);
+
+    const restored = rewriteNamespaceResponsePayload({
+      output: [
+        { type: "function_call", name: history[0].name, call_id: "plain", arguments: "{}" },
+        { type: "function_call", name: history[1].name, call_id: "app", arguments: "{}" },
+      ],
+    }, buildNamespaceLookups(routed.namespaces));
+    assert.deepEqual(restored.output[0], {
+      type: "function_call",
+      name: "codex_app__create_thread",
+      call_id: "plain",
+      arguments: "{}",
+    }, providerId);
+    assert.deepEqual(restored.output[1], {
+      type: "function_call",
+      name: "create_thread",
+      namespace: "codex_app",
+      call_id: "app",
+      arguments: "{}",
+    }, providerId);
+  }
+});
+
+test("a live top-level schema wins over a discovered one on every chat route", () => {
+  // `flattenToolSearchHistory` states the rule: live top-level schemas win on
+  // a name collision. It compared provider-facing names, so on a route that
+  // aliases collisions the discovered tool was handed a different name, stopped
+  // colliding, and the stale schema was declared beside the live one -- two
+  // definitions of one tool, the wrong one first.
+  const tools = [
+    clientToolSearch(),
+    { type: "function", name: "shell", parameters: { type: "object", properties: {} } },
+    {
+      type: "function",
+      name: "mcp__calendar__create_event",
+      description: "Current live schema.",
+      parameters: { type: "object", properties: { live: { type: "boolean" } } },
+    },
+  ];
+  const input = [
+    { type: "tool_search_call", call_id: "s1", execution: "client", arguments: { query: "calendar" } },
+    {
+      type: "tool_search_output",
+      call_id: "s1",
+      status: "completed",
+      execution: "client",
+      tools: [{
+        type: "namespace",
+        name: "mcp__calendar",
+        description: "Calendar tools.",
+        tools: [
+          { type: "function", name: "create_event", parameters: { type: "object", properties: { stale: { type: "string" } } } },
+          { type: "function", name: "delete_event", parameters: { type: "object", properties: { id: { type: "string" } } } },
+        ],
+      }],
+    },
+  ];
+  for (const providerId of ["groq", "commandcode", "deepseek", "openrouter"]) {
+    const routed = chatProviderToolSurface(tools, providerId, { input });
+    const flattened = flattenToolSearchHistory(input, routed.tools, routed.namespaces, {
+      maxTools: 128,
+    });
+    const calendarTools = flattened.tools
+      .filter((tool) => tool?.type === "function" && tool.name.startsWith("mcp__calendar"))
+      .map((tool) => tool.name);
+    assert.deepEqual(
+      calendarTools,
+      ["mcp__calendar__create_event", "mcp__calendar__delete_event"],
+      `${providerId} redeclared the discovered schema beside the live one`,
+    );
+    const searchOutput = flattened.input.find(
+      (item) => item?.type === "function_call_output" && item.call_id === "s1",
+    );
+    assert.deepEqual(
+      JSON.parse(searchOutput.output).tools.map((tool) => tool.name),
+      ["mcp__calendar__delete_event"],
+      providerId,
+    );
+  }
+});
+
+test("collision aliases are the same on a bounded and an unbounded provider", () => {
+  // The alias is derived from the native identity, not the route, so an
+  // operator comparing two providers sees one answer.
+  const client = [
+    { type: "function", name: "codex_app__create_thread", parameters: { type: "object" } },
+  ];
+  const bounded = chatProviderToolSurface(client, "commandcode").tools.map((tool) => tool.name);
+  const unbounded = chatProviderToolSurface(client, "deepseek").tools.map((tool) => tool.name);
+  assert.deepEqual(unbounded, bounded);
+});
+
+for (const [providerId, upstreamModel] of [
+  ["openrouter"],
+  ["openrouter", "meta/muse-spark-1.3"],
+  ["openrouter", "meta/muse-spark-1.2-contributor"],
+  ["nousresearch", "meta/muse-spark-1.3-contributor"],
+]) {
+  test(`${providerId}/${upstreamModel} keeps the unbounded 80-character name`, () => {
+    const routed = chatProviderToolSurface(commandCodeSurface(), providerId, { upstreamModel });
+    assert.ok(
+      routed.tools.some((tool) => tool.name === COMMAND_CODE_LONG_TOOL),
+      "unaffected routes retain their original names",
+    );
+  });
+}
+
+// A fresh routed turn ships the whole deferred connector registry. The unit
+// behaviour lives in test/namespace-relay.test.mjs; this guards the request
+// path, where `mergeCodexAppTools` could otherwise hand the deferred surface
+// back to the provider after the relay dropped it.
+function deferredConnectorSurface() {
+  const connector = (namespace, name) => ({
+    type: "function",
+    name,
+    defer_loading: true,
+    description: `Call the ${namespace} connector.`,
+    parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
+  });
+  return [
+    { type: "function", name: "shell", parameters: { type: "object", properties: {} } },
+    clientToolSearch(),
+    {
+      // When the router supplies its own app snapshot, known definitions are
+      // eager. A client search relay instead owns discovery of these deferred
+      // client registrations.
+      type: "namespace",
+      name: "codex_app",
+      defer_loading: true,
+      tools: [
+        { type: "function", name: "navigate_to_codex_page", defer_loading: true },
+        connector("codex_app", "read_connector_page"),
+      ],
+    },
+    {
+      type: "namespace",
+      name: "mcp__codex_apps__notion",
+      tools: [connector("notion", "search"), connector("notion", "fetch")],
+    },
+    {
+      type: "namespace",
+      name: "mcp__codex_apps__slack",
+      defer_loading: true,
+      tools: [{ type: "function", name: "post_message" }],
+    },
+  ];
+}
+
+test("a chat route omits deferred connector tools behind the bridged search relay", () => {
+  const routed = chatProviderToolSurface(deferredConnectorSurface(), "deepseek");
+  const names = routed.tools.map((tool) => tool.name);
+  assert.ok(names.includes("shell"));
+  assert.ok(names.includes("tool_search"));
+  // A client search relay owns discovery on current routes. Unreferenced app
+  // snapshot definitions are not injected, and the client's deferred app
+  // registration remains hidden until a search or explicit reference needs it.
+  assert.ok(!names.includes("codex_app__navigate_to_codex_page"));
+  assert.ok(!names.includes("codex_app__automation_update"));
+  assert.ok(!names.includes("plugin_management__uninstall_plugin"));
+  // Everything else Codex registered with deferLoading stays out of the prompt.
+  assert.ok(!names.includes("codex_app__read_connector_page"));
+  assert.ok(!names.some((name) => name.startsWith("mcp__codex_apps__")));
+  assert.ok(
+    routed.tools.every((tool) => !("defer_loading" in tool)),
+    "the registration flag never reaches a provider",
+  );
+});
+
+test("a chat route sends non-connector deferred tools when no search relay is bridged", () => {
+  withConnectorAllowList("none", () => {
+    const withoutSearch = deferredConnectorSurface().filter((tool) => tool.type !== "tool_search");
+    const routed = chatProviderToolSurface(withoutSearch, "deepseek");
+    const names = routed.tools.map((tool) => tool.name);
+    // Without a client search relay, the router supplies its eager snapshot.
+    // Client registrations for known app tools retain their schemas while
+    // their deferral flags are removed by the snapshot merge.
+    assert.ok(names.includes("codex_app__navigate_to_codex_page"));
+    assert.ok(names.includes("codex_app__automation_update"));
+    assert.ok(names.includes("plugin_management__uninstall_plugin"));
+    // A deferral marker outside the connector namespaces means nothing without
+    // a relay to serve the search, so that definition is still sent.
+    assert.ok(names.includes("codex_app__read_connector_page"));
+    // Connector withholding applies independently of a client search relay.
+    assert.ok(!names.includes("mcp__codex_apps__notion__search"));
+    assert.ok(!names.includes("mcp__codex_apps__slack__post_message"));
+    assert.ok(
+      routed.tools.every((tool) => !("defer_loading" in tool)),
+      "a sent definition never carries the registration flag either",
+    );
+  });
+});
+
+test("a chat route re-declares a deferred connector the transcript already called", () => {
+  const routed = chatProviderToolSurface(deferredConnectorSurface(), "deepseek", {
+    input: [
+      {
+        type: "function_call",
+        call_id: "call-1",
+        namespace: "mcp__codex_apps__notion",
+        name: "search",
+        arguments: '{"query":"roadmap"}',
+      },
+    ],
+  });
+  const withHistory = flattenToolSearchHistory(
+    [
+      {
+        type: "function_call",
+        call_id: "call-1",
+        namespace: "mcp__codex_apps__notion",
+        name: "search",
+        arguments: '{"query":"roadmap"}',
+      },
+    ],
+    routed.tools,
+    routed.namespaces,
+  );
+  const names = withHistory.tools.map((tool) => tool.name);
+  assert.ok(names.includes("mcp__codex_apps__notion__search"));
+  assert.ok(!names.includes("mcp__codex_apps__notion__fetch"));
+  assert.ok(withHistory.tools.every((tool) => !("defer_loading" in tool)));
+});
+
+// A synthetic scale fixture using namespace counts and approximate sizes
+// reported with the incoming PR. Child names and schemas are generated below;
+// it proves selection and serialized-size reduction for this fixture, not a
+// live Codex capture, token accounting or provider billing. It deliberately has
+// no deferral markers or search control, and children use `inputSchema`.
+const REAL_TURN_NAMESPACES = [
+  ["collaboration", 6, 9],
+  ["mcp__codex_app", 31, 31],
+  ["mcp__cua_repl", 2, 3],
+  ["mcp__node_repl", 3, 4],
+  ["mcp__openai_artifact_template_picker", 2, 3],
+  ["image_gen", 1, 2],
+  ["mcp__codex_apps__airtable", 47, 105],
+  ["mcp__codex_apps__apify", 22, 39],
+  ["mcp__codex_apps__canva", 33, 82],
+  ["mcp__codex_apps__codex_document_control", 3, 4],
+  ["mcp__codex_apps__figma", 38, 77],
+  ["mcp__codex_apps__github", 89, 75],
+  ["mcp__codex_apps__gmail", 21, 32],
+  ["mcp__codex_apps__google_calendar", 15, 18],
+  ["mcp__codex_apps__google_drive", 45, 69],
+  ["mcp__codex_apps__granola", 6, 8],
+  ["mcp__codex_apps__hotline", 1, 1],
+  ["mcp__codex_apps__linkedin", 1, 1],
+  ["mcp__codex_apps__notion", 36, 84],
+  ["mcp__codex_apps__plugin_management", 6, 10],
+  ["mcp__codex_apps__safety_settings", 5, 4],
+  ["mcp__codex_apps__sites", 23, 36],
+  ["mcp__codex_apps__slack", 38, 71],
+  ["mcp__codex_apps__todoist__to_do_list___calendar", 47, 58],
+  ["mcp__codex_apps__vercel", 24, 26],
+];
+
+const CONNECTOR_PREFIX = "mcp__codex_apps__";
+
+function realTurnChildName(namespace, index) {
+  return `${namespace.replace(/^mcp__(codex_apps__)?/, "")}_op_${index}`;
+}
+
+function realTurnChild(namespace, index, padding) {
+  return {
+    type: "function",
+    name: realTurnChildName(namespace, index),
+    description: `Operation ${index} on ${namespace}. ${"d".repeat(padding)}`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Search text." },
+        limit: { type: "integer", description: "Maximum rows." },
+        cursor: { type: "string", description: "Opaque pagination cursor." },
+      },
+      required: ["query"],
+      additionalProperties: false,
+    },
+  };
+}
+
+function realTurnSurface() {
+  return [
+    ...Array.from({ length: 11 }, (_, index) => ({
+      type: "function",
+      name: `core_op_${index}`,
+      parameters: { type: "object", properties: {}, additionalProperties: false },
+    })),
+    { type: "custom", name: "apply_patch", description: "Apply a patch." },
+    { type: "web_search" },
+    ...REAL_TURN_NAMESPACES.map(realTurnNamespace),
+  ];
+}
+
+// Pad generated schemas to the fixture's target size. These bytes are an
+// illustrative workload; they are not measurements from a live provider turn.
+function realTurnNamespace([name, children, kilobytes]) {
+  const build = (padding) => ({
+    type: "namespace",
+    name,
+    tools: Array.from({ length: children }, (_, index) => realTurnChild(name, index, padding)),
+  });
+  const bare = JSON.stringify(build(0)).length;
+  return build(Math.max(0, Math.round((kilobytes * 1024 - bare) / children)));
+}
+
+function withConnectorAllowList(value, run) {
+  const previous = process.env.CODEX_ROUTER_APP_CONNECTORS;
+  if (value === undefined) delete process.env.CODEX_ROUTER_APP_CONNECTORS;
+  else process.env.CODEX_ROUTER_APP_CONNECTORS = value;
+  try {
+    return run();
+  } finally {
+    if (previous === undefined) delete process.env.CODEX_ROUTER_APP_CONNECTORS;
+    else process.env.CODEX_ROUTER_APP_CONNECTORS = previous;
+  }
+}
+
+function eagerConnectorNamespaces(tools) {
+  return REAL_TURN_NAMESPACES.map(([name]) => name)
+    .filter((name) => name.startsWith(CONNECTOR_PREFIX))
+    .filter((name) => tools.some((tool) => tool.name?.startsWith(`${name}__`)));
+}
+
+test("a fresh routed turn keeps every app connector eager by default", () => {
+  const routed = withConnectorAllowList(undefined, () =>
+    chatProviderToolSurface(realTurnSurface(), "opencode-go"),
+  );
+  const optedOut = withConnectorAllowList("all", () =>
+    chatProviderToolSurface(realTurnSurface(), "opencode-go"),
+  );
+  // Withholding is opt-in: an unset variable must reach the provider with the
+  // same surface the router sent before the feature existed, which is the one
+  // `all` asks for explicitly.
+  assert.equal(routed.tools.length, optedOut.tools.length);
+  assert.deepEqual(
+    JSON.stringify(routed.tools).length,
+    JSON.stringify(optedOut.tools).length,
+  );
+  assert.equal(routed.tools.length, 576);
+  assert.deepEqual(
+    eagerConnectorNamespaces(routed.tools),
+    REAL_TURN_NAMESPACES.map(([name]) => name).filter((name) =>
+      name.startsWith(CONNECTOR_PREFIX),
+    ),
+  );
+});
+
+test("the connector allow-list value none withholds every connector", () => {
+  const eager = withConnectorAllowList("all", () =>
+    chatProviderToolSurface(realTurnSurface(), "opencode-go"),
+  );
+  const routed = withConnectorAllowList("none", () =>
+    chatProviderToolSurface(realTurnSurface(), "opencode-go"),
+  );
+  const eagerBytes = JSON.stringify(eager.tools).length;
+  const routedBytes = JSON.stringify(routed.tools).length;
+  // This deterministic fixture expands to 576 tools and over 900 KiB.
+  assert.equal(eager.tools.length, 576);
+  assert.ok(eagerBytes > 900 * 1024, `${eagerBytes} bytes eager`);
+  // What is left is the client's non-connector namespaces plus the app
+  // snapshot the router injects itself (~53 KB of the total, half of it the
+  // `inputSchema` copy `flattenNamespaceChild` keeps beside `parameters`).
+  // Both are required eager, so the floor sits above the 100 KB the connector
+  // removal alone would suggest.
+  assert.ok(routedBytes < 128 * 1024, `${routedBytes} bytes routed`);
+  assert.ok(routedBytes * 8 < eagerBytes, `${routedBytes} of ${eagerBytes} bytes`);
+  const names = routed.tools.map((tool) => tool.name);
+  assert.deepEqual(eagerConnectorNamespaces(routed.tools), []);
+  // The app's own toolset, the collaboration runtime, the repls, the template
+  // picker, image_gen and every plain tool are still declared in full.
+  assert.equal(
+    names.filter((name) => name?.startsWith("mcp__codex_app__")).length,
+    31,
+  );
+  assert.equal(names.filter((name) => name?.startsWith("collaboration__")).length, 6);
+  assert.ok(names.includes("mcp__node_repl__node_repl_op_0"));
+  assert.ok(names.includes("image_gen__image_gen_op_0"));
+  assert.ok(names.includes("mcp__openai_artifact_template_picker__openai_artifact_template_picker_op_0"));
+  assert.ok(names.includes("codex_app__automation_update"));
+  assert.ok(names.includes("core_op_0"));
+  assert.ok(routed.tools.some((tool) => tool?.type === "custom"));
+  assert.ok(routed.tools.some((tool) => tool?.type === "web_search"));
+});
+
+test("the connector allow-list keeps exactly the named connectors eager", () => {
+  const routed = withConnectorAllowList(" Airtable , gmail ", () =>
+    chatProviderToolSurface(realTurnSurface(), "opencode-go"),
+  );
+  assert.deepEqual(eagerConnectorNamespaces(routed.tools), [
+    "mcp__codex_apps__airtable",
+    "mcp__codex_apps__gmail",
+  ]);
+  const names = routed.tools.map((tool) => tool.name);
+  assert.equal(
+    names.filter((name) => name?.startsWith("mcp__codex_apps__airtable__")).length,
+    47,
+  );
+  assert.equal(names.filter((name) => name?.startsWith("mcp__codex_apps__gmail__")).length, 21);
+});
+
+test("the connector allow-list value all restores the whole eager surface", () => {
+  const eager = withConnectorAllowList("all", () =>
+    chatProviderToolSurface(realTurnSurface(), "opencode-go"),
+  );
+  const declared = REAL_TURN_NAMESPACES.reduce((total, [, children]) => total + children, 0);
+  // 11 functions + custom + web_search + every namespace child + the injected
+  // codex_app (17) and plugin_management (1) app definitions.
+  assert.equal(eager.tools.length, declared + 13 + 18);
+  for (const [namespace, children] of REAL_TURN_NAMESPACES) {
+    assert.equal(
+      eager.tools.filter((tool) => tool.name?.startsWith(`${namespace}__`)).length,
+      children,
+      `${namespace} is declared in full`,
+    );
+  }
+});
+
+for (const [label, storedCall] of [
+  [
+    "the flattened wire name",
+    {
+      type: "function_call",
+      call_id: "call-airtable",
+      name: "mcp__codex_apps__airtable__airtable_op_3",
+      arguments: '{"query":"roadmap"}',
+    },
+  ],
+  [
+    "the namespaced form Codex dispatches by",
+    {
+      type: "function_call",
+      call_id: "call-airtable",
+      namespace: "mcp__codex_apps__airtable",
+      name: "airtable_op_3",
+      arguments: '{"query":"roadmap"}',
+    },
+  ],
+]) {
+  test(`a stored connector call under ${label} restores only that definition`, () => {
+    withConnectorAllowList("none", () => {
+      const input = [storedCall];
+      const routed = chatProviderToolSurface(realTurnSurface(), "opencode-go", { input });
+      // This turn carries no tool_search control, so the restore may not
+      // depend on a live relay.
+      assert.equal(toolSearchRelayAvailable(routed.namespaces), false);
+      const withHistory = flattenToolSearchHistory(input, routed.tools, routed.namespaces);
+      const names = withHistory.tools.map((tool) => tool.name);
+      assert.ok(names.includes("mcp__codex_apps__airtable__airtable_op_3"));
+      assert.equal(
+        names.filter((name) => name?.startsWith(CONNECTOR_PREFIX)).length,
+        1,
+        "every other connector tool stays withheld",
+      );
+      const renamed = flattenNamespacedHistory(withHistory.input, routed.namespaces);
+      assert.equal(renamed[0].name, "mcp__codex_apps__airtable__airtable_op_3");
+      assert.equal(renamed[0].namespace, undefined);
+      // Withholding a definition never unregisters its identity: the model's
+      // next call under the flat wire name still comes back as the namespaced
+      // one Codex dispatches.
+      const restored = rewriteNamespaceResponsePayload(
+        {
+          output: [
+            {
+              type: "function_call",
+              name: "mcp__codex_apps__airtable__airtable_op_3",
+              call_id: "call-airtable",
+              arguments: "{}",
+            },
+          ],
+        },
+        buildNamespaceLookups(routed.namespaces),
+      );
+      assert.deepEqual(restored.output[0], {
+        type: "function_call",
+        name: "airtable_op_3",
+        call_id: "call-airtable",
+        arguments: "{}",
+        namespace: "mcp__codex_apps__airtable",
+      });
+    });
+  });
+}
+
+test("a forced choice on a withheld connector tool restores its definition", () => {
+  withConnectorAllowList("none", () => {
+    const toolChoice = { type: "function", name: "mcp__codex_apps__slack__slack_op_1" };
+    const routed = chatProviderToolSurface(realTurnSurface(), "opencode-go", { toolChoice });
+    const withHistory = flattenToolSearchHistory([], routed.tools, routed.namespaces, {
+      toolChoice,
+    });
+    const names = withHistory.tools.map((tool) => tool.name);
+    assert.ok(names.includes("mcp__codex_apps__slack__slack_op_1"));
+    assert.equal(names.filter((name) => name?.startsWith(CONNECTOR_PREFIX)).length, 1);
+  });
 });

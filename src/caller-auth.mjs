@@ -1,4 +1,5 @@
 import { timingSafeEqual } from "node:crypto";
+import { CODEX_PATCH_HOOK_BASE_PATH } from "./codex-patch-hook-endpoint.mjs";
 
 export const CALLER_PATH_PREFIX = "/_codex-router";
 const MINIMUM_SECRET_LENGTH = 32;
@@ -37,6 +38,10 @@ export function callerBaseUrl(port, secret) {
   return `http://127.0.0.1:${port}${callerBasePath(secret)}`;
 }
 
+export function cursorCliBaseUrl(port, secret) {
+  return `http://127.0.0.1:${port}${CALLER_PATH_PREFIX}/${assertCallerSecret(secret)}`;
+}
+
 // The Gemini API leaf, behind the identical capability in the identical
 // position. Gemini CLI hands its base URL to @google/genai, which appends
 // `/v1beta/models/{model}:{method}` itself -- so the secret has to be a path
@@ -49,6 +54,18 @@ export function geminiBasePath(secret) {
 
 export function geminiBaseUrl(port, secret) {
   return `http://127.0.0.1:${port}${geminiBasePath(secret)}`;
+}
+
+// Claude Code appends `/v1/messages` and `/v1/models` to this gateway origin.
+// Keeping the capability ahead of the protocol leaf lets the router expose an
+// Anthropic-compatible surface without placing a reusable credential in query
+// parameters or changing the shared caller authority.
+export function claudeBasePath(secret) {
+  return `${CALLER_PATH_PREFIX}/${assertCallerSecret(secret)}/anthropic`;
+}
+
+export function claudeBaseUrl(port, secret) {
+  return `http://127.0.0.1:${port}${claudeBasePath(secret)}`;
 }
 
 // The companion's browser surface sits behind the same capability as the API,
@@ -130,6 +147,7 @@ export function configuredCallerBaseUrl(config, secret) {
 // with a bearer sent to the plain loopback Responses endpoint.
 export function isManagedCodexBaseUrl(value, port) {
   if (isManagedCallerBaseUrl(value, port)) return true;
+  if (isManagedLeafBaseUrl(value, port, CODEX_PATCH_HOOK_BASE_PATH.slice(1))) return true;
   if (typeof value !== "string" || !value) return false;
   try {
     const url = new URL(value);
@@ -139,7 +157,8 @@ export function isManagedCodexBaseUrl(value, port) {
       url.hostname === "127.0.0.1" &&
       (port === undefined || url.port === expectedPort) &&
       !url.username && !url.password && !url.search && !url.hash &&
-      /^\/v1\/?$/.test(url.pathname)
+      (url.pathname.replace(/\/$/, "") === "/v1" ||
+       url.pathname.replace(/\/$/, "") === CODEX_PATCH_HOOK_BASE_PATH)
     );
   } catch {
     return false;
@@ -155,6 +174,10 @@ export function isManagedGeminiBaseUrl(value, port) {
   return isManagedLeafBaseUrl(value, port, "gemini");
 }
 
+export function isManagedClaudeBaseUrl(value, port) {
+  return isManagedLeafBaseUrl(value, port, "anthropic");
+}
+
 // Every leaf the capability guards, not just `/v1`. Redaction is what keeps the
 // caller key out of support bundles, doctor output, and error messages, and it
 // matched only the API path -- so the panel URL, which carries the identical
@@ -163,7 +186,7 @@ export function isManagedGeminiBaseUrl(value, port) {
 export function redactCallerUrl(value) {
   if (typeof value !== "string") return value;
   return value.replace(
-    new RegExp(`(${CALLER_PATH_PREFIX}/)[A-Za-z0-9_-]+(?=/(?:v1|panel|gemini)(?:/|$|[^A-Za-z0-9_-]))`, "g"),
+    new RegExp(`(${CALLER_PATH_PREFIX}/)[A-Za-z0-9_-]+(?=/(?:v1|panel|gemini|anthropic)(?:/|$|[^A-Za-z0-9_-])|$)`, "g"),
     "$1[REDACTED]",
   );
 }

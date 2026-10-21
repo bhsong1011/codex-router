@@ -25,12 +25,21 @@ import { withServiceOperationLock } from "./service-operation-lock.mjs";
 import { runServiceCommandUnlocked } from "./service.mjs";
 import { CALLER_SECRET_PATH, PORTS } from "./paths.mjs";
 import { assertStateOwnership } from "./state-owner.mjs";
+import { ROUTED_HARNESS_IDS, routedHarnesses } from "./routed-harness-catalog.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const refreshCommand = Object.freeze({
   codex: ["src/config-manager.mjs", ["caller-capability-refresh"]],
   dsh: ["src/dsh-config-manager.mjs", ["caller-capability-refresh"]],
   gemini: ["src/gemini-config-manager.mjs", ["caller-capability-refresh"]],
+  openclaw: ["src/openclaw-config-manager.mjs", ["caller-capability-refresh"]],
+  // The caller secret is a path segment of every published base URL, so a
+  // rotation invalidates each of these documents at once. One publisher serves
+  // all five, addressed by harness id.
+  ...Object.fromEntries(ROUTED_HARNESS_IDS.map((id) => [
+    id,
+    ["src/routed-harness-manager.mjs", [id, "caller-capability-refresh"]],
+  ])),
 });
 
 function secretDigest(secret) {
@@ -41,7 +50,8 @@ function partialClient(label) {
   throw new Error(`Refusing caller capability rotation while ${label} has partial managed state; run its doctor/repair path first.`);
 }
 
-export function installedTargetsFromStatus({ codex = {}, dsh = {}, gemini = {} } = {}) {
+export function installedTargetsFromStatus(statuses = {}) {
+  const { codex = {}, dsh = {}, gemini = {}, openclaw = {} } = statuses;
   const targets = [];
   const codexStatePresent = codex.provider_mode_state_present === true || codex.signed_provider_state_present === true;
   const codexManagedArtifacts = codex.managed_router_artifacts_present === true;
@@ -76,6 +86,40 @@ export function installedTargetsFromStatus({ codex = {}, dsh = {}, gemini = {} }
     }
     targets.push("gemini");
   }
+
+  const openclawEvidence = openclaw.installed === true || openclaw.providerInstalled === true;
+  if (openclawEvidence) {
+    if (
+      openclaw.installed !== true ||
+      openclaw.providerInstalled !== true ||
+      openclaw.baseUrlManaged !== true ||
+      openclaw.configValid !== true ||
+      openclaw.configProtected !== true
+    ) {
+      partialClient("OpenClaw");
+    }
+    targets.push("openclaw");
+  }
+
+  // Each document-configured harness is published exactly when its marker is
+  // valid and its provider is live at a base URL this router issued. Anything
+  // in between is partial managed state, and rotating the capability across it
+  // would leave a client pointed at a URL that no longer authenticates with no
+  // record of how to put it back.
+  for (const harness of routedHarnesses()) {
+    const status = statuses[harness.id] || {};
+    const evidence = status.installed === true || status.providerInstalled === true;
+    if (!evidence) continue;
+    if (
+      status.installed !== true ||
+      status.providerInstalled !== true ||
+      status.baseUrlManaged !== true ||
+      status.configValid !== true
+    ) {
+      partialClient(harness.displayName);
+    }
+    targets.push(harness.id);
+  }
   return targets;
 }
 
@@ -104,6 +148,11 @@ export async function readManagedClientStatuses({ runNode = runNodeCommand } = {
     codex: parseJsonCommand("src/config-manager.mjs", ["status"], runNode),
     dsh: parseJsonCommand("src/dsh-config-manager.mjs", ["status"], runNode),
     gemini: parseJsonCommand("src/gemini-config-manager.mjs", ["status"], runNode),
+    openclaw: parseJsonCommand("src/openclaw-config-manager.mjs", ["status"], runNode),
+    ...Object.fromEntries(ROUTED_HARNESS_IDS.map((id) => [
+      id,
+      parseJsonCommand("src/routed-harness-manager.mjs", [id, "status"], runNode),
+    ])),
   };
 }
 

@@ -4,8 +4,9 @@ import path from "node:path";
 import { writePrivateJson } from "./file-security.mjs";
 import { STATE_DIR } from "./paths.mjs";
 import { upstreamFailureKind } from "./error-translation.mjs";
+import { isLocalToolArgumentConversionFailure } from "./invalid-function-call.mjs";
 import { PROVIDERS } from "./model-registry.mjs";
-import { canonicalProviderId } from "./provider-selection.mjs";
+import { cooldownScope } from "./provider-cooldown.mjs";
 import { hasProviderTransportError } from "./transport-failure.mjs";
 import {
   routedModelPreservesSearchContract,
@@ -81,12 +82,18 @@ function isoOrUndefined(value) {
 // request all produce the same answer from every other provider too, so a swap
 // would spend two more round trips to reprint the same failure with a different
 // model's name on it -- and for a credential in particular it would hide the one
-// fact the operator needs. A 5xx is excluded because upstream-retry.mjs already
-// absorbs the transient shapes and because masking a provider outage costs the
-// operator an incident they would want to see.
+// fact the operator needs. A generic 5xx is excluded because the routed turn
+// path retries only the forwarder's reserved pre-response transport marker;
+// masking any other provider outage costs the operator an incident they would
+// want to see.
 export function classifyRoutedFailure({ status, bodyText, retryAfterSeconds, now } = {}) {
   const code = Number(status);
   if (!Number.isFinite(code) || code < 400) return { swap: false };
+  // A LiteLLM Anthropic-conversion parse of stored tool arguments is a local
+  // request failure. The argument body is echoed in the error and can match a
+  // quota phrase, which would otherwise swap the turn onto another provider
+  // for a request that cannot succeed (#796).
+  if (isLocalToolArgumentConversionFailure(bodyText)) return { swap: false };
   // The local provider forwarder writes this reserved marker only before it
   // has committed a response. A generic provider 5xx remains an application
   // failure and is never switched away silently.
@@ -109,13 +116,17 @@ export function classifyRoutedFailure({ status, bodyText, retryAfterSeconds, now
     // is not a reason to invent a window: the turn still fails over, and the
     // next turn tries the operator's chosen model again, which is the honest
     // behaviour when nothing is known.
-    return {
-      swap: true,
-      reason: "out_of_usage",
-      ...(Number.isFinite(retryAfter) && retryAfter > 0
-        ? { until: cappedUntil(at, retryAfter * 1_000) }
-        : {}),
-    };
+    //
+    // Some do say, in the body rather than a header, and that sentence is the
+    // provider naming its own window exactly as `Retry-After` would. Reading it
+    // is what stops an exhausted plan from being re-attempted once per turn for
+    // the whole window -- observed as 225 quota refusals against one Z.ai
+    // Coding Plan window, each one a full round trip before the failover.
+    const until =
+      Number.isFinite(retryAfter) && retryAfter > 0
+        ? cappedUntil(at, retryAfter * 1_000)
+        : providerNamedResetUntil(bodyText, at);
+    return { swap: true, reason: "out_of_usage", ...(until ? { until } : {}) };
   }
 
   if (code === 429 && Number.isFinite(retryAfter) && retryAfter > MIN_RATE_LIMIT_COOLDOWN_SECONDS) {
@@ -129,7 +140,67 @@ function cappedUntil(at, durationMs) {
   return new Date(at + Math.min(durationMs, MAX_COOLDOWN_MS)).toISOString();
 }
 
+// Z.ai's Coding Plan refuses an exhausted window with code 1308 and the
+// sentence "Usage limit reached for 5 hour. Your limit will reset at
+// 2026-09-01 21:32:15", carrying no `Retry-After` at all. Narrow on purpose:
+// only a wall-clock stamp immediately after "reset at" counts, so prose that
+// merely mentions a reset never becomes a window.
+const PROVIDER_NAMED_RESET = /\breset(?:s)?\s+at\s+(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})/i;
+
+// Every real UTC offset, in minutes, including the quarter-hour ones. The
+// provider's stamp carries no zone, so this is the set of instants it could
+// possibly denote.
+const UTC_OFFSET_MINUTES = Object.freeze([
+  -720, -660, -600, -570, -540, -480, -420, -360, -300, -240, -210, -180, -120, -60, 0, 60, 120,
+  180, 210, 240, 270, 300, 330, 345, 360, 390, 420, 480, 525, 540, 570, 600, 630, 660, 720, 765,
+  780, 840,
+]);
+
+// Which instant a zoneless stamp names depends on a zone neither side states.
+// Reading it as this host's local time is right only when the operator's clock
+// happens to match the plan's, and wrong by up to a day for everyone else --
+// in the direction that stops the router dispatching to a model that is in fact
+// available again.
+//
+// The two errors are not symmetric. Waking early costs one extra refusal and
+// re-records the window. Waking late withholds a model the operator chose and
+// is paying for, for as long as the misreading runs. So take the *earliest*
+// instant the stamp could denote that has not already passed: the true reset is
+// always one of these candidates, so the window can never outlast it.
+//
+// This also makes the reading independent of the host's own timezone, which is
+// why these assertions hold wherever `TZ` is set.
+//
+// A stamp with no future candidate at all records nothing rather than a window
+// in the past. `cappedUntil` keeps the far side bounded by the same six hours
+// every other source is held to.
+function providerNamedResetUntil(bodyText, at) {
+  if (typeof bodyText !== "string") return undefined;
+  const match = PROVIDER_NAMED_RESET.exec(bodyText);
+  if (!match) return undefined;
+  const wallMs = Date.parse(`${match[1]}T${match[2]}Z`);
+  if (!Number.isFinite(wallMs)) return undefined;
+  let earliest;
+  for (const offsetMinutes of UTC_OFFSET_MINUTES) {
+    const instant = wallMs - offsetMinutes * 60_000;
+    if (instant <= at) continue;
+    if (earliest === undefined || instant < earliest) earliest = instant;
+  }
+  return earliest === undefined ? undefined : cappedUntil(at, earliest - at);
+}
+
 // -- how long an empty provider is believed ----------------------------------
+//
+// Windows are keyed by `cooldownScope`, not by the canonical provider id.
+// Protocol variants of one subscription do share an allowance -- opencode's
+// Messages and Responses variants are the same plan behind a different wire
+// format, so one being empty means all of them are. opencode Zen is not:
+// it shares a credential and a selection toggle with Go, and is billed
+// separately at its own endpoint. Keying its window under the canonical parent
+// made a closed Go plan withdraw a Zen route the operator can still pay for,
+// and an exhausted Zen balance withdraw the whole Go subscription -- in both
+// directions a paid route silently swapped away for a window the provider
+// never named for it.
 
 function readCooldownDocument() {
   if (!existsSync(PROVIDER_COOLDOWNS_PATH)) return {};
@@ -170,7 +241,7 @@ export function readProviderCooldowns({ now } = {}) {
 // `undefined` once the window the provider named has passed, so expiry needs no
 // sweeper and a provider comes back by itself.
 export function providerCooldown(providerId, { now } = {}) {
-  const id = canonicalProviderId(String(providerId || "").trim());
+  const id = cooldownScope(String(providerId || "").trim());
   return id ? readProviderCooldowns({ now })[id] : undefined;
 }
 
@@ -187,7 +258,7 @@ export function providerCooldown(providerId, { now } = {}) {
 // window of its own may sharpen the reason on a window that already exists.
 // It may never create one.
 export function recordProviderCooldown(providerId, { until, reason, now } = {}) {
-  const id = canonicalProviderId(String(providerId || "").trim());
+  const id = cooldownScope(String(providerId || "").trim());
   if (!id) return undefined;
   const at = nowMs(now);
   const document = readCooldownDocument();
@@ -216,7 +287,7 @@ export function recordProviderCooldown(providerId, { until, reason, now } = {}) 
 // end the same way, with a real answer, and that answer is better evidence than
 // anything this file recorded.
 export function clearProviderCooldown(providerId) {
-  const id = canonicalProviderId(String(providerId || "").trim());
+  const id = cooldownScope(String(providerId || "").trim());
   if (!id) return false;
   const document = readCooldownDocument();
   if (!(id in document)) return false;
@@ -336,11 +407,17 @@ function eligible(
     requiredSearchMode,
     hasSearchHistory,
     cooled,
+    allowSameFamily,
   },
 ) {
   if (!model?.slug) return false;
-  if (canonicalProviderId(model.provider) === fromProvider) return false;
-  if (cooled.has(canonicalProviderId(model.provider))) return false;
+  // Compact overflow is the one caller that may hop inside a family: a
+  // 262k Go Messages card and a 1M Go Chat sibling share a credential, so
+  // quota failover must still skip them, but a prompt the 262k card cannot
+  // hold is not evidence the 1M sibling cannot. Same-slug is already
+  // filtered by the ranking. Ordinary turns keep the default.
+  if (!allowSameFamily && cooldownScope(model.provider) === fromProvider) return false;
+  if (cooled.has(cooldownScope(model.provider))) return false;
   if (Number.isFinite(estimatedTokens) && Number(model.contextWindow) < estimatedTokens) {
     return false;
   }
@@ -384,8 +461,9 @@ export function rankFailoverCandidates(
     requiredSearchMode: requiredSearchModeOverride,
     chain = [],
     now,
+    allowSameFamily = false,
   } = options;
-  const fromProvider = canonicalProviderId(from?.provider || "");
+  const fromProvider = cooldownScope(from?.provider || "");
   // An explicitly captured absence is part of the request contract. `??`
   // would mistake it for an omitted override and re-read mutable sidecar
   // state after the source snapshot.
@@ -398,6 +476,13 @@ export function rankFailoverCandidates(
   const available = (Array.isArray(models) ? models : []).filter(
     (model) =>
       model.slug !== from?.slug &&
+      // `failoverCandidate: false` keeps a model selectable (picker, explicit
+      // slug, named requests) while opting it out of every automatic hop:
+      // quota failover, compaction attempts and compaction overflow. It is
+      // checked before the chain on purpose -- an operator who marks a route
+      // as never-automatic must not have that undone by an old chain entry.
+      // Absent means eligible, so every existing model ranks exactly as before.
+      model.failoverCandidate !== false &&
       eligible(model, {
         fromProvider,
         estimatedTokens,
@@ -406,6 +491,7 @@ export function rankFailoverCandidates(
         requiredSearchMode,
         hasSearchHistory,
         cooled,
+        allowSameFamily,
       }),
   );
 

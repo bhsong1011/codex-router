@@ -60,12 +60,14 @@ assets are committed rather than rasterized during a normal tray build.
 
 The Swift host stays `LSUIElement`, so it does not add a Dock icon. A person
 opening `Codex Router.app` gets the embedded Control Center as a normal window;
-that window supplies the product's Dock and Command-Tab entry only while it is
-open. Opening the app also reveals the native tray surfaces for 20 seconds if
-**With Codex** would otherwise hide them. Closing the Control Center window
-leaves the native host running; reopen the app or choose **Control Center**
-from the menu-bar panel to restore it. The temporary reveal also starts the
-router and pulses the status dot, then follow mode resumes on its own.
+that process supplies the product's Dock and Command-Tab entry while Control
+Center is running, including after the window is closed or you switch away.
+Closing the window hides it rather than quitting, so Cmd+Tab and the Dock can
+bring it back. Opening the app also reveals the native tray surfaces for 20
+seconds if **With Codex** would otherwise hide them. The menu-bar host keeps
+running either way; choose **Control Center** from the panel to reopen if the
+Dock tile is not showing yet. The temporary reveal also starts the router and
+pulses the status dot, then follow mode resumes on its own.
 
 launchd passes `--supervised` when it starts the native host at login. That
 starts the menu-bar host without opening the Control Center window or forcing
@@ -287,3 +289,30 @@ missing and **Sign In** when the CLI has no usable session. API providers show
   command output.
 - Completing sign-in or adding a key automatically enables that provider and
   exposes its models to new Codex tasks.
+
+## Signed release installation
+
+The installer supports `model-router-<version>-macos-universal.zip` from
+`duolahypercho/codex-router`. Downloads are disabled until a maintainer sets the
+verified public `MACOS_RELEASE_TEAM_ID` in `src/macos-tray-release.mjs`; an
+environment variable cannot override the repository or signing identity.
+
+Publishing also requires `MACOS_CERTIFICATE_P12_BASE64`,
+`MACOS_CERTIFICATE_PASSWORD`, `MACOS_SIGNING_IDENTITY`, `MACOS_NOTARY_APPLE_ID`,
+`MACOS_NOTARY_PASSWORD`, and `MACOS_TEAM_ID` Actions secrets. The workflow checks
+that the signing team matches the source pin. Its optional macOS job does not
+prevent Windows/Linux releases when signing is unavailable or fails.
+
+The installer verifies the checksum, confined bundle layout, pinned Developer ID
+signature and Gatekeeper assessment before reading version and source metadata.
+Normal internal Electron framework links are supported; escaping links and
+special files are rejected. Missing releases, network failures and a verified
+release built from different tray sources fall back to the local Xcode build.
+Checksum, signature and malformed-bundle failures refuse installation. Both
+paths use the same staging, journal, readiness checks and rollback.
+
+Release bundles omit the developer checkout's sealed `ModelRouterSourceRoot`
+and the embedded `router-root` file. They resolve the installed checkout through
+the existing install manifest/default lookup. Local builds retain their checkout
+binding. Setting a trust pin does not prove a signed release works: the first
+release still needs a real notarized build, download and installation check.

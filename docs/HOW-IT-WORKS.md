@@ -58,8 +58,13 @@ catalog, router, gateway generator, API forwarder, and doctor.
 `enabled-providers.json` is a separate local policy owned by the router plane.
 It controls routed picker visibility and dispatcher access. `model-picker.json`
 stores the durable per-model decision, including explicit show choices, and the
-Codex, DeepSeek Harness, and Gemini publishers all consume that same state for
-external models. In a signed-in Codex install, the native GPT catalog and its
+Codex, DeepSeek Harness, Gemini, and Cursor publishers all consume that same state for
+external models. The same file carries the Codex picker `order`: `native-first`
+(the default, routed models publish after the highest visible native GPT
+priority) or `routed-first` (every routed model publishes ahead of the natives,
+in vendor-group order, and the natives shift after them). Set it with
+`./bin/model-router codex picker-order routed-first|native-first|status`; the
+command republishes the catalog, and Codex reloads the picker on its next start. In a signed-in Codex install, the native GPT catalog and its
 base-entry visibility remain Codex-owned, so a router "hide all" action cannot
 erase the original native picker. A known namespaced model whose provider is hidden receives a local
 `provider_not_enabled` error; it is never mistaken for a native model or
@@ -95,6 +100,8 @@ map, which restores native GPT routing.
 | Grok 4.5 | `grok-api/grok-4.5` | `grok-api-grok-4-5` | `grok-4.5` |
 | Claude Opus 4.8 | `anthropic-api/claude-opus-4.8` | `anthropic-api-claude-opus-4-8` | `claude-opus-4-8` |
 | GLM-5.2 Ollama Cloud | `ollama-cloud/glm-5.2` | `ollama-cloud-glm-5-2` | `glm-5.2` |
+| GLM-5.3 Ollama Cloud | `ollama-cloud/glm-5.3` | `ollama-cloud-glm-5-3` | `glm-5.3:cloud` |
+| GLM-5.3-Flash Ollama Cloud | `ollama-cloud/glm-5.3-flash` | `ollama-cloud-glm-5-3-flash` | `glm-5.3-flash:cloud` |
 | Kimi K2.7 Code Ollama Cloud | `ollama-cloud/kimi-k2.7-code` | `ollama-cloud-kimi-k2-7-code` | `kimi-k2.7-code` |
 | MiniMax M3 Ollama Cloud | `ollama-cloud/minimax-m3` | `ollama-cloud-minimax-m3` | `minimax-m3` |
 | DeepSeek V4 Pro Ollama Cloud | `ollama-cloud/deepseek-v4-pro` | `ollama-cloud-deepseek-v4-pro` | `deepseek-v4-pro` |
@@ -103,6 +110,7 @@ map, which restores native GPT routing.
 | GLM-5.3 Coding Plan | `zai-coding/glm-5.3` | `zai-coding-glm-5-3` | `glm-5.3` |
 | GLM-5.2 Coding Plan | `zai-coding/glm-5.2` | `zai-coding-glm-5-2` | `glm-5.2` |
 | GLM-5-Turbo Coding Plan | `zai-coding/glm-5-turbo` | `zai-coding-glm-5-turbo` | `glm-5-turbo` |
+| GLM-5.3-Flash Z.ai API | `zai-api/glm-5.3-flash` | `zai-api-glm-5-3-flash` | `glm-5.3-flash` |
 | GLM-5.3 Z.ai API | `zai-api/glm-5.3` | `zai-api-glm-5-3` | `glm-5.3` |
 | GLM-5.2 Z.ai API | `zai-api/glm-5.2` | `zai-api-glm-5-2` | `glm-5.2` |
 | GLM-4.7 Z.ai API | `zai-api/glm-4.7` | `zai-api-glm-4-7` | `glm-4.7` |
@@ -118,6 +126,22 @@ do not claim to be based on GPT-5.
 The integration deliberately keeps the built-in `openai` provider and points
 it at a loopback `openai_base_url`. This makes named models appear in the normal
 picker instead of replacing the provider with a generic `Custom` entry.
+
+Current Codex builds validate a prefixed external model against the selected
+provider before sending the request. When the user explicitly enables signed
+routing from a root-OpenAI configuration, the router therefore snapshots the
+root provider and selects its dedicated `codex-router-signed` provider. That
+provider still requires ChatGPT authentication and sends both native and
+external Responses requests to the local router. The switch uses the signed
+state format already understood by the previous release, so downgrading can
+still disable it and restore the prior provider. Ordinary install, update,
+repair, and catalog refresh maintain an existing signed mode but never convert
+one implicitly; changing modes requires an explicit off/on toggle.
+
+Native redirect is a separate, all-or-nothing control. If configured, it still
+redirects unmatched native GPT turns while signed routing is enabled, and
+turning model failover off does not disable it. Clear native redirect separately
+when selected native GPT models should remain on OpenAI.
 
 For a selected custom provider, the tray's login-free switch keeps the provider
 id unchanged and temporarily replaces its complete table with a router-owned,
@@ -240,6 +264,14 @@ operator can opt in locally only by adding `searchTool` to that exact entry in
 the protected `user-models.json` after verifying the route. The curation CLI
 does not ask for or infer search mode from an upstream catalog claim.
 
+Accepting a completed `web_search_call` in conversation history is a narrower
+input-compatibility capability than executing a new search. A route that has
+been live-tested for history replay may declare `supportsSearchHistory: true`
+without a `searchTool`; this keeps new search unavailable while allowing that
+route to continue or compact an existing searched conversation. The flag is
+false by default and, like `searchTool`, belongs to the exact model/provider
+route rather than to an OpenAI-compatible protocol family.
+
 ### Per-model search sidecar
 
 A model without `searchTool` can be opted into the Perplexity Search sidecar.
@@ -277,6 +309,33 @@ frames. The WebSocket edge never selects or contacts a provider itself, and
 the caller capability is never relayed to an upstream. HTTP request bodies may
 use Zstandard, gzip, deflate, or Brotli; the router safely decompresses them
 before inspecting the model ID.
+
+The upstream leg can separately reuse Responses WebSocket connections. Generic
+providers opt in with `providers generic edit ID --adapter openai-responses
+--transport websocket`; native transport stays HTTP unless
+`MODEL_ROUTER_NATIVE_TRANSPORT=websocket` (or its `CODEX_ROUTER_` alias) is set.
+The forwarder still owns generic credentials and normalization. Full canonical
+requests travel over the connection; no direct edge-to-provider relay or
+incremental upstream request shortcut bypasses routing, image/tool policies,
+usage accounting, or response transforms. A request containing an unresolved
+`previous_response_id` stays on HTTP.
+
+Pools are bounded and isolated by endpoint and all handshake headers. Each
+acquisition revalidates generic provider configuration and DNS; rotated
+credentials cannot reuse an old handshake. Per-request native identity headers
+participate in connection affinity, so changing them can reduce connection
+reuse. Idle identities expire, and process shutdown closes active connections.
+An outbound environment proxy disables this raw-socket transport.
+
+Upgrade refusal or connection failure before a turn is sent falls back to
+HTTP, retaining native zstd compression, with a five-minute transport breaker.
+After sending a turn, transport failures are never replayed. Empty-completion
+repair also stays disabled for WebSocket-configured generic routes, including
+HTTP fallback, to avoid replaying a turn still generating upstream. The
+first-event deadline defaults to 60 seconds; `MODEL_ROUTER_WS_PRELUDE_TIMEOUT_MS`
+(or its `CODEX_ROUTER_` alias) accepts a positive millisecond value capped at
+300,000. Invalid values use the default. Slow consumers pause upstream reads;
+malformed upgrades, metadata, and oversized queued events fail the affected turn.
 
 Codex can compact history through `/responses/compact` or a
 `compaction_trigger`. External Chat Completions providers cannot create OpenAI's
@@ -352,8 +411,27 @@ external model. Ordinary routed prompts do not use this relay.
 The relay requires an active ChatGPT sign-in because only the native Codex
 backend can open its own opaque payload. In login-free mode the router fails
 closed instead of forwarding unreadable ciphertext to an external provider.
+A native relay `429` stays a `429` instead of becoming a gateway-style `502`,
+and the router remembers that exact account-and-ciphertext refusal for 60
+seconds so client retries do not repeatedly hit native quota. A native relay
+`401` likewise stays `401`, with the upstream body removed, so Codex's own
+ChatGPT authentication recovery can refresh the session and retry. The short
+429 backoff stores only the already-hashed cache key and an expiry timestamp;
+other accounts and delegated payloads remain independent. Operators can tune
+the window with `CODEX_ROUTER_AGENT_RELAY_FAILURE_BACKOFF_MS`.
 
-Only registry-proven models are advertised as native v2 spawn-agent overrides.
+At service startup, the post-health reconciliation checks both native model
+metadata and the router-managed Codex agent definitions. If the native catalog
+is current but a routed `router-model-*.toml` definition is missing, stale,
+unprotected, or left over for a model that is no longer eligible, the installed
+picker is republished to restore the coupled catalog/agent state. An unreadable
+or foreign Codex transport is never repaired speculatively.
+
+Only registry-proven models are advertised as native v2 spawn-agent overrides,
+and an explicit spawn model is kept: a child runs on the model the operator
+picked from Codex's own list instead of being pinned back to the routed parent.
+Codex checks that value against its list before the call is dispatched, so an
+override cannot name a route the operator was never offered.
 The Settings tab (desktop panel and macOS tray) exposes two local accordions:
 **Subagent models** can withhold or re-enable proven models, while **Model
 picker** controls visibility. Local settings never promote an unverified model

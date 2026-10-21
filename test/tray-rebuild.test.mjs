@@ -443,6 +443,20 @@ test("each companion fingerprints its own sources", () => {
   assert.equal(traySourceFingerprint(root, "aix"), "");
 });
 
+test("the macOS tray fingerprint includes its full-Xcode resolver", () => {
+  const fakeRoot = scratch();
+  try {
+    const resolver = path.join(fakeRoot, "src", "macos-developer-tools.mjs");
+    mkdirSync(path.dirname(resolver), { recursive: true });
+    writeFileSync(resolver, "before\n", "utf8");
+    const before = traySourceFingerprint(fakeRoot, "darwin");
+    writeFileSync(resolver, "after\n", "utf8");
+    assert.notEqual(traySourceFingerprint(fakeRoot, "darwin"), before);
+  } finally {
+    rmSync(fakeRoot, { recursive: true, force: true });
+  }
+});
+
 test("one companion location: the Node and shell sides name the same directory", () => {
   // Three copies of this path drifted apart before -- paths.mjs, the build
   // script default, and trayBundleDir -- which is how a machine ends up with a
@@ -1030,6 +1044,8 @@ test("the native macOS tray owns one embedded Control Center", () => {
   assert.match(detached, /task\.standardInput = FileHandle\.nullDevice/);
   assert.match(detached, /task\.standardOutput = FileHandle\.nullDevice/);
   assert.match(detached, /task\.standardError = FileHandle\.nullDevice/);
+  assert.match(detached, /removeValue\(forKey: "CODEX_ROUTER_OWNER_SIGNAL_BUDGET_MS"\)/);
+  assert.match(detached, /removeValue\(forKey: "CODEX_ROUTER_OWNER_SIGNAL_BARRIER_DIR"\)/);
   assert.match(detached, /try task\.run\(\)/);
   assert.doesNotMatch(detached, /waitUntilExit/);
 });
@@ -1097,6 +1113,8 @@ test("Control Center fingerprints include renderer, build config, and shared ico
     ["apps", "control-center", "vite.config.ts"],
     ["apps", "control-center", "tsconfig.json"],
     ["apps", "control-center", "assets", "icon.png"],
+    ["apps", "control-center", "assets", "trayTemplate.png"],
+    ["apps", "control-center", "assets", "trayTemplate@2x.png"],
   ]) {
     const fakeRoot = scratch();
     try {
@@ -1116,9 +1134,10 @@ test("Control Center fingerprints include renderer, build config, and shared ico
 test("desktop shells keep their routing mark while the Control Center sidebar stays text-only", () => {
   const script = readFileSync(path.join(root, "scripts", "build-app-icon.sh"), "utf8");
   assert.match(script, /ModelRouterTray\/Resources\/AppIcon\.svg/);
-  for (const asset of ["32x32.png", "128x128.png", "128x128@2x.png", "icon.png", "icon.ico"]) {
+  for (const asset of ["32x32.png", "128x128.png", "128x128@2x.png", "icon.png", "icon.ico", "trayTemplate.png", "trayTemplate@2x.png"]) {
     assert.match(script, new RegExp(`control_center_assets/${asset.replaceAll(".", "\\.")}`));
   }
+  assert.match(script, /Sources\/Resources\/RouterMark\.svg/);
   assert.match(script, /scripts\/build-ico\.mjs/);
 
   const renderer = readFileSync(path.join(root, "apps", "control-center", "src", "App.tsx"), "utf8");
@@ -1134,6 +1153,28 @@ test("Control Center fingerprints include JavaScript model helpers and build ent
     ["apps", "control-center", "src", "model-families.mjs"],
     ["scripts", "build-electron-companion.sh"],
     ["scripts", "build-electron-companion.ps1"],
+  ]) {
+    const fakeRoot = scratch();
+    try {
+      const file = path.join(fakeRoot, ...relative);
+      mkdirSync(path.dirname(file), { recursive: true });
+      writeFileSync(file, "before\n", "utf8");
+      const before = traySourceFingerprint(fakeRoot, "linux");
+      writeFileSync(file, "after\n", "utf8");
+      assert.notEqual(traySourceFingerprint(fakeRoot, "linux"), before, relative.join("/"));
+    } finally {
+      rmSync(fakeRoot, { recursive: true, force: true });
+    }
+  }
+});
+
+test("Control Center fingerprints include every packaged security helper", () => {
+  for (const relative of [
+    ["src", "spawnable-command.mjs"],
+    ["src", "chatgpt-login-lease.mjs"],
+    ["src", "file-security.mjs"],
+    ["src", "path-security.mjs"],
+    ["src", "process-identity.mjs"],
   ]) {
     const fakeRoot = scratch();
     try {

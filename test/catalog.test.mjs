@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   mkdirSync,
   mkdtempSync,
@@ -20,12 +21,15 @@ import {
   clampModelEfforts,
   codexEffortVocabulary,
   effectivePickerHiddenModels,
+  liveAccountCatalogProbeAllowed,
+  nativeCacheCanRefreshInPlace,
   nativeCatalogIsReusable,
   deriveBaseInstructions,
   mergeNativeCatalogs,
   mergeNativeModel,
   nativeSubagentCertification,
   promoteNativeMultiAgent,
+  publishHiddenAfterVisible,
   routedCatalogConfigured,
   routedModel,
 } from "../src/catalog.mjs";
@@ -63,6 +67,41 @@ const grok = {
   compHash: "grok-oauth-grok-4-5-v1",
   multiAgentVersion: "v2",
 };
+
+test("live account catalog probes stay off while the router owns the catalog", () => {
+  assert.equal(
+    liveAccountCatalogProbeAllowed({ discoveryDisabled: false, routedCatalogActive: false }),
+    true,
+  );
+  assert.equal(
+    liveAccountCatalogProbeAllowed({ discoveryDisabled: true, routedCatalogActive: false }),
+    false,
+  );
+  assert.equal(
+    liveAccountCatalogProbeAllowed({ discoveryDisabled: false, routedCatalogActive: true }),
+    false,
+  );
+  // ChatGPT account switching refreshes native while openai_base_url still
+  // points at this router. A live `debug models` probe would echo the merged
+  // catalog and abort the switch with "already-merged catalog".
+  assert.equal(
+    liveAccountCatalogProbeAllowed({ discoveryDisabled: false, routedCatalogActive: true }),
+    false,
+  );
+});
+
+test("native capture refuses to probe a live account catalog under a routed config", () => {
+  const source = readFileSync(new URL("../src/catalog.mjs", import.meta.url), "utf8");
+  assert.match(
+    source,
+    /liveAccountCatalogProbeAllowed\(\{\s*discoveryDisabled: idle,\s*routedCatalogActive: routedActive,\s*\}\)/,
+  );
+  assert.match(source, /catalogContainsRoutedSlugs\(account\)/);
+  assert.match(
+    source,
+    /Could not refresh the native model catalog \(\$\{error\.message\}\); reusing the cached capture\./,
+  );
+});
 
 test("signed-in picker overlay cannot hide Codex native base entries", () => {
   const hidden = new Set(["gpt-5.6-luna", "gpt-5.6-sol-1m", "grok-oauth/grok-4.5"]);
@@ -188,6 +227,50 @@ test("routed models rewrite GPT identity text to the external model name", () =>
   assert.equal(model.multi_agent_version, "v2");
 });
 
+test("grok family rewrites workspace reads onto its own tools", () => {
+  const workspace = "- When you search for text or files, you reach first for `rg` or `rg --files`; they are much faster than alternatives like `grep`. If `rg` is unavailable, you use the next best tool without fuss.\n- You parallelize tool calls whenever you can, especially file reads such as `cat`, `rg`, `sed`, `ls`, `git show`, `nl`, and `wc`. You use `multi_tool_use.parallel` for that parallelism, and only that. Do not chain shell commands with separators like `echo \"====\";`; the output becomes noisy in a way that makes the user\u2019s side of the conversation worse.\n- Use `apply_patch` for manual code edits. Do not create or edit files with `cat` or other shell write tricks. Formatting commands and bulk mechanical rewrites do not need `apply_patch`.\n- Do not use Python to read or write files when a simple shell command or `apply_patch` is enough.\n- Treat ordinary local filesystem paths as files, never as MCP resource URIs. Inspect local files with a filesystem tool that is present in this request's menu.";
+  const native = {
+    ...template,
+    base_instructions: `You are Codex, a coding agent based on GPT-5.\n${workspace}`,
+    model_messages: {
+      instructions_template: `You are Codex, a coding agent based on GPT-5.\n${workspace}`,
+      instructions_variables: { personality_default: "" },
+    },
+  };
+  const grok47 = {
+    ...grok,
+    slug: "grok-oauth/grok-4.7",
+    displayName: "Grok 4.7 (OAuth)",
+    instructionOverlay: "filesystem-mcp-discipline",
+  };
+  const other = {
+    ...grok47,
+    slug: "deepseek/deepseek-v4-pro",
+    displayName: "DeepSeek V4 Pro",
+    gatewayModel: "deepseek-v4-pro",
+  };
+
+  const model = routedModel(native, grok47);
+  assert.match(model.base_instructions, /based on Grok 4\.7/);
+  assert.match(model.base_instructions, /read files with `read_file`/);
+  assert.match(model.base_instructions, /separate tool calls in the same response/);
+  assert.match(model.base_instructions, /search_replace` for manual edits/);
+  assert.match(model.base_instructions, /not for paging through files/);
+  assert.match(model.base_instructions, /`multi_tool_use\.parallel` is not available/);
+  assert.doesNotMatch(model.base_instructions, /You use `multi_tool_use\.parallel` for that parallelism/);
+  assert.doesNotMatch(model.base_instructions, /such as exec_command, to inspect/);
+  assert.doesNotMatch(model.base_instructions, /filesystem tool that is present/);
+  assert.match(model.model_messages.instructions_template, /read files with `read_file`/);
+  assert.match(model.model_messages.instructions_template, /`multi_tool_use\.parallel` is not available/);
+  assert.doesNotMatch(model.model_messages.instructions_template, /You use `multi_tool_use\.parallel` for that parallelism/);
+  assert.doesNotMatch(model.base_instructions, /GPT-5/);
+
+  const untouched = routedModel(native, other);
+  assert.match(untouched.base_instructions, /based on DeepSeek V4 Pro/);
+  assert.match(untouched.base_instructions, /multi_tool_use\.parallel/);
+  assert.doesNotMatch(untouched.base_instructions, /read files with `read_file`/);
+});
+
 test("routed models can borrow native behavior instructions without inheriting capabilities", () => {
   const behaviorTemplate = {
     ...template,
@@ -287,10 +370,11 @@ test("routed models advertise reasoning summaries only when the registry opts in
   assert.equal(summarized.default_reasoning_summary, "auto");
 });
 
-test("ClinePass routed models omit the unsupported reasoning-effort selector", () => {
+test("ClinePass routed models hide the reasoning-effort selector with a schema-valid empty ladder", () => {
   const clinepass = routedModel(template, { ...grok, requestProfile: "clinepass" });
   assert.equal("default_reasoning_level" in clinepass, false);
-  assert.equal("supported_reasoning_levels" in clinepass, false);
+  // Codex's ModelInfo requires this key; omitting it makes the entry unparseable.
+  assert.deepEqual(clinepass.supported_reasoning_levels, []);
 
   const normal = routedModel(template, grok);
   assert.equal(normal.default_reasoning_level, "high");
@@ -507,11 +591,12 @@ test("merged catalog gives native models first and keeps routed providers contig
   ];
   const merged = buildMergedCatalog({ models: [nativeOlder, template] }, routed);
 
-  // Routed models stay grouped by the named vendor policy, and each model
-  // keeps the `priority` the operator chose. Picker grouping must not renumber
-  // every routed route past the native maximum, or the low priorities on
-  // certified native v2 spawn routes get crowded out of Codex's override
-  // window.
+  // Routed models stay grouped by the named vendor policy. Every routed entry
+  // in this fixture inherits `multiAgentVersion: "v2"` from `grok`, and a
+  // certified v2 spawn route keeps the `priority` the operator chose: those
+  // low values are what keep it inside Codex's spawn_agent override window,
+  // so publication must never renumber them. The band that v1 routed models
+  // do move into is covered by the next test.
   assert.deepEqual(merged.map((model) => model.slug), [
     "gpt-5.5",
     "gpt-5.4",
@@ -527,6 +612,61 @@ test("merged catalog gives native models first and keeps routed providers contig
     merged.map((model) => model.priority),
     [10, 29, 3, 9, 1, 2, 4, 7, 0],
   );
+});
+
+test("v1 routed models publish in a band above the visible native maximum while v2 routes keep their authored priority", () => {
+  // Issue #544: Codex sorts its picker by `priority`, so routed models that
+  // reuse the native GPT integers interleave with them and vendor grouping
+  // never appears. Renumbering everything would crowd certified v2 spawn
+  // routes out of Codex's override window, so only v1 routes move.
+  const nativeOlder = { ...template, slug: "gpt-5.4", display_name: "GPT-5.4", priority: 29 };
+  // A hidden native entry may carry any number; it must not set the band.
+  const hiddenNative = {
+    ...template,
+    slug: "gpt-5.3-internal",
+    display_name: "GPT-5.3",
+    priority: 500,
+    visibility: "hide",
+  };
+  const v1 = { ...grok, multiAgentVersion: "v1" };
+  const routed = [
+    { ...v1, slug: "opencode-go/glm-5.3", provider: "opencode-go", priority: 7 },
+    { ...v1, slug: "deepseek/deepseek-v4-pro", provider: "deepseek", priority: 1 },
+    { ...v1, slug: "deepseek/deepseek-v4-flash", provider: "deepseek", priority: 6 },
+    { ...grok, slug: "grok-oauth/grok-4.5", provider: "grok-oauth", priority: 2 },
+    { ...v1, slug: "grok-oauth/grok-4.6", provider: "grok-oauth", priority: 1 },
+  ];
+  const merged = buildMergedCatalog(
+    { models: [nativeOlder, template, hiddenNative] },
+    routed,
+  );
+  const bySlug = new Map(merged.map((model) => [model.slug, model]));
+
+  // Natives are never renumbered.
+  assert.equal(bySlug.get("gpt-5.5").priority, 10);
+  assert.equal(bySlug.get("gpt-5.4").priority, 29);
+  assert.equal(bySlug.get("gpt-5.3-internal").priority, 500);
+
+  // The certified v2 route keeps its authored priority and its certificate,
+  // and does not consume a slot in the band.
+  assert.equal(bySlug.get("grok-oauth/grok-4.5").priority, 2);
+  assert.equal(bySlug.get("grok-oauth/grok-4.5").multi_agent_version, "v2");
+
+  // v1 routes land directly above the highest *visible* native (29, not the
+  // hidden 500), in vendor-group order and then authored order within a
+  // vendor: DeepSeek (pro 1, flash 6), then opencode, then the catch-all.
+  assert.deepEqual(
+    [
+      "deepseek/deepseek-v4-pro",
+      "deepseek/deepseek-v4-flash",
+      "opencode-go/glm-5.3",
+      "grok-oauth/grok-4.6",
+    ].map((slug) => bySlug.get(slug).priority),
+    [30, 31, 32, 33],
+  );
+
+  // The published picker has no colliding integers left to interleave on.
+  assert.equal(new Set(merged.map((model) => model.priority)).size, merged.length);
 });
 
 test("native gpt-5.2 stays parseable by older Codex catalog readers", () => {
@@ -821,6 +961,104 @@ test("models stay untouched when the installed build understands their efforts",
   assert.equal(unchanged, original);
 });
 
+test("native cache permits in-place refresh only when it contains native models", () => {
+  assert.equal(
+    nativeCacheCanRefreshInPlace({ catalog: { models: [template] } }),
+    true,
+  );
+  assert.equal(
+    nativeCacheCanRefreshInPlace({
+      catalog: { models: [template, { ...template, slug: grok.slug }] },
+    }),
+    false,
+  );
+  assert.equal(nativeCacheCanRefreshInPlace({}), false);
+});
+
+test("fingerprint drift from new native model triggers automatic recapture", () => {
+  // Simulate a stored catalog with one native model
+  const oldNative = {
+    slug: "gpt-5.6-sol",
+    name: "GPT Sol",
+    visibility: "list",
+  };
+  const oldFingerprint = createHash("sha256")
+    .update(JSON.stringify([oldNative]))
+    .digest("hex");
+  
+  const oldCaptured = {
+    captured_with: "codex-cli 0.146.1",
+    native_source_fingerprint: oldFingerprint,
+    models: [oldNative],
+  };
+  
+  // Old fingerprint matches - cache is reusable
+  assert.equal(
+    nativeCatalogIsReusable(oldCaptured, "codex-cli 0.146.1", oldFingerprint),
+    true,
+  );
+  
+  // Simulate a NEW arbitrary native model appearing in models_cache.json
+  // (This could be gpt-7, o5, any future native - not hardcoded)
+  const newNative = {
+    slug: "gpt-7-nova",  // Arbitrary new native slug
+    name: "GPT Nova",
+    visibility: "list",
+  };
+  const newFingerprint = createHash("sha256")
+    .update(JSON.stringify([oldNative, newNative]))
+    .digest("hex");
+  
+  // New fingerprint differs - triggers recapture
+  assert.equal(
+    nativeCatalogIsReusable(oldCaptured, "codex-cli 0.146.1", newFingerprint),
+    false,
+  );
+  
+  // Verify fingerprints are actually different
+  assert.notEqual(oldFingerprint, newFingerprint);
+});
+
+test("new arbitrary native model appears in merged catalog after drift", () => {
+  // Existing native model
+  const existingNative = {
+    slug: "gpt-5.6-sol",
+    name: "GPT Sol",
+    visibility: "list",
+    priority: 100,
+  };
+  
+  // NEW arbitrary native model (could be gpt-7, o5, etc. - not hardcoded)
+  const newNative = {
+    slug: "gpt-7-quantum",  // Arbitrary future native
+    name: "GPT Quantum",
+    visibility: "list",
+    priority: 50,
+  };
+  
+  // Routed model for comparison
+  const routedModel = {
+    ...grok,
+    visibility: "list",
+  };
+  
+  // Merge with both natives present
+  const merged = buildMergedCatalog(
+    { models: [existingNative, newNative] },
+    [routedModel],
+  );
+  
+  // Verify BOTH natives appear in merged output
+  const slugs = merged.map((model) => model.slug);
+  assert.ok(slugs.includes("gpt-5.6-sol"), "existing native preserved");
+  assert.ok(slugs.includes("gpt-7-quantum"), "new arbitrary native appears");
+  assert.ok(slugs.includes(grok.slug), "routed model also present");
+  
+  // Verify natives come first
+  assert.equal(merged[0].slug, "gpt-7-quantum", "higher-priority native first");
+  assert.equal(merged[1].slug, "gpt-5.6-sol", "lower-priority native second");
+});
+
 test("native catalog cache is reusable only for the codex build that captured it", () => {
   const captured = {
     captured_with: "codex-cli 0.142.5",
@@ -847,6 +1085,34 @@ test("native catalog cache is reusable only for the codex build that captured it
   // Invalid or empty caches are never reusable.
   assert.equal(nativeCatalogIsReusable(undefined, undefined), false);
   assert.equal(nativeCatalogIsReusable({ models: [] }, "codex-cli 0.146.1"), false);
+});
+
+test("native catalog cache is invalidated when the Codex binary changes without a version change", () => {
+  const captured = {
+    captured_with: "codex-cli 0.153.3",
+    native_source_fingerprint: "account-a",
+    native_binary_fingerprint: "binary-a",
+    models: [template],
+  };
+
+  assert.equal(
+    nativeCatalogIsReusable(
+      captured,
+      "codex-cli 0.153.3",
+      "account-a",
+      "binary-a",
+    ),
+    true,
+  );
+  assert.equal(
+    nativeCatalogIsReusable(
+      captured,
+      "codex-cli 0.153.3",
+      "account-a",
+      "binary-b",
+    ),
+    false,
+  );
 });
 
 test("native catalog merge preserves account visibility and bundled-only models", () => {
@@ -892,6 +1158,20 @@ test("native catalog merge preserves account visibility and bundled-only models"
     },
     { slug: "gpt-bundled-only", visibility: "list" },
   ]);
+});
+
+test("an account catalog can be authoritative about model availability", () => {
+  const merged = mergeNativeCatalogs(
+    { models: [{ slug: "gpt-free", visibility: "list" }] },
+    {
+      models: [
+        { slug: "gpt-free", visibility: "list" },
+        { slug: "gpt-plus-only", visibility: "list" },
+      ],
+    },
+    { includeBundledOnly: false },
+  );
+  assert.deepEqual(merged.models, [{ slug: "gpt-free", visibility: "list" }]);
 });
 
 test("native catalog merge never loses non-empty bundled metadata", () => {
@@ -1341,6 +1621,7 @@ test(
         merged.models.map((model) => [String(model.slug), model.visibility]),
       );
       assert.equal(visibility.get("deepseek/deepseek-v4.1-flash"), "list");
+      assert.equal(visibility.get("deepseek/deepseek-v4-flash"), "list");
       assert.equal(visibility.get("deepseek/deepseek-v4-flash-vision-exp"), "list");
       assert.equal(visibility.get("deepseek/deepseek-v4-pro"), "hide");
       assert.equal(visibility.get("gpt-5.6-sol-1m"), "hide");
@@ -1357,3 +1638,84 @@ test(
     }
   },
 );
+
+test("routed-first publishes every routed model ahead of the natives and shifts the natives by that count", () => {
+  const native = {
+    models: [
+      { slug: "gpt-5.5", priority: 1, visibility: "list", input_modalities: ["text"], supported_reasoning_levels: [] },
+      { slug: "gpt-5.2", priority: 4, visibility: "list", input_modalities: ["text"], supported_reasoning_levels: [] },
+      { slug: "gpt-5.4", priority: 9, visibility: "hide", input_modalities: ["text"], supported_reasoning_levels: [] },
+    ],
+  };
+  const routedEntry = (slug, provider, priority, extra = {}) => ({
+    slug, provider, priority, contextWindow: 1, autoCompact: 1, inputModalities: ["text"], reasoningLevels: [], displayName: slug, ...extra,
+  });
+  const routed = [
+    routedEntry("grok-oauth/grok-4.6", "grok-oauth", 1, { multiAgentVersion: "v2" }),
+    routedEntry("ollama-local/a", "ollama-local", 100),
+    routedEntry("ollama-local/b", "ollama-local", 101),
+  ];
+
+  const nativeFirst = new Map(buildMergedCatalog(native, routed).map((m) => [m.slug, m.priority]));
+  // Default behaviour is unchanged: v2 keeps its authored value, v1 bands above the visible native max.
+  assert.equal(nativeFirst.get("grok-oauth/grok-4.6"), 1);
+  assert.equal(nativeFirst.get("ollama-local/a"), 5);
+  assert.equal(nativeFirst.get("gpt-5.5"), 1);
+
+  const routedFirst = new Map(
+    buildMergedCatalog(native, routed, { pickerOrder: "routed-first" }).map((m) => [m.slug, m.priority]),
+  );
+  assert.deepStrictEqual(
+    [...routedFirst.entries()].filter(([slug]) => slug !== "gpt-5.4").sort((l, r) => l[1] - r[1]).map(([slug]) => slug),
+    ["grok-oauth/grok-4.6", "ollama-local/a", "ollama-local/b", "gpt-5.5", "gpt-5.2"],
+  );
+  assert.equal(routedFirst.get("gpt-5.5"), 4);
+  assert.equal(routedFirst.get("gpt-5.2"), 7);
+  assert.equal(routedFirst.get("gpt-5.4"), 12, "hidden natives shift too so relative native order is kept");
+
+  // Login-free aliasing publishes routed entries under native slugs and keeps
+  // the native priority there; the option must still reach the merged tail.
+  const loginFree = buildLoginFreeCatalog(native, routed, { pickerOrder: "routed-first" });
+  assert.ok(Array.isArray(loginFree.models));
+});
+
+test("hidden entries publish after every visible model so the desktop picker's first page holds the selection", () => {
+  // The desktop picker reads one 100-entry page of `model/list`, which Codex
+  // serves in priority order with hidden entries included.
+  const hiddenRoutes = Array.from({ length: 120 }, (_, index) => ({
+    slug: `commandcode/hidden-${String(index).padStart(3, "0")}`,
+    priority: 20 + index,
+    visibility: "hide",
+  }));
+  const models = [
+    { slug: "gpt-5.5", priority: 10, visibility: "list" },
+    { slug: "codex-auto-review", priority: 3, visibility: "hide" },
+    ...hiddenRoutes,
+    { slug: "stepfun-api/step-5-preview", priority: 200, visibility: "list" },
+    { slug: "opencode-go/mimo-v2.6-pro", priority: 90, visibility: "list" },
+  ];
+
+  const published = publishHiddenAfterVisible(models);
+  const firstPage = [...published]
+    .sort((left, right) => left.priority - right.priority)
+    .slice(0, 100)
+    .map((model) => model.slug);
+
+  for (const slug of ["gpt-5.5", "stepfun-api/step-5-preview", "opencode-go/mimo-v2.6-pro"]) {
+    assert.ok(firstPage.includes(slug), `${slug} must be on the first page`);
+  }
+  // Visible priorities are published unchanged.
+  assert.deepEqual(
+    published.filter((model) => model.visibility === "list").map((model) => [model.slug, model.priority]),
+    [
+      ["gpt-5.5", 10],
+      ["stepfun-api/step-5-preview", 200],
+      ["opencode-go/mimo-v2.6-pro", 90],
+    ],
+  );
+  // Every hidden entry is still published, after the highest visible priority.
+  const hidden = published.filter((model) => model.visibility === "hide");
+  assert.equal(hidden.length, 121);
+  assert.ok(hidden.every((model) => model.priority > 200));
+  assert.equal(new Set(hidden.map((model) => model.priority)).size, hidden.length);
+});

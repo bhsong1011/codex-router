@@ -2,6 +2,8 @@ import { spawn, spawnSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { routerNodeBinary } from "./node-runtime.mjs";
+
 import { MODEL_BY_SLUG } from "./model-registry.mjs";
 import {
   clearSubagentProof,
@@ -9,6 +11,7 @@ import {
   recordProbeResult,
   recordProbeStarted,
 } from "./subagent-proofs.mjs";
+import { detachedOperationEnvironment } from "./process-tree.mjs";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -117,7 +120,7 @@ export async function verifySubagentCandidates(slugs, { probe, force = false } =
 // the verdict and republishes the catalog when it lands.
 export function spawnDetachedVerification(
   slugs,
-  { execPath = process.execPath, deferCandidateResolution = false } = {},
+  { execPath = routerNodeBinary(), deferCandidateResolution = false } = {},
 ) {
   // A curation transaction has just written a new model overlay, but this
   // process still holds the old registry module. Let the fresh worker resolve
@@ -135,7 +138,7 @@ export function spawnDetachedVerification(
     [path.join(REPO_ROOT, "src", "subagent-verify.mjs"), "--worker", ...candidates],
     {
       cwd: REPO_ROOT,
-      env: { ...process.env, MODEL_ROUTER_TARGET: "codex" },
+      env: detachedOperationEnvironment(process.env, { MODEL_ROUTER_TARGET: "codex" }),
       detached: true,
       stdio: "ignore",
       windowsHide: true,
@@ -146,7 +149,7 @@ export function spawnDetachedVerification(
 }
 
 function refreshCatalog() {
-  const result = spawnSync(process.execPath, [path.join(REPO_ROOT, "src", "catalog.mjs")], {
+  const result = spawnSync(routerNodeBinary(), [path.join(REPO_ROOT, "src", "catalog.mjs")], {
     cwd: REPO_ROOT,
     env: { ...process.env, MODEL_ROUTER_TARGET: "codex" },
     stdio: "ignore",

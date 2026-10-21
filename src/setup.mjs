@@ -13,6 +13,7 @@ import { effectiveVisibleModels, setModelSelection } from "./model-picker-state.
 import { kimiOAuthStatus } from "./oauth-status.mjs";
 import { SOURCE_ROOT, TARGET } from "./paths.mjs";
 import { effectiveProviderCredentialStatus } from "./provider-api-key-routing.mjs";
+import { credentialSetupHint } from "./provider-credentials.mjs";
 import {
   installOauthCli,
   oauthCliPath,
@@ -39,6 +40,10 @@ import {
   readVisionBridgeSettings,
   visionBridgeConfigured,
 } from "./vision-bridge-state.mjs";
+import {
+  operationDeadlineFromEnvironment,
+  remainingOperationMs,
+} from "./process-tree.mjs";
 
 const args = process.argv.slice(2);
 const guided = args.includes("--guided");
@@ -67,9 +72,11 @@ const flagOptions = new Set([
 let setupArgumentError;
 for (let index = 0; index < args.length; index += 1) {
   const argument = args[index];
-  if (argument === "--providers") {
+  if (argument === "--providers" || argument === "--public-url" || argument === "--hostname") {
     if (!args[index + 1] || args[index + 1].startsWith("--")) {
-      setupArgumentError = "--providers requires a comma-separated value.";
+      setupArgumentError = argument === "--providers"
+        ? "--providers requires a comma-separated value."
+        : `${argument} requires a value.`;
       break;
     }
     index += 1;
@@ -106,6 +113,12 @@ if (!setupArgumentError && TARGET !== "codex" && (migrateKnown || adoptNativeCat
   setupArgumentError = `${
     migrateKnown ? "--migrate-known" : "--adopt-native-catalog"
   } applies only to the Codex target.`;
+}
+if (!setupArgumentError && TARGET !== "cursor" && (args.includes("--public-url") || args.includes("--hostname"))) {
+  setupArgumentError = "--public-url and --hostname apply only to the Cursor target.";
+}
+if (!setupArgumentError && args.includes("--public-url") && args.includes("--hostname")) {
+  setupArgumentError = "Use either --hostname or --public-url, not both.";
 }
 if (!setupArgumentError) {
   setupArgumentError = traySetupError({
@@ -145,6 +158,8 @@ Options:
   --guided             Ask provider and migration questions interactively
   --auto               Use already configured credentials (default)
   --providers LIST     Comma-separated provider ids
+  --hostname HOST      Public hostname for a managed Cloudflare named tunnel
+  --public-url URL     Existing stable HTTPS tunnel origin for Cursor App
   --migrate-known      Safely migrate recognized earlier Codex Router installs
   --adopt-native-catalog  Use an existing user-owned native Codex catalog as the merge base
   --smoke-test         Make one small live request per enabled provider
@@ -330,7 +345,10 @@ function oauthSetupHint(provider) {
     const command = process.platform === "win32"
       ? ".\\codex-router.ps1 providers login antigravity-oauth"
       : "./bin/providers login antigravity-oauth";
-    return `run \`${command}\``;
+    const probe = process.platform === "win32"
+      ? ".\\codex-router.ps1 providers probe antigravity-oauth --live --yes"
+      : "./bin/providers probe antigravity-oauth --live --yes";
+    return `run \`${command}\`, then explicitly run \`${probe}\` after reviewing its quota cost`;
   }
   return "run `kimi login`";
 }
@@ -341,7 +359,9 @@ async function configureProvider(provider) {
     const setup =
       provider.kind === "oauth"
         ? oauthSetupHint(provider)
-        : `run \`./bin/provider-key ${provider.id} set\``;
+        : provider.credential?.resolver
+          ? credentialSetupHint(provider)
+          : `run \`./bin/provider-key ${provider.id} set\``;
     throw incomplete(`${provider.displayName} is selected but not configured; ${setup} first.`);
   }
   if (provider.kind === "oauth") {
@@ -349,10 +369,38 @@ async function configureProvider(provider) {
       if (!confirm(`Open a browser to sign in to ${provider.displayName} now?`)) {
         throw incomplete(`${provider.displayName} sign-in was cancelled.`);
       }
-      const { signInAntigravity } = await import("./antigravity-oauth-onboarding.mjs");
-      await signInAntigravity();
-      if (!providerConfigured(provider)) {
+      const deadline = operationDeadlineFromEnvironment(process.env, {
+        timeoutMs: 10 * 60_000,
+        maximumMs: 10 * 60_000,
+      });
+      const controller = new AbortController();
+      const timer = setTimeout(() => {
+        const error = new Error("Antigravity OAuth setup exceeded its absolute deadline.");
+        error.code = "router_operation_timeout";
+        controller.abort(error);
+      }, remainingOperationMs(deadline));
+      timer.unref?.();
+      try {
+        // Dependency setup and the browser callback share one deadline so a
+        // wedged npm child cannot consume an unbounded pre-auth phase or fail
+        // the setup only after the operator has authorized Google.
+        await ensureNodeDependencies({ signal: controller.signal, deadline });
+        const { signInAntigravity } = await import("./antigravity-oauth-onboarding.mjs");
+        await signInAntigravity({ signal: controller.signal, deadline });
+      } finally {
+        clearTimeout(timer);
+      }
+      const status = antigravityOAuthStatus();
+      if (!status.signedIn) {
         throw incomplete(`${provider.displayName} sign-in did not produce a usable credential.`);
+      }
+      if (!status.configured) {
+        const probe = process.platform === "win32"
+          ? ".\\codex-router.ps1 providers probe antigravity-oauth --live --yes"
+          : "./bin/providers probe antigravity-oauth --live --yes";
+        throw incomplete(
+          `${provider.displayName} is signed in but remains disabled until the explicit live compatibility test succeeds; run \`${probe}\` after reviewing its quota cost.`,
+        );
       }
       return;
     }
@@ -384,11 +432,16 @@ async function configureProvider(provider) {
     }
   } else {
     if (["anonymous", "per-model"].includes(provider.authMode)) return;
+    if (provider.credential?.resolver) {
+      throw incomplete(
+        `${provider.displayName} is selected but not configured; ${credentialSetupHint(provider)} first.`,
+      );
+    }
     const prompt = provider.credential?.prompt || `${provider.displayName} API key`;
     if (!confirm(`Enter ${prompt} securely now?`)) {
       throw incomplete(`${provider.displayName} setup was cancelled.`);
     }
-    ensureNodeDependencies();
+    await ensureNodeDependencies();
     run(process.execPath, [path.join(SOURCE_ROOT, "src", "provider-key.mjs"), provider.id, "set"]);
   }
 }
@@ -398,14 +451,6 @@ async function configureProvider(provider) {
 function installTray() {
   try {
     if (process.platform === "darwin") {
-      try {
-        execFileSync("xcrun", ["--find", "swift"], { stdio: "ignore" });
-      } catch {
-        process.stdout.write(
-          "The Swift toolchain is missing; run `xcode-select --install`, then `./bin/model-router-tray` to add the companion later.\n",
-        );
-        return;
-      }
       // One canonical transaction stages the signed bundle, drains any
       // running embedded Control Center, swaps atomically, stamps the build,
       // and hands the native host to launchd.
@@ -436,7 +481,7 @@ function installTray() {
     process.stdout.write(
       `Desktop companion install did not finish: ${error instanceof Error ? error.message : String(error)}\n` +
         (process.platform === "darwin"
-          ? "Recent macOS SDKs need the full Xcode app (not only the Command Line Tools) to build the menu-bar companion's SwiftUI macros.\n"
+          ? "The macOS companion needs the full Xcode app for its SwiftUI macros and WidgetKit extension. Select Xcode under Xcode > Settings > Locations > Command Line Tools, or set DEVELOPER_DIR for ./bin/model-router-tray.\n"
           : "") +
         (process.platform === "win32"
           ? "The router itself is installed; retry later with .\\codex-router.ps1 tray.\n"
@@ -514,9 +559,33 @@ async function main() {
       // wrong thing. Let it out so the installer restores the checkout.
       if (isNodeDependencyFailure(error)) throw error;
       const reason = error instanceof Error ? error.message : String(error);
-      pendingCredentials.push({ provider, reason });
+      pendingCredentials.push({
+        provider,
+        reason,
+        // A normal API provider can remain selected while waiting for a key;
+        // Antigravity cannot: sign-in alone is deliberately insufficient and
+        // its explicit quota-consuming proof has deterministically not passed.
+        withdrawn: provider.id === "antigravity-oauth",
+      });
       process.stderr.write(`\nWarning: ${provider.displayName} was not configured (${reason})\n`);
+      if (provider.id === "antigravity-oauth") {
+        process.stderr.write(
+          "Antigravity remains unselected until its explicit live proof succeeds and the router confirms its forwarder.\n",
+        );
+      }
     }
+  }
+  const withdrawnProviders = new Set(
+    pendingCredentials.filter(({ withdrawn }) => withdrawn).map(({ provider }) => provider.id),
+  );
+  if (withdrawnProviders.size) {
+    providers = providers.filter((id) => !withdrawnProviders.has(id));
+    const withdrawnModelSlugs = new Set(
+      modelChoices
+        .filter((model) => withdrawnProviders.has(canonicalProviderId(model.provider)))
+        .map((model) => model.slug),
+    );
+    selectedModelSlugs = selectedModelSlugs.filter((slug) => !withdrawnModelSlugs.has(slug));
   }
   writeProviderSelection(providers);
   // Written on every run, not only idle ones: re-running setup without
@@ -562,11 +631,29 @@ async function main() {
     return;
   }
 
+  const cursorTarget = TARGET === "cursor";
+  let cursorHostname = option("--hostname") || process.env.MODEL_ROUTER_CURSOR_TUNNEL_HOSTNAME;
+  let cursorPublicUrl = option("--public-url") || process.env.MODEL_ROUTER_CURSOR_PUBLIC_BASE_URL;
+  if (cursorTarget && guided && !cursorHostname && !cursorPublicUrl) {
+    cursorHostname = promptLine(
+      "Cloudflare hostname for Cursor App (for example cursor-router.example.com)",
+    );
+  }
+  if (cursorTarget && !cursorHostname && !cursorPublicUrl) {
+    throw incomplete(
+      "Cursor App requires --hostname for a managed named tunnel, or --public-url for an existing stable tunnel; retail Cursor's BYOK backend cannot reach loopback addresses.",
+    );
+  }
+  if (cursorHostname) process.env.MODEL_ROUTER_CURSOR_TUNNEL_HOSTNAME = cursorHostname;
+  if (cursorPublicUrl) process.env.MODEL_ROUTER_CURSOR_PUBLIC_BASE_URL = cursorPublicUrl;
+
   nextStep("Review and install");
   const dshTarget = TARGET === "dsh";
   // Like the harness, Gemini CLI has no native catalog to adopt: that list is
   // the ChatGPT-plan model set Codex publishes for itself.
   const geminiTarget = TARGET === "gemini";
+  const claudeTarget = TARGET === "claude";
+  const openclawTarget = TARGET === "openclaw";
   if (guided) {
     process.stdout.write(
       `\nReady to install:\n` +
@@ -577,6 +664,13 @@ async function main() {
           ? `  Changes: per-user background service and one provider route in the harness settings document\n`
           : geminiTarget
             ? `  Changes: per-user background service and one managed block in Gemini CLI's environment file\n`
+            : cursorTarget
+              ? `  Changes: per-user background service, Cursor Agent launcher, and Cursor App model settings\n` +
+                `  Public edge: ${cursorPublicUrl} -> 127.0.0.1:${(await import("./paths.mjs")).PORTS.cursorPublic}\n`
+            : claudeTarget
+              ? `  Changes: per-user background service and a router-owned claude-router launcher; Claude settings stay untouched\n`
+            : openclawTarget
+              ? `  Changes: installs OpenClaw when missing, starts the shared background service, and owns only models.providers.codex-router\n`
             : `  Native catalog: ${adoptNativeCatalog ? "adopt existing user catalog" : "capture from Codex"}\n` +
               `  Changes: per-user background service and the managed Codex config block\n`),
     );
@@ -603,6 +697,8 @@ async function main() {
         "-File",
         path.join(SOURCE_ROOT, "install.ps1"),
         "-CheckoutInstall",
+        "-Target",
+        TARGET,
         ...(adoptNativeCatalog ? ["-AdoptNativeCatalog"] : []),
       ]);
     } else {
@@ -647,6 +743,16 @@ async function main() {
           `It reads its environment at startup, so the next \`gemini\` run picks this up.\n` +
           `If it asks how to authenticate, choose "Use Gemini API key" once -- the key is this router's local caller capability.\n` +
           `For native GPT models, run \`codex login\`, then \`./bin/model-router codex chatgpt-session enable\` once; that authorization is shared by every local client.\n`
+        : cursorTarget
+          ? `\nCursor is ready with: ${providerSummary}\n` +
+            `Run \`cursor-router-agent --list-models\` for the CLI. Fully quit and reopen Cursor App, then choose a \`codex_router/.../EFFORT\` model.\n` +
+            `The HTTPS tunnel must keep forwarding to 127.0.0.1:${(await import("./paths.mjs")).PORTS.cursorPublic}.\n`
+        : claudeTarget
+          ? `\nClaude Code is ready with: ${providerSummary}\n` +
+            `Run \`claude-router\`, then choose any \`codex_router/anthropic/...\` model from /model.\n`
+        : openclawTarget
+          ? `\nOpenClaw is ready with: ${providerSummary}\n` +
+            `Run \`openclaw\`; every routed model is available under the \`codex-router\` provider.\n`
         : `\nCodex Router is ready with: ${providerSummary}\nFully quit Codex, reopen it, and start a new task.\n`,
   );
   if (visionBridge?.enabled && visionBridge.engine) {
@@ -662,18 +768,27 @@ async function main() {
     );
   }
   if (pendingCredentials.length) {
+    const retainedPending = pendingCredentials.filter(({ withdrawn }) => !withdrawn);
+    const withdrawnPending = pendingCredentials.filter(({ withdrawn }) => withdrawn);
     process.stdout.write(
-      `\nStill needs a credential:\n` +
+      `\nStill needs provider setup:\n` +
         pendingCredentials
           .map(({ provider }) => {
             if (provider.kind === "oauth") {
               return `  ${provider.displayName}: ${oauthSetupHint(provider)}\n`;
             }
-            const key = `./bin/provider-key ${provider.id} set`;
-            return `  ${provider.displayName}: ${key}\n`;
+            const setup = provider.credential?.resolver
+              ? credentialSetupHint(provider)
+              : `./bin/provider-key ${provider.id} set`;
+            return `  ${provider.displayName}: ${setup}\n`;
           })
           .join("") +
-        `These providers stay selected and start working as soon as a key is stored.\n`,
+        (retainedPending.length
+          ? "Providers waiting only for a credential stay selected and start working as soon as it is stored.\n"
+          : "") +
+        (withdrawnPending.length
+          ? "Antigravity remains unselected until its explicit live proof succeeds and the router confirms its forwarder.\n"
+          : ""),
     );
   }
 }

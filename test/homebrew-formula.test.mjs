@@ -30,7 +30,9 @@ test("Homebrew lock selection follows its declared Python version", () => {
     "3.14",
   );
   const versions = new Map(selected.map(({ name, version }) => [name, version]));
-  assert.equal(versions.get("litellm"), "1.96.0");
+  assert.equal(versions.get("litellm"), "1.96.2");
+  assert.equal(versions.get("multidict"), "6.9.1");
+  assert.equal(versions.get("urllib3"), "2.8.0");
   assert.equal(versions.get("fastapi"), "0.139.2");
   assert.equal(versions.get("numpy"), "2.5.1");
   assert.equal(versions.get("rpds-py"), "2026.6.3");
@@ -168,13 +170,21 @@ test("the generated formula owns upgrades and preserves one-time setup", () => {
   // print the wrong usage. It must go through the packaged dispatcher.
   assert.match(formula, /exec "\$source_root\/bin\/codex-router" "\$@"/);
   assert.doesNotMatch(formula, /bin\/model-router" codex/);
-  // bin/codex-router refuses `install` on purpose, so post_install must not
-  // reach the installer through the dispatcher -- that pairing would break
-  // every `brew upgrade` the moment the shim was repointed.
-  assert.match(formula, /system libexec\/"packaged-install"/);
+  // bin/codex-router refuses `install` on purpose, so upgrade reconciliation
+  // must not reach the installer through the dispatcher -- that pairing would
+  // break every `brew upgrade` the moment the shim was repointed.
   assert.doesNotMatch(formula, /system bin\/"codex-router", "install"/);
   assert.match(formula, /exec "\$source_root\/bin\/install" "\$@"/);
-  assert.match(formula, /manifest\.dig\("current", "packageManager"\) != "homebrew"/);
+  // Official Homebrew taps reject arbitrary Ruby post_install methods. The
+  // declarative step invokes a private helper that retains the existing
+  // manifest gate and warning without putting Ruby logic in the formula hook.
+  assert.doesNotMatch(formula, /^\s*def post_install\b/m);
+  assert.match(formula, /post_install_steps do/);
+  assert.match(formula, /run "packaged-post-install", base: :libexec/);
+  assert.match(formula, /manifest\?\.current\?\.packageManager/);
+  assert.match(formula, /\[ "\$package_manager" = homebrew \] \|\| exit 0/);
+  assert.match(formula, /exec "\$helper_root\/packaged-install"/);
+  assert.match(formula, /install manifest is invalid/);
   assert.match(formula, /codex-router setup --guided/);
   assert.match(formula, /router and CLI only/);
   assert.match(formula, /does not build or\s+download the Electron Control Center/);

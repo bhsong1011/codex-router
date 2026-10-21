@@ -30,18 +30,20 @@ const {
   curatedModelContextLength,
   curatedModelDescription,
   curatedModelIds,
+  curatedModelInputModalities,
   curatedModelOutputLimit,
   curatedModelProviderId,
   curatedModelReasoningLevels,
+  curatedModelRequestProfile,
   curationProviderIds,
 } = await import("../src/opencode-curation.mjs");
 const { CHECKED_IN_MODELS, MODEL_BY_SLUG } = await import("../src/model-registry.mjs");
 const {
   DEFAULT_AUTO_COMPACT,
   DEFAULT_CONTEXT_WINDOW,
-  defaultUserModelDescription,
   hasDefaultUserModelReasoning,
   userModelEntry,
+  userModelIdentity,
 } = await import("../src/user-models.mjs");
 process.argv = savedArgv;
 process.exitCode = 0;
@@ -82,7 +84,16 @@ test("OpenCode curation keeps each endpoint family on its documented protocol", 
     "opencode-free",
     "opencode-free-responses",
   ]);
-  assert.deepEqual(curationProviderIds("opencode-zen"), ["opencode-zen"]);
+  assert.deepEqual(curationProviderIds("opencode-zen"), [
+    "opencode-zen",
+    "opencode-zen-messages",
+    "opencode-zen-responses",
+  ]);
+  assert.deepEqual(curationProviderIds("opencode-zen-messages"), [
+    "opencode-zen",
+    "opencode-zen-messages",
+    "opencode-zen-responses",
+  ]);
   assert.deepEqual(curationProviderIds("opencode-go"), [
     "opencode-go",
     "opencode-go-messages",
@@ -100,13 +111,26 @@ test("OpenCode curation keeps each endpoint family on its documented protocol", 
       model.slug,
     );
   }
+  // Client-gated, so its documented protocol is only resolved for an entry
+  // that already exists; a fresh candidate is refused before the wire matters.
   assert.equal(
-    curatedModelProviderId("opencode-free", "muse-spark-1.2-contributor-free"),
+    curatedModelProviderId("opencode-free", "muse-spark-1.2-contributor-free", {
+      existingProvider: "opencode-free",
+    }),
     "opencode-free-responses",
   );
   assert.equal(
     curatedModelProviderId("opencode-zen", "muse-spark-1.2"),
-    "opencode-zen",
+    "opencode-zen-responses",
+  );
+  assert.equal(
+    curatedModelProviderId("opencode-zen", "claude-sonnet-4-5"),
+    "opencode-zen-messages",
+  );
+  assert.equal(curatedModelProviderId("opencode-zen", "glm-5.3"), "opencode-zen");
+  assert.match(
+    curatedModelBlockReason("opencode-zen", "gemini-3-pro") || "",
+    /Google's native protocol/,
   );
   assert.equal(curatedModelBlockReason("opencode-go", "grok-4.5"), undefined);
   assert.match(
@@ -123,6 +147,18 @@ test("OpenCode curation keeps each endpoint family on its documented protocol", 
     }),
     "opencode-go-responses",
   );
+});
+
+test("OpenCode Free Muse curation carries its model-specific tool-choice repair", () => {
+  assert.equal(
+    curatedModelRequestProfile("opencode-free", "muse-spark-1.2-contributor-free"),
+    "auto-tool-choice",
+  );
+  assert.equal(
+    curatedModelRequestProfile("opencode-free", "muse-spark-1.3-contributor-free"),
+    "auto-tool-choice",
+  );
+  assert.equal(curatedModelRequestProfile("opencode-free", "nemotron-3-ultra-free"), undefined);
 });
 
 test("Command Code curation accepts only its exact certified Chat and Messages routes", () => {
@@ -202,6 +238,106 @@ test("scripted OpenCode curation refuses an uncertified discovered protocol rout
   }
 });
 
+// OpenCode answers a free-tier request that did not come from its own client
+// with `FreeTierError: OpenCode's free tier can only be used from within
+// OpenCode`. Curating such an id would hand the operator a picker entry that
+// fails on its first request, which is the exact outcome the unverified-
+// protocol refusal beside it exists to prevent, so the gate refuses it too --
+// and says the provider's policy is the cause, not this router's coverage.
+test("client-gated OpenCode Free ids are refused, and the one that answers is not", () => {
+  for (const id of [
+    "big-pickle",
+    "mimo-v2.5-free",
+    "mimo-v2.6-flash-free",
+    "muse-spark-1.2-contributor-free",
+    "muse-spark-1.3-contributor-free",
+    "nemotron-3-ultra-free",
+    "nemotron-3.5-lightning-free",
+  ]) {
+    const reason = curatedModelBlockReason("opencode-free", id);
+    assert.equal(typeof reason, "string", `${id} is not refused`);
+    assert.match(reason, /only to its own client/);
+    assert.match(reason, /can only be used from within OpenCode/);
+    // The cause has to be named as the provider's, or the message reads like a
+    // missing feature somebody could wait for this repository to ship.
+    assert.match(reason, /access policy rather than a router compatibility limitation/);
+    assert.throws(() => curatedModelProviderId("opencode-free", id), /only to its own client/);
+    // The Responses half of the same provider pair answers identically.
+    assert.match(
+      curatedModelBlockReason("opencode-free-responses", id) || "",
+      /only to its own client/,
+    );
+  }
+  // Probed on the same run and not gated, so it stays addable. A blanket
+  // provider rule would have taken this one out with the rest.
+  assert.equal(curatedModelBlockReason("opencode-free", "deepseek-v4-flash-free"), undefined);
+  assert.equal(
+    curatedModelProviderId("opencode-free", "deepseek-v4-flash-free"),
+    "opencode-free",
+  );
+});
+
+// The gate withholds a route's first appearance. It must not reach a row the
+// operator already has: curation resolves every stored entry through the same
+// function, and refusing those would strand them short of their documented
+// provider and metadata.
+test("a gated id already curated still resolves to its documented route", () => {
+  assert.equal(
+    curatedModelProviderId("opencode-free", "muse-spark-1.2-contributor-free", {
+      existingProvider: "opencode-free",
+    }),
+    "opencode-free-responses",
+  );
+  assert.equal(
+    curatedModelProviderId("opencode-free", "mimo-v2.6-flash-free", {
+      existingProvider: "opencode-free",
+    }),
+    "opencode-free",
+  );
+  const stored = userModelEntry({
+    providerId: "opencode-free",
+    upstreamId: "nemotron-3-ultra-free",
+    priority: 154,
+  });
+  const [normalized] = normalizeCurationModels([stored], "opencode-free");
+  assert.equal(normalized.contextWindow, 1_000_000);
+  assert.equal(normalized.autoCompact, 850_000);
+});
+
+test("scripted OpenCode Free curation refuses a client-gated id by name", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "curate-models-opencode-free-gated-"));
+  const fixture = path.join(dir, "models.json");
+  writeFileSync(fixture, JSON.stringify({ data: [{ id: "mimo-v2.6-flash-free" }] }));
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [
+        path.join(root, "src", "curate-models.mjs"),
+        "opencode-free",
+        "--models",
+        "mimo-v2.6-flash-free",
+        "--fixture",
+        fixture,
+        "--no-apply",
+      ],
+      {
+        cwd: root,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          CODEX_ROUTER_STATE_DIR: dir,
+          MODEL_ROUTER_USER_MODELS: path.join(dir, "user-models.json"),
+          OPENCODE_API_KEY: "",
+        },
+      },
+    );
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /mimo-v2\.6-flash-free only to its own client/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("scripted Command Code curation refuses an uncertified discovered protocol route", () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), "curate-models-commandcode-blocked-"));
   const fixture = path.join(dir, "models.json");
@@ -247,7 +383,7 @@ test("OpenCode Free curation knows the documented windows its live catalog omits
   assert.equal(curatedModelContextLength("opencode-free", "mimo-v2.5-free"), undefined);
 });
 
-test("paid Zen curation identity remains byte-for-byte unchanged", () => {
+test("paid Zen Muse curation lands on the Responses variant", () => {
   const paidZen = userModelEntry({
     providerId: "opencode-zen",
     upstreamId: "muse-spark-1.2",
@@ -256,9 +392,9 @@ test("paid Zen curation identity remains byte-for-byte unchanged", () => {
     metadata: { contextWindow: 1_048_576 },
   });
   const [normalized] = normalizeCurationModels([paidZen], "opencode-zen");
-  assert.strictEqual(normalized, paidZen);
-  assert.equal(normalized.slug, "opencode-zen/muse-spark-1.2");
-  assert.equal(normalized.gatewayModel, "opencode-zen-muse-spark-1-2");
+  assert.equal(normalized.slug, "opencode-zen-responses/muse-spark-1.2");
+  assert.equal(normalized.gatewayModel, "opencode-zen-responses-muse-spark-1-2");
+  assert.equal(normalized.provider, "opencode-zen-responses");
 });
 
 test("OpenCode protocol normalization preserves metadata and deduplicates old routes", () => {
@@ -293,8 +429,37 @@ test("OpenCode protocol normalization preserves metadata and deduplicates old ro
 
   assert.deepEqual(
     normalizeCurationModels([old, correct], "opencode-free"),
-    [correct],
+    [{ ...correct, requestProfile: "auto-tool-choice" }],
   );
+});
+
+test("Both Muse Spark 1.2 and 1.3 contributor free curate to opencode-free-responses", () => {
+  for (const upstreamModel of [
+    "muse-spark-1.2-contributor-free",
+    "muse-spark-1.3-contributor-free",
+  ]) {
+    const entry = userModelEntry({
+      providerId: "opencode-free",
+      upstreamId: upstreamModel,
+      priority: 147,
+      requestProfile: "auto-tool-choice",
+      metadata: {
+        contextWindow: 1_048_576,
+        autoCompact: 900_000,
+        inputModalities: ["text", "image"],
+        isFree: true,
+      },
+    });
+    const [normalized] = normalizeCurationModels([entry], "opencode-free");
+    assert.equal(normalized.provider, "opencode-free-responses", `${upstreamModel} provider`);
+    assert.equal(
+      normalized.slug,
+      `opencode-free-responses/${upstreamModel}`,
+      `${upstreamModel} slug`,
+    );
+    assert.equal(normalized.upstreamModel, upstreamModel);
+    assert.equal(normalized.multiAgentVersion, undefined, `${upstreamModel} not v2`);
+  }
 });
 
 test("an additive model run keeps unrelated curated metadata", () => {
@@ -369,6 +534,88 @@ test("--remove edits local curation without provider credentials or discovery", 
   }
 });
 
+// --no-apply reads like a rehearsal but only defers publication: it still
+// persists the overlay, so a removal run under it really deletes. --dry-run is
+// the rehearsal, and the distinction only matters if it writes nothing at all.
+test("--dry-run reports the removal it would make and leaves the overlay alone", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "curate-models-dry-run-"));
+  const file = path.join(dir, "user-models.json");
+  const kept = curated("accounts/fireworks/models/kimi-k3");
+  const doomed = curated("accounts/fireworks/models/deepseek-v4-flash");
+  const before = JSON.stringify({ version: 1, models: [kept, doomed] });
+  writeFileSync(file, before);
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [
+        path.join(root, "src", "curate-models.mjs"),
+        "fireworks",
+        "--remove",
+        doomed.upstreamModel,
+        "--dry-run",
+      ],
+      {
+        cwd: root,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          FIREWORKS_API_KEY: "",
+          MODEL_ROUTER_USER_MODELS: file,
+          MODEL_ROUTER_STATE_DIR: dir,
+        },
+      },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Dry run/);
+    assert.match(result.stdout, /Nothing was written/);
+    // It has to name the model, or the rehearsal cannot be checked before the
+    // real run is authorised.
+    assert.ok(
+      result.stdout.includes(`- ${doomed.upstreamModel}`),
+      `the dry run must name ${doomed.upstreamModel}; got:\n${result.stdout}`,
+    );
+    assert.equal(readFileSync(file, "utf8"), before, "a dry run must not touch the overlay");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("--dry-run refuses to be combined with a flag that writes", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "curate-models-dry-run-guard-"));
+  const file = path.join(dir, "user-models.json");
+  const doomed = curated("accounts/fireworks/models/deepseek-v4-flash");
+  writeFileSync(file, JSON.stringify({ version: 1, models: [doomed] }));
+  try {
+    for (const flag of ["--apply", "--no-apply"]) {
+      const result = spawnSync(
+        process.execPath,
+        [
+          path.join(root, "src", "curate-models.mjs"),
+          "fireworks",
+          "--remove",
+          doomed.upstreamModel,
+          "--dry-run",
+          flag,
+        ],
+        {
+          cwd: root,
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            FIREWORKS_API_KEY: "",
+            MODEL_ROUTER_USER_MODELS: file,
+            MODEL_ROUTER_STATE_DIR: dir,
+          },
+        },
+      );
+      assert.notEqual(result.status, 0, `${flag} must not be accepted beside --dry-run`);
+      assert.match(result.stderr, /--dry-run writes nothing/);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("interactive deselection remains authoritative", () => {
   const kept = curated("accounts/fireworks/models/kimi-k3");
   const removed = curated("accounts/fireworks/models/deepseek-v4-flash");
@@ -432,11 +679,19 @@ test("a curated model can opt into the auto tool-choice profile", () => {
   assert.equal(parseRequestProfile("auto-tool-choice"), "auto-tool-choice");
 });
 
+test("a curated model can opt into omit-tool-choice", () => {
+  assert.equal(parseRequestProfile("omit-tool-choice"), "omit-tool-choice");
+});
+
 test("a curated model can opt into the narrow encrypted-schema profile", () => {
   assert.equal(
     parseRequestProfile("codex-encrypted-schema"),
     "codex-encrypted-schema",
   );
+});
+
+test("a curated model can opt into the DashScope reasoning profile", () => {
+  assert.equal(parseRequestProfile("dashscope-reasoning"), "dashscope-reasoning");
 });
 
 test("an unknown request profile is rejected by name", () => {
@@ -816,7 +1071,7 @@ test("OpenCode Free curation migrates Muse to Responses", () => {
   }
 });
 
-test("removing an old Chat-routed Muse does not create a stale Responses picker entry", () => {
+test("removing an old Chat-routed Muse forgets its stale picker decision", () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), "curate-opencode-free-remove-"));
   const file = path.join(dir, "user-models.json");
   const pickerFile = path.join(dir, "model-picker.json");
@@ -860,11 +1115,9 @@ test("removing an old Chat-routed Muse does not create a stale Responses picker 
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(JSON.parse(readFileSync(file, "utf8")).models, []);
     const picker = JSON.parse(readFileSync(pickerFile, "utf8"));
-    assert.deepEqual(picker.visible, [oldMuse.slug]);
-    assert.equal(
-      picker.visible.includes(`opencode-free-responses/${museId}`),
-      false,
-    );
+    assert.deepEqual(picker.visible, []);
+    assert.deepEqual(picker.hidden, []);
+    assert.deepEqual(picker.seeded, []);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -897,7 +1150,10 @@ test("curation publishes through the overlay finalizer, never the installer", ()
 // checked-in precedent is config/zai/coding/glm-5.3.json, whose description
 // records the probe that justified 1M. Curated entries have the same field.
 test("a documented OpenCode Free window ships with the sourcing that justifies it", () => {
-  for (const id of ["muse-spark-1.2-contributor-free"]) {
+  for (const id of [
+    "muse-spark-1.2-contributor-free",
+    "muse-spark-1.3-contributor-free",
+  ]) {
     const description = curatedModelDescription("opencode-free", id);
     assert.equal(typeof description, "string", `${id} has no sourcing note`);
     // Naming the figure, and naming what published it, is the whole point.
@@ -919,19 +1175,95 @@ test("the Responses variant resolves the same sourcing as its base provider", ()
     curatedModelDescription("opencode-free-responses", "muse-spark-1.2-contributor-free"),
     curatedModelDescription("opencode-free", "muse-spark-1.2-contributor-free"),
   );
+  assert.equal(
+    curatedModelDescription("opencode-free-responses", "muse-spark-1.3-contributor-free"),
+    curatedModelDescription("opencode-free", "muse-spark-1.3-contributor-free"),
+  );
+});
+
+// The label names the route, not the tier. A "Free" in the name put this route
+// in a family of its own, away from the paid routes to the same model, because
+// the picker builds its grouping key from the display name.
+test("OpenCode Free Muse Spark routes publish stable picker labels", async () => {
+  const { curatedModelDisplayName, curatedModelIsFree } =
+    await import("../src/opencode-curation.mjs");
+  const { officialModelDisplayName } = await import("../src/user-models.mjs");
+  for (const [providerId, upstreamId, label, family] of [
+    [
+      "opencode-free",
+      "muse-spark-1.2-contributor-free",
+      "Muse Spark 1.2 Contributor (OpenCode Free)",
+      "Muse Spark 1.2 Contributor",
+    ],
+    [
+      "opencode-free",
+      "muse-spark-1.3-contributor-free",
+      "Muse Spark 1.3 Contributor (OpenCode Free)",
+      "Muse Spark 1.3 Contributor",
+    ],
+  ]) {
+    assert.equal(curatedModelDisplayName(providerId, upstreamId), label);
+    assert.equal(officialModelDisplayName(providerId, upstreamId), label);
+    assert.equal(curatedModelDisplayName("opencode-free-responses", upstreamId), label);
+    assert.equal(officialModelDisplayName("opencode-free-responses", upstreamId), label);
+    // The grouping key the Control Center derives: strip the trailing provider
+    // qualifier and what is left must equal the paid routes' family name.
+    assert.equal(label.replace(/\s+\([^()]+\)\s*$/u, "").trim(), family);
+    assert.equal(curatedModelIsFree(providerId, upstreamId), true);
+    assert.equal(curatedModelIsFree("opencode-free-responses", upstreamId), true);
+  }
+});
+
+// An id this module documents nothing about must not be tagged: `undefined`
+// leaves a stored flag standing, where `false` would erase one.
+test("curated free tagging is undefined for an undocumented id", async () => {
+  const { curatedModelIsFree } = await import("../src/opencode-curation.mjs");
+  assert.equal(curatedModelIsFree("opencode-free", "not-a-documented-id"), undefined);
+});
+
+// Zen's catalog never advertises modalities, so free Muse image input has to
+// live in the same documented table as the window and effort ladder. Both
+// free ids publish attachment/image on models.dev; every other free id stays
+// on the conservative text-only default until measured the same way.
+test("OpenCode Free Muse Spark routes document text and image input", () => {
+  for (const id of [
+    "muse-spark-1.2-contributor-free",
+    "muse-spark-1.3-contributor-free",
+  ]) {
+    assert.deepEqual(
+      curatedModelInputModalities("opencode-free", id),
+      ["text", "image"],
+      id,
+    );
+    assert.deepEqual(
+      curatedModelInputModalities("opencode-free-responses", id),
+      ["text", "image"],
+      `${id} responses variant`,
+    );
+  }
+  assert.equal(
+    curatedModelInputModalities("opencode-free", "nemotron-3-ultra-free"),
+    undefined,
+  );
+  assert.equal(
+    curatedModelInputModalities("opencode-free", "not-a-documented-id"),
+    undefined,
+  );
 });
 
 test("scripted OpenCode Free curation stores the documented window and its sourcing", () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), "curate-opencode-free-sourcing-"));
   const file = path.join(dir, "user-models.json");
   const fixture = path.join(dir, "models.json");
-  // Ox Alpha used to stand in for the documented-window case here, but that
-  // OpenCode Free id was withdrawn. Nemotron 3 Ultra Free carries the same
-  // shape (a published 1M window with a declared output limit) and is still
-  // reached through curation.
-  const oxId = "nemotron-3-ultra-free";
-  const otherId = "mimo-v2.5-free";
-  writeFileSync(fixture, JSON.stringify({ data: [{ id: oxId }, { id: otherId }] }));
+  // Ox Alpha used to stand in for the documented-window case here, then
+  // Nemotron 3 Ultra Free did. Both are unreachable now -- Ox Alpha was
+  // withdrawn, Nemotron is client-gated -- so the case rests on Laguna, which
+  // has the same shape (a published window with a declared output limit) and
+  // is still addable. The undocumented-id half of this test moved out with
+  // `mimo-v2.5-free`: every free id that documents nothing is client-gated,
+  // and refusing those is what the gate test below covers.
+  const oxId = "laguna-s-2.1-free";
+  writeFileSync(fixture, JSON.stringify({ data: [{ id: oxId }] }));
   try {
     const result = spawnSync(
       process.execPath,
@@ -939,7 +1271,7 @@ test("scripted OpenCode Free curation stores the documented window and its sourc
         path.join(root, "src", "curate-models.mjs"),
         "opencode-free",
         "--models",
-        `${oxId},${otherId}`,
+        oxId,
         "--fixture",
         fixture,
         "--no-apply",
@@ -961,16 +1293,12 @@ test("scripted OpenCode Free curation stores the documented window and its sourc
     assert.equal(result.status, 0, result.stderr);
     const stored = JSON.parse(readFileSync(file, "utf8"));
     const ox = stored.models.find((model) => model.upstreamModel === oxId);
-    assert.equal(ox.contextWindow, 1_000_000);
-    assert.equal(ox.autoCompact, 850_000);
+    assert.equal(ox.contextWindow, 256_000);
+    assert.equal(ox.autoCompact, 217_600);
     assert.equal(ox.description, curatedModelDescription("opencode-free", oxId));
     // autoCompact has to leave room for the id's published output limit, or
     // compaction never fires early enough to keep a completion inside the window.
     assert.ok(ox.contextWindow - ox.autoCompact >= curatedModelOutputLimit("opencode-free", oxId));
-
-    const other = stored.models.find((model) => model.upstreamModel === otherId);
-    assert.equal(other.contextWindow, 131072);
-    assert.equal(other.description, defaultUserModelDescription("opencode-free"));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -1040,6 +1368,17 @@ test("an untuned entry gains the documented ladder while a tuned one is untouche
   assert.equal(upgraded.contextWindow, 256_000);
   assert.equal(upgraded.autoCompact, 217_600);
 
+  const muse = userModelEntry({
+    providerId: "opencode-free-responses",
+    upstreamId: "muse-spark-1.2-contributor-free",
+    priority: 151,
+    metadata: { contextWindow: 200_000, autoCompact: 170_000 },
+  });
+  const [upgradedMuse] = normalizeCurationModels([muse], "opencode-free");
+  assert.equal(upgradedMuse.requestProfile, "auto-tool-choice");
+  assert.equal(upgradedMuse.contextWindow, 200_000);
+  assert.equal(upgradedMuse.autoCompact, 170_000);
+
   // A ladder-only id keeps the conservative window and still gains the ladder.
   const flash = userModelEntry({
     providerId: "opencode-free",
@@ -1077,16 +1416,20 @@ test("an untuned entry gains the documented ladder while a tuned one is untouche
   assert.strictEqual(normalizeCurationModels([undocumented], "opencode-free")[0], undocumented);
 });
 
-test("a non-interactive OpenCode Free curation stores documented windows and ladders", () => {
+test("a non-interactive OpenCode Free curation stores documented metadata and profiles", () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), "curate-opencode-free-ladders-"));
   const file = path.join(dir, "user-models.json");
   const fixture = path.join(dir, "models.json");
   const lagunaId = "laguna-s-2.1-free";
   const flashId = "deepseek-v4-flash-free";
-  const undocumentedId = "mimo-v2.5-free";
-  // Zen serves these exact id-only records: no context limit, no effort control.
+  // Zen serves these exact id-only records: no context limit, no effort
+  // control. The Muse and undocumented ids this run used to carry are client-
+  // gated now, so they cannot be added at all; the profile and modality
+  // overlays they proved are covered against stored entries instead, by
+  // "OpenCode Free curation migrates Muse to Responses" and
+  // "OpenCode Free Muse Spark routes document text and image input".
   writeFileSync(fixture, JSON.stringify({
-    data: [{ id: lagunaId }, { id: flashId }, { id: undocumentedId }],
+    data: [{ id: lagunaId }, { id: flashId }],
   }));
   const env = {
     ...process.env,
@@ -1103,7 +1446,7 @@ test("a non-interactive OpenCode Free curation stores documented windows and lad
       path.join(root, "src", "curate-models.mjs"),
       "opencode-free",
       "--models",
-      `${lagunaId},${flashId},${undocumentedId}`,
+      `${lagunaId},${flashId}`,
       "--fixture",
       fixture,
       "--no-apply",
@@ -1146,13 +1489,10 @@ test("a non-interactive OpenCode Free curation stores documented windows and lad
     assert.match(flash.description, /unknown/);
     assert.match(flash.description, /low\/high\/max/);
 
-    // Nothing documented: every value stays a conservative default, and the
-    // stock description keeps saying exactly that.
-    const undocumented = find(undocumentedId);
-    assert.equal(undocumented.contextWindow, DEFAULT_CONTEXT_WINDOW);
-    assert.equal(undocumented.autoCompact, DEFAULT_AUTO_COMPACT);
-    assert.ok(hasDefaultUserModelReasoning(undocumented));
-    assert.equal(undocumented.description, defaultUserModelDescription("opencode-free"));
+    // Muse's exact-model profile is never spread across the Chat routes beside
+    // it, so a free id that documents no profile still stores none.
+    assert.equal(laguna.requestProfile, undefined);
+    assert.deepEqual(laguna.inputModalities, ["text"]);
 
     // A rerun is additive and must not rewrite what it already stored.
     const before = readFileSync(file, "utf8");
@@ -1209,6 +1549,59 @@ test("--efforts still overrides a documented ladder", () => {
     assert.equal(stored.contextWindow, 256_000);
     assert.match(stored.description, /256,000/);
     assert.doesNotMatch(stored.description, /low\/medium\/high ladder/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("scripted curation records that a served window and modalities came from the provider's catalog", () => {
+  const providerId = "openrouter";
+  const upstreamModel = "vendor/sized";
+  const dir = mkdtempSync(path.join(os.tmpdir(), "curate-advertised-"));
+  const file = path.join(dir, "user-models.json");
+  const fixture = path.join(dir, "models.json");
+  writeFileSync(fixture, JSON.stringify({ data: [
+    { id: upstreamModel, context_length: 1048576, architecture: { input_modalities: ["text", "image", "file"] } },
+    { id: "vendor/silent" },
+    { id: "vendor/audio-only", architecture: { input_modalities: ["audio"] } },
+  ] }));
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [
+        path.join(root, "src", "curate-models.mjs"),
+        providerId,
+        "--models",
+        `${upstreamModel},vendor/silent,vendor/audio-only`,
+        "--fixture",
+        fixture,
+        "--no-apply",
+      ],
+      {
+        cwd: root,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          CODEX_HOME: path.join(dir, "codex"),
+          MODEL_ROUTER_STATE_DIR: dir,
+          MODEL_ROUTER_USER_MODELS: file,
+          MODEL_ROUTER_MODEL_PICKER_STATE: path.join(dir, "model-picker.json"),
+          OPENROUTER_API_KEY: "",
+        },
+      },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    const models = JSON.parse(readFileSync(file, "utf8")).models;
+    const sized = models.find((model) => model.upstreamModel === upstreamModel);
+    assert.equal(sized.contextWindow, 1048576);
+    assert.deepEqual(sized.inputModalities, ["text", "image"], "file is advertised but not publishable; text and image survive");
+    assert.match(sized.description, /context window and input modalities as advertised by the provider's catalog/);
+    const audioOnly = models.find((model) => model.upstreamModel === "vendor/audio-only");
+    assert.deepEqual(audioOnly.inputModalities, ["text"], "an unpublishable modality set falls back to the default, never an empty list");
+    assert.match(audioOnly.description, /conservative default metadata/);
+    const silent = models.find((model) => model.upstreamModel === "vendor/silent");
+    assert.equal(silent.contextWindow, 131072);
+    assert.match(silent.description, /conservative default metadata/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

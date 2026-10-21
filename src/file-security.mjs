@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto";
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   renameSync,
   statSync,
@@ -10,6 +11,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import path from "node:path";
+
+import { startupTimeoutMs } from "./startup-timeout.mjs";
 
 const WINDOWS_PRIVATE_ASYNC_TIMEOUT_MS = 30_000;
 const WINDOWS_PRIVATE_ASYNC_OUTPUT_LIMIT = 64 * 1024;
@@ -172,6 +175,17 @@ function protectPrivateFilesWin32(paths) {
       {
         env: windowsPowerShellEnvironment(list),
         stdio: ["ignore", "ignore", "pipe"],
+        // Slow hosts (VDI Task Scheduler ancestry) need a wider bound for
+        // the helper's cold start; the default is unchanged. The async
+        // request path keeps its own bound below.
+        timeout: startupTimeoutMs("CODEX_ROUTER_WINDOWS_PRIVATE_SYNC_TIMEOUT_MS", 15_000),
+        // Every private write reaches this helper, including the ones a
+        // Control Center status refresh performs. A console child of a GUI
+        // parent gets its own window unless this is set, which is how a
+        // routine refresh produced a burst of visible PowerShell windows
+        // (issue #565). The script is non-interactive and its stdio is
+        // already redirected, so nothing is hidden from the operator.
+        windowsHide: true,
       },
     );
   } catch (error) {
@@ -249,20 +263,41 @@ export function protectPrivateFile(target) {
 
 // All private JSON state uses the same temp-file, owner-only, atomic replace.
 // Keeping it here prevents one state writer from drifting away from the rest.
-export function writePrivateFile(target, contents, { directoryMode } = {}) {
+//
+// `hardenFailure: "warn"` is for a caller whose write must survive a PowerShell
+// that cannot start. It is not a general relaxation: the default stays "throw",
+// and only service-process.json opts in. That record is a PID, an identity
+// string, paths and ports -- no credential -- and it lives in a state directory
+// whose own ACL already applies, so a cold-host ACL timeout should cost the
+// file its extra hardening rather than cost the router its startup.
+export function writePrivateFile(target, contents, { directoryMode, hardenFailure = "throw" } = {}) {
   const directory = path.dirname(target);
-  mkdirSync(directory, { recursive: true, mode: 0o700 });
-  if (directoryMode !== undefined) chmodSync(directory, directoryMode);
+  const createdDirectory = mkdirSync(directory, { recursive: true, mode: 0o700 });
+  // A caller may inject a credential path for an isolated test, but it never
+  // owns an already-existing parent such as /tmp or a project checkout. Only
+  // apply the requested directory mode to a directory this write created.
+  if (createdDirectory !== undefined && directoryMode !== undefined) {
+    chmodSync(directory, directoryMode);
+  }
   const temporary = `${target}.tmp.${process.pid}.${randomBytes(8).toString("hex")}`;
   try {
-    writeFileSync(temporary, contents, { encoding: "utf8", mode: 0o600 });
+    writeFileSync(temporary, contents, { encoding: "utf8", mode: 0o600, flag: "wx" });
     if (process.platform === "win32") {
       // One spawn hardens the temporary; the renameSync below then moves this
       // exact file over the target, and MoveFile carries the source's DACL
       // with it, so the destination inherits the same owner-only ACL without a
       // second PowerShell cold start. A pre-existing target that is being
       // replaced is discarded with the move, so it cannot leak permissions.
-      protectPrivateFilesWin32([temporary]);
+      try {
+        protectPrivateFilesWin32([temporary]);
+      } catch (error) {
+        if (hardenFailure !== "warn") throw error;
+        console.warn(
+          `[codex-router] warning: could not harden the ACL on ${target}: ` +
+            `${error instanceof Error ? error.message : String(error)}; continuing ` +
+            "(the state directory's own ACL still applies).",
+        );
+      }
       renameSync(temporary, target);
     } else {
       protectPrivateFile(temporary);
@@ -270,7 +305,12 @@ export function writePrivateFile(target, contents, { directoryMode } = {}) {
       protectPrivateFile(target);
     }
   } catch (error) {
-    if (existsSync(temporary)) unlinkSync(temporary);
+    try {
+      const metadata = lstatSync(temporary);
+      if (metadata.isFile() && !metadata.isSymbolicLink()) unlinkSync(temporary);
+    } catch {
+      // The exclusive temporary was never created or was already moved.
+    }
     throw error;
   }
   return target;
@@ -297,14 +337,70 @@ export async function writePrivateFileAsync(target, contents, { directoryMode } 
   return target;
 }
 
-export function writePrivateJson(target, value, { space = 2, directoryMode } = {}) {
-  writePrivateFile(target, `${JSON.stringify(value, null, space)}\n`, { directoryMode });
+export function writePrivateJson(target, value, { space = 2, directoryMode, hardenFailure = "throw" } = {}) {
+  writePrivateFile(target, `${JSON.stringify(value, null, space)}\n`, { directoryMode, hardenFailure });
   return value;
 }
 
 export async function writePrivateJsonAsync(target, value, { space = 2, directoryMode } = {}) {
   await writePrivateFileAsync(target, `${JSON.stringify(value, null, space)}\n`, { directoryMode });
   return value;
+}
+
+// Ensure a directory and its contents are readable by the Limited-level
+// scheduled task. On Windows, an elevated installer creates directories and
+// files with ACLs that only allow the elevated account to read them. The
+// scheduled task runs at Limited level (issue #548), so it cannot read a
+// checkout created by an elevated shell. This function grants Users read and
+// execute access to the directory tree, so the Limited task can load modules.
+//
+// Only the checkout directory needs this treatment: STATE_DIR files are
+// deliberately owner-only and are never loaded by the task directly.
+export function ensureCheckoutReadable(checkoutPath) {
+  if (process.platform !== "win32") return;
+  // The script grants Users (BUILTIN\Users) ReadAndExecute on the checkout
+  // directory, recursively. This allows the Limited-level task to traverse
+  // directories and read files while keeping write access restricted.
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    "try {",
+    "  $path = $env:CODEX_ROUTER_CHECKOUT_PATH",
+    "  $usersId = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')",
+    "  $readExecute = [System.Security.AccessControl.FileSystemRights]::ReadAndExecute",
+    "  $containerInherit = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit",
+    "  $objectInherit = [System.Security.AccessControl.InheritanceFlags]::ObjectInherit",
+    "  $propagationNone = [System.Security.AccessControl.PropagationFlags]::None",
+    "  $allow = [System.Security.AccessControl.AccessControlType]::Allow",
+    "  $acl = [System.IO.Directory]::GetAccessControl($path)",
+    "  $rule = [System.Security.AccessControl.FileSystemAccessRule]::new($usersId, $readExecute, ($containerInherit -bor $objectInherit), $propagationNone, $allow)",
+    "  $acl.AddAccessRule($rule)",
+    "  [System.IO.Directory]::SetAccessControl($path, $acl)",
+    "} catch {",
+    "  [Console]::Error.WriteLine($_.Exception.Message)",
+    "  exit 1",
+    "}",
+  ].join("\n");
+  const encoded = Buffer.from(script, "utf16le").toString("base64");
+  try {
+    execFileSync(
+      "powershell.exe",
+      ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+      {
+        env: { ...process.env, CODEX_ROUTER_CHECKOUT_PATH: checkoutPath },
+        stdio: ["ignore", "ignore", "pipe"],
+        timeout: 15_000,
+        windowsHide: true,
+      },
+    );
+  } catch (error) {
+    const detail = String(error?.stderr?.trim?.() || error?.message || "").trim();
+    // This is a best-effort operation: if PowerShell is unavailable or the
+    // ACL cannot be modified, the operator can still fix it manually per the
+    // diagnostic message. Do not fail the install outright.
+    if (detail) {
+      console.warn(`Warning: Could not grant Users read access to checkout: ${detail}`);
+    }
+  }
 }
 
 export function privateFileIsProtected(target) {
@@ -332,6 +428,10 @@ export function privateFileIsProtected(target) {
         encoding: "utf8",
         env: { ...process.env, CODEX_ROUTER_PRIVATE_FILE: target },
         stdio: ["ignore", "pipe", "ignore"],
+        timeout: 15_000,
+        // Verification runs from the same GUI-parented paths as the write
+        // above; see issue #565.
+        windowsHide: true,
       },
     ).trim().toLowerCase() === "true";
   } catch {

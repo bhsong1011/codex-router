@@ -1,5 +1,4 @@
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -20,12 +19,16 @@ import {
   CONFIG_PATH,
   LEGACY_PORTS,
   MERGED_CATALOG_PATH,
-  MODELS_CACHE_PATH,
   NATIVE_ALIAS_PATH,
   NATIVE_CATALOG_PATH,
   PORTS,
 } from "./paths.mjs";
-import { codexAuthStatus, codexVersion, runCodex } from "./codex-binary.mjs";
+import {
+  codexAuthStatus,
+  codexBinaryFingerprint,
+  codexVersion,
+  runCodex,
+} from "./codex-binary.mjs";
 import { readUserModels } from "./user-models.mjs";
 import { syncRoutedCodexAgents } from "./codex-agent-catalog.mjs";
 import {
@@ -43,6 +46,7 @@ import {
   modelPickerSnapshot,
   readHiddenModels,
   seedModelsHidden,
+  readPickerOrder,
 } from "./model-picker-state.mjs";
 import { buildNativeAliasAssignments } from "./native-alias.mjs";
 import {
@@ -62,6 +66,11 @@ import {
 import { discoveryDisabled } from "./discovery-mode.mjs";
 import { withCatalogPublicationLock } from "./catalog-publication-lock.mjs";
 import { routedModelSearchAvailable } from "./search-capability.mjs";
+import {
+  readModelsCache,
+} from "./native-account-catalog.mjs";
+
+export { readModelsCache } from "./native-account-catalog.mjs";
 
 const refresh = process.argv.includes("--refresh-native");
 
@@ -98,7 +107,11 @@ export function deriveBaseInstructions(modelMessages) {
 // newer schema or models absent from a stale account cache. Preserve the
 // account entry for every slug it lists (first occurrence wins on a
 // duplicate), then append bundled-only entries.
-export function mergeNativeCatalogs(accountCatalog, bundledCatalog) {
+export function mergeNativeCatalogs(
+  accountCatalog,
+  bundledCatalog,
+  { includeBundledOnly = true } = {},
+) {
   const account = validNativeCatalog(accountCatalog) ? accountCatalog.models : [];
   const fallback = validNativeCatalog(bundledCatalog) ? bundledCatalog.models : [];
   const fallbackBySlug = new Map(
@@ -125,7 +138,9 @@ export function mergeNativeCatalogs(accountCatalog, bundledCatalog) {
   return {
     models: [
       ...normalizedAccount,
-      ...fallback.filter((model) => !seen.has(String(model?.slug || ""))),
+      ...(includeBundledOnly
+        ? fallback.filter((model) => !seen.has(String(model?.slug || "")))
+        : []),
     ],
   };
 }
@@ -177,23 +192,20 @@ export function mergeNativeModel(accountModel, bundledModel) {
   return merged;
 }
 
-// One read serves both the catalog contents and the fingerprint; reading the
-// file twice would hash a possibly different snapshot than the one merged.
-function readModelsCache() {
-  const missing = { catalog: undefined, fingerprint: undefined };
-  if (!existsSync(MODELS_CACHE_PATH)) return missing;
-  try {
-    const parsed = JSON.parse(readFileSync(MODELS_CACHE_PATH, "utf8"));
-    if (!validNativeCatalog(parsed)) return missing;
-    return {
-      catalog: parsed,
-      fingerprint: createHash("sha256")
-        .update(JSON.stringify(parsed.models))
-        .digest("hex"),
-    };
-  } catch {
-    return missing;
-  }
+// A valid account cache containing no routed slugs can be refreshed directly
+// and remains a safe native source while model_catalog_json points at the
+// merged router catalog. A missing or contaminated cache still takes the
+// conservative transport-transition path in refresh-catalog.
+export function nativeCacheCanRefreshInPlace(cache = readModelsCache()) {
+  const catalog = cache?.catalog;
+  return (
+    Boolean(validNativeCatalog(catalog)) &&
+    !catalog.models.some((model) => MODEL_BY_SLUG.has(String(model.slug)))
+  );
+}
+
+export function nativeCatalogCanRefreshInPlace() {
+  return discoveryDisabled() || nativeCacheCanRefreshInPlace();
 }
 
 function atomicContents(target, contents) {
@@ -226,6 +238,24 @@ function restoreFileSnapshot(target, snapshot) {
   }
 }
 
+// Live `codex debug models` (no --bundled) reads whatever model_catalog_json
+// Codex currently points at. While this router owns that path, the answer is
+// our merged catalog — never a native capture source. Account switching and
+// other in-place refreshes must not force operators to disable the router
+// just to rebuild native-models.json.
+export function liveAccountCatalogProbeAllowed({
+  discoveryDisabled: idle = false,
+  routedCatalogActive: routedActive = false,
+} = {}) {
+  return !idle && !routedActive;
+}
+
+function catalogContainsRoutedSlugs(catalog) {
+  return Boolean(
+    catalog?.models?.some((model) => MODEL_BY_SLUG.has(String(model.slug))),
+  );
+}
+
 function captureNative(cache) {
   // A discovery-disabled install promised that nothing account-derived is
   // read: `debug models` without --bundled reflects the signed-in account's
@@ -234,6 +264,7 @@ function captureNative(cache) {
   // This is the gate SECURITY.md's "the one Codex spawn that remains is
   // `codex debug models --bundled`" claim rests on.
   const idle = discoveryDisabled();
+  const routedActive = routedCatalogActive();
   const resolved = cache ?? (idle ? {} : readModelsCache());
   // This is the account-aware catalog Codex itself cached after signing in.
   // Reading it directly also avoids asking `codex debug models` while the
@@ -242,7 +273,17 @@ function captureNative(cache) {
   let fallback;
   let accountError;
   let fallbackError;
-  if (!account && !idle) {
+  if (account && catalogContainsRoutedSlugs(account)) {
+    // A prior merged echo written into models_cache.json is not native.
+    account = undefined;
+    accountError = new Error(
+      "models_cache.json contains routed model slugs; refusing to treat it as native.",
+    );
+  }
+  if (!account && liveAccountCatalogProbeAllowed({
+    discoveryDisabled: idle,
+    routedCatalogActive: routedActive,
+  })) {
     try {
       account = JSON.parse(runCodex(["debug", "models"], {
         encoding: "utf8",
@@ -279,9 +320,11 @@ function captureNative(cache) {
   }
   const capturedWith = codexVersion();
   const sourceFingerprint = cache.fingerprint;
+  const binaryFingerprint = codexBinaryFingerprint();
   atomicJson(NATIVE_CATALOG_PATH, {
     ...(capturedWith ? { captured_with: capturedWith } : {}),
     ...(sourceFingerprint ? { native_source_fingerprint: sourceFingerprint } : {}),
+    ...(binaryFingerprint ? { native_binary_fingerprint: binaryFingerprint } : {}),
     models: parsed.models,
   });
   return parsed;
@@ -296,6 +339,7 @@ export function nativeCatalogIsReusable(
   parsed,
   currentVersion,
   currentSourceFingerprint = undefined,
+  currentBinaryFingerprint = undefined,
 ) {
   if (!parsed || !Array.isArray(parsed.models) || parsed.models.length === 0) {
     return false;
@@ -307,10 +351,16 @@ export function nativeCatalogIsReusable(
   ) {
     return false;
   }
+  if (
+    currentBinaryFingerprint &&
+    parsed.native_binary_fingerprint !== currentBinaryFingerprint
+  ) {
+    return false;
+  }
   return true;
 }
 
-function nativeCatalog() {
+function nativeCatalog({ refreshNative = refresh } = {}) {
   const source = readNativeCatalogSource();
   if (source) {
     const catalog = readNativeCatalogFile(source.path);
@@ -325,9 +375,43 @@ function nativeCatalog() {
   // so a discovery-disabled install leaves it unread like every other
   // account-derived artifact.
   const cache = discoveryDisabled() ? {} : readModelsCache();
-  if (!existsSync(NATIVE_CATALOG_PATH) || refresh) return captureNative(cache);
+  const readCachedNative = () => {
+    if (!existsSync(NATIVE_CATALOG_PATH)) return undefined;
+    try {
+      const parsed = JSON.parse(readFileSync(NATIVE_CATALOG_PATH, "utf8"));
+      if (parsed && Array.isArray(parsed.models) && parsed.models.length > 0) {
+        return parsed;
+      }
+    } catch {
+      // Unreadable cache is treated as missing below.
+    }
+    return undefined;
+  };
+  if (!existsSync(NATIVE_CATALOG_PATH) || refreshNative) {
+    try {
+      return captureNative(cache);
+    } catch (error) {
+      // Account switching refreshes native while the router still owns
+      // model_catalog_json. Prefer a prior capture over aborting the switch.
+      const cached = readCachedNative();
+      if (cached) {
+        console.error(
+          `Could not refresh the native model catalog (${error.message}); reusing the cached capture.`,
+        );
+        return cached;
+      }
+      throw error;
+    }
+  }
   const parsed = JSON.parse(readFileSync(NATIVE_CATALOG_PATH, "utf8"));
-  if (nativeCatalogIsReusable(parsed, codexVersion(), cache.fingerprint)) {
+  if (
+    nativeCatalogIsReusable(
+      parsed,
+      codexVersion(),
+      cache.fingerprint,
+      codexBinaryFingerprint(),
+    )
+  ) {
     return parsed;
   }
   try {
@@ -519,13 +603,49 @@ function rewriteIdentity(text, model) {
     .replace(/\bbased on GPT-5(?:\.\d+)?(?:[-\s](?:Sol|Terra|Luna))?\b/gi, `based on ${name}`);
 }
 
+function isGrokFamily(model) {
+  return [model?.slug, model?.displayName, model?.upstreamModel, model?.provider, model?.gatewayModel]
+    .some((value) => typeof value === "string" && /(?:^|[^a-z])grok(?:[^a-z]|$)/i.test(value));
+}
+
+// Codex's gpt-5.5 instruction batches reads through multi_tool_use.parallel and
+// pages files with sed. Grok's menu is read_file, grep, list_dir, and
+// search_replace. These are the three paragraphs that made two reads land in
+// one response.
+const GROK_WORKSPACE_INSTRUCTION_REPLACEMENTS = Object.freeze([
+  ["- When you search for text or files, you reach first for `rg` or `rg --files`; they are much faster than alternatives like `grep`. If `rg` is unavailable, you use the next best tool without fuss.\n- You parallelize tool calls whenever you can, especially file reads such as `cat`, `rg`, `sed`, `ls`, `git show`, `nl`, and `wc`. You use `multi_tool_use.parallel` for that parallelism, and only that. Do not chain shell commands with separators like `echo \"====\";`; the output becomes noisy in a way that makes the user\u2019s side of the conversation worse.",
+   "- When those tools are in the menu, read files with `read_file`, search with `grep`, and list directories with `list_dir`. Do not page through files with `sed`, `cat`, `nl`, or `head`.\n- Independent reads and searches go out together as separate tool calls in the same response. Do not wait for one read before sending the next independent read. `multi_tool_use.parallel` is not available. Do not chain shell commands with separators like `echo \"====\";`.\n- Edit an existing file with `search_replace` when that tool is in the menu. Otherwise use `apply_patch`. A patch that does not need an unseen read can be in the same response as the reads. A patch that depends on a read waits for that result, then goes in the next response."],
+  ["- Use `apply_patch` for manual code edits. Do not create or edit files with `cat` or other shell write tricks. Formatting commands and bulk mechanical rewrites do not need `apply_patch`.\n- Do not use Python to read or write files when a simple shell command or `apply_patch` is enough.",
+   "- Use `search_replace` for manual edits of existing files when it is in the menu. Otherwise use `apply_patch`. Do not create or edit files with `cat`, `sed`, or other shell write tricks. Formatting commands and bulk mechanical rewrites do not need a patch tool.\n- Do not use Python or the shell to read or write files when `read_file`, `grep`, `search_replace`, or `apply_patch` is available."],
+  ["- Treat ordinary local filesystem paths as files, never as MCP resource URIs. Use an available filesystem or shell tool, such as exec_command, to inspect local files.",
+   "- Treat ordinary local filesystem paths as files, never as MCP resource URIs. Inspect them with `read_file`, `grep`, or `list_dir` when those tools are in the menu. Use `run_terminal_command` or `exec_command` for processes such as git, tests, and installs, not for paging through files."],
+  ["- Treat ordinary local filesystem paths as files, never as MCP resource URIs. Inspect local files with a filesystem tool that is present in this request's menu.",
+   "- Treat ordinary local filesystem paths as files, never as MCP resource URIs. Inspect them with `read_file`, `grep`, or `list_dir` when those tools are in the menu. Use `run_terminal_command` or `exec_command` for processes such as git, tests, and installs, not for paging through files."]
+]);
+
+function rewriteGrokWorkspaceInstructions(text, model) {
+  if (!isGrokFamily(model) || typeof text !== "string" || !text) return text;
+  let next = text;
+  for (const [from, to] of GROK_WORKSPACE_INSTRUCTION_REPLACEMENTS) {
+    if (next.includes(from)) next = next.replaceAll(from, to);
+  }
+  return next;
+}
+
+function publishRoutedInstructions(text, model) {
+  return rewriteGrokWorkspaceInstructions(
+    applyInstructionOverlay(rewriteIdentity(text, model), model.instructionOverlay),
+    model,
+  );
+}
+
 function rewriteModelMessages(messages, model) {
   if (!messages || typeof messages !== "object" || Array.isArray(messages)) {
     return messages;
   }
   const next = { ...messages };
   if (typeof next.instructions_template === "string") {
-    next.instructions_template = rewriteIdentity(next.instructions_template, model);
+    next.instructions_template = publishRoutedInstructions(next.instructions_template, model);
   }
   return next;
 }
@@ -650,10 +770,13 @@ export function routedModel(template, model, behaviorTemplate = template) {
   // not a routed capability and must stay out even when that native entry is
   // also the conservative fallback template.
   delete next.tool_mode;
-  // ClinePass strips these unsupported request controls, so Codex must not offer them.
+  // ClinePass strips these unsupported request controls, so Codex must not
+  // offer them. Codex requires `supported_reasoning_levels` (a missing key is a
+  // serde error that drops the entry), so an empty ladder is the only
+  // schema-valid way to hide the selector; the default level is optional.
   if (model.requestProfile === "clinepass") {
     delete next.default_reasoning_level;
-    delete next.supported_reasoning_levels;
+    next.supported_reasoning_levels = [];
   }
   // A few OpenAI-compatible upstreams reject tool scheduling the native
   // template advertises. Registry entries opt out explicitly so the picker
@@ -662,19 +785,10 @@ export function routedModel(template, model, behaviorTemplate = template) {
     next.experimental_supported_tools = [...model.experimentalSupportedTools];
   }
   if (typeof next.base_instructions === "string") {
-    next.base_instructions = applyInstructionOverlay(
-      rewriteIdentity(next.base_instructions, model),
-      model.instructionOverlay,
-    );
+    next.base_instructions = publishRoutedInstructions(next.base_instructions, model);
   }
   if (next.model_messages) {
     next.model_messages = rewriteModelMessages(next.model_messages, model);
-    if (typeof next.model_messages?.instructions_template === "string") {
-      next.model_messages.instructions_template = applyInstructionOverlay(
-        next.model_messages.instructions_template,
-        model.instructionOverlay,
-      );
-    }
   }
   return next;
 }
@@ -771,10 +885,11 @@ function pickerProviderGroup(provider) {
   if (value === "chatgpt-login") return { rank: 0, key: "personal" };
   if (value === "deepseek") return { rank: 1, key: "deepseek" };
   // The opencode family shares one stored key: `opencode-go` and its variants
-  // (`opencode-go-messages`, `opencode-go-responses`, `opencode-zen`). Group
-  // them together so Zen models stay next to the Go models they relate to
-  // instead of falling into the rank-3 catch-all under their own key.
-  if (value.startsWith("opencode-go") || value === "opencode-zen") {
+  // (`opencode-go-messages`, `opencode-go-responses`, `opencode-zen` and the
+  // Zen Messages/Responses protocol variants). Group them together so Zen
+  // models stay next to the Go models they relate to instead of falling into
+  // the rank-3 catch-all under their own key.
+  if (value.startsWith("opencode-go") || value.startsWith("opencode-zen")) {
     return { rank: 2, key: "opencode" };
   }
   return { rank: 3, key: value };
@@ -786,12 +901,26 @@ function pickerSlugGroup(slug) {
   return pickerProviderGroup(value.slice(0, value.indexOf("/")));
 }
 
-// Orders routed models for the picker by the vendor-group policy WITHOUT
-// rewriting each model's `priority`. The `priority` field feeds Codex's
-// spawn_agent override window (AGENTS.md step 5), where certified native v2
-// routes keep intentionally low values; renumbering every routed model to
-// nativeMax+1 would crowd those certified routes out of the window. Grouping
-// only reorders the published array while every model keeps its own priority.
+// Orders routed models for the picker by the vendor-group policy. Codex
+// renders its picker by each entry's `priority`, never by array order, so
+// grouping the array alone never reached the screen: routed models reuse the
+// same low integers as native GPT entries and interleave with them (issue
+// #544). Two numberings therefore coexist in the published catalog, assigned
+// by `publishedPickerPriorities` below:
+//
+//  - A certified v2 spawn route keeps the priority its registry entry
+//    authored. That field also feeds Codex's spawn_agent override window
+//    (AGENTS.md step 5), which shows only a small priority-ordered subset, so
+//    those routes must keep their intentionally low values or they are
+//    crowded out of the window.
+//  - Every other routed model is published in a band above the highest
+//    visible native priority, in vendor-group order. Codex never offers a v1
+//    route as a spawn override, so moving it can crowd nothing out, and the
+//    picker finally shows the vendor grouping the array always carried.
+//
+// Only the published entry is renumbered. Failover ranking, the vision
+// bridge, and every other client read the registry's authored priority and
+// are unaffected.
 function routedPickerPriorities(nativeModels, routedModelsList) {
   const groups = new Map();
   for (const model of routedModelsList) {
@@ -822,6 +951,30 @@ function sortCatalogModels(models) {
     const priority = Number(left.priority ?? 999) - Number(right.priority ?? 999);
     return priority || String(left.slug).localeCompare(String(right.slug));
   });
+}
+
+// Codex serves `model/list` in priority order, hidden entries included, and
+// the desktop model picker reads only the first page of that list (100
+// entries) before dropping the hidden ones. With a large catalog, hidden
+// routes interleaved by priority pushed selected models past entry 100, so
+// they never reached the picker although the CLI listed them. Publishing every
+// hidden entry in a band after the last visible priority keeps each selected
+// model on that first page. Visible priorities are untouched, and a hidden
+// model is never a spawn override (AGENTS.md step 5), so the spawn window
+// cannot lose anything to this renumbering.
+export function publishHiddenAfterVisible(models) {
+  const isVisible = (model) => model.visibility !== "hide";
+  const visibleMax = Math.max(
+    0,
+    ...models.filter(isVisible).map((model) => Number(model.priority)).filter(Number.isFinite),
+  );
+  const hiddenOrder = new Map(
+    sortCatalogModels(models.filter((model) => !isVisible(model)))
+      .map((model, index) => [model.slug, visibleMax + 1 + index]),
+  );
+  return models.map((model) =>
+    hiddenOrder.has(model.slug) ? { ...model, priority: hiddenOrder.get(model.slug) } : model,
+  );
 }
 
 // Native entries carry upstream's static multi_agent_version. One pinned
@@ -874,7 +1027,11 @@ function behaviorTemplateFor(nativeModels, model, fallback) {
   return nativeModels.find((candidate) => candidate.slug === model.behaviorTemplate) || fallback;
 }
 
-export function buildMergedCatalog(native, routedModelsList, { includeNative = true } = {}) {
+export function buildMergedCatalog(
+  native,
+  routedModelsList,
+  { includeNative = true, pickerOrder = "native-first" } = {},
+) {
   const template =
     native.models.find((model) => model.slug === "gpt-5.5") ||
     native.models.find((model) => model.visibility === "list") ||
@@ -882,16 +1039,66 @@ export function buildMergedCatalog(native, routedModelsList, { includeNative = t
   if (!template) {
     throw new Error("Native model catalog is empty.");
   }
+  const ordered = routedPickerPriorities(native.models, routedModelsList);
+  const routedFirst = pickerOrder === "routed-first";
+  const published = publishedPickerPriorities(native.models, ordered, { routedFirst });
+  // Under routed-first every routed model was renumbered 1..N, so the natives
+  // move after them by the same count. Only the published priority changes;
+  // the native entry is otherwise the account's own.
+  const nativeShift = routedFirst ? published.size : 0;
   const models = new Map(
     includeNative
-      ? native.models.map((model) => [model.slug, normalizeNativeModel(model)])
+      ? native.models.map((model) => {
+          const normalized = normalizeNativeModel(model);
+          const priority = Number(normalized.priority);
+          return [
+            model.slug,
+            nativeShift && Number.isFinite(priority)
+              ? { ...normalized, priority: priority + nativeShift }
+              : normalized,
+          ];
+        })
       : [],
   );
-  for (const model of routedPickerPriorities(native.models, routedModelsList)) {
+  for (const model of ordered) {
     const behaviorTemplate = behaviorTemplateFor(native.models, model, template);
-    models.set(model.slug, routedModel(template, model, behaviorTemplate));
+    const entry = routedModel(template, model, behaviorTemplate);
+    models.set(
+      model.slug,
+      published.has(model.slug) ? { ...entry, priority: published.get(model.slug) } : entry,
+    );
   }
   return sortCatalogModels(models.values());
+}
+
+// The picker priority each routed model is published under, keyed by slug,
+// for every model that is renumbered. Certified v2 spawn routes are absent
+// from the map and keep their authored value; see `routedPickerPriorities`.
+// The band starts above the highest *visible* native priority: a hidden
+// native entry can carry an arbitrary number that would otherwise push every
+// routed model far down the picker for no reason a user can see.
+//
+// With `routedFirst` the band starts at 1 instead and includes the v2 routes:
+// the operator asked for external models ahead of the natives, and leaving a
+// v2 route at its authored value would interleave it with the shifted natives
+// unpredictably. The spawn_agent override window shows a priority-ordered
+// subset, so those routes stay at the top of it either way.
+function publishedPickerPriorities(nativeModels, orderedRoutedModels, { routedFirst = false } = {}) {
+  const visible = nativeModels.filter((model) => model.visibility === "list");
+  const nativeMax = Math.max(
+    0,
+    ...(visible.length ? visible : nativeModels)
+      .map((model) => Number(model.priority))
+      .filter(Number.isFinite),
+  );
+  const published = new Map();
+  let next = routedFirst ? 1 : nativeMax + 1;
+  for (const model of orderedRoutedModels) {
+    if (model.multiAgentVersion === "v2" && !routedFirst) continue;
+    published.set(model.slug, next);
+    next += 1;
+  }
+  return published;
 }
 
 // Login-free Codex surfaces only list allowlisted native slugs, so external
@@ -905,7 +1112,7 @@ export function buildMergedCatalog(native, routedModelsList, { includeNative = t
 // merged-catalog path filters through `selectedConfiguredListedModels()`; this
 // function keeps the same rule for the login-free path instead of trusting its
 // caller to pre-filter, so no future call site can publish dead slots again.
-export function buildLoginFreeCatalog(native, routedModelsList) {
+export function buildLoginFreeCatalog(native, routedModelsList, { pickerOrder = "native-first" } = {}) {
   const configured = new Set(configuredProviderIds());
   const usableModels = routedModelsList.filter(
     (model) => !model.provider || configured.has(model.provider),
@@ -925,7 +1132,7 @@ export function buildLoginFreeCatalog(native, routedModelsList) {
       slug: nativeModel.slug,
       priority: nativeModel.priority,
     })),
-    ...buildMergedCatalog(native, usableModels, { includeNative: false }).map(
+    ...buildMergedCatalog(native, usableModels, { includeNative: false, pickerOrder }).map(
       (model) =>
         aliasedSlugs.has(model.slug) ? { ...model, visibility: "hide" } : model,
     ),
@@ -945,7 +1152,7 @@ export function effectivePickerHiddenModels(hiddenModels, nativeBaseSlugs, { log
   return new Set([...hidden].filter((slug) => !native.has(slug)));
 }
 
-function main() {
+export function publishCatalog({ refreshNative = refresh, output = true } = {}) {
   // The catalog is what Codex offers in its picker. Writing it from a checkout
   // that does not own this state directory is how the picker ends up
   // advertising models the running gateway has no route for.
@@ -999,7 +1206,7 @@ function main() {
     userSlugs,
     Date.now(),
   );
-  const captured = nativeCatalog();
+  const captured = nativeCatalog({ refreshNative });
   // The router picker overlay is for routed models.  In a normal signed-in
   // Codex install the account's native entries remain Codex-owned; applying a
   // stale router `hidden` decision to them can erase the original Codex picker
@@ -1061,11 +1268,13 @@ function main() {
     readVisionBridgeSettings(),
   );
   const catalogModels = applyVisionBridge(routedModels, visionEngine);
+  const pickerOrder = readPickerOrder();
   const { models: merged, aliases } = loginFree
-    ? buildLoginFreeCatalog(native, catalogModels)
+    ? buildLoginFreeCatalog(native, catalogModels, { pickerOrder })
     : {
         models: buildMergedCatalog(native, routedCatalog ? catalogModels : [], {
           includeNative: openaiAuthenticated,
+          pickerOrder,
         }),
         aliases: {},
       };
@@ -1078,7 +1287,7 @@ function main() {
     atomicJson(NATIVE_ALIAS_PATH, { version: 1, aliases });
     writeAnnouncedAt(announcedAt);
     atomicJson(MERGED_CATALOG_PATH, {
-      models: merged.map((model) => {
+      models: publishHiddenAfterVisible(merged.map((model) => {
         const slug = String(model.slug);
         // In login-free mode a native-looking slot is an alias for a routed
         // model, so visibility follows the canonical routed slug that the
@@ -1097,7 +1306,7 @@ function main() {
         return routerManaged && (hidden || !selected)
           ? { ...model, visibility: "hide" }
           : model;
-      }),
+      })),
     });
     if (process.env.MODEL_ROUTER_TEST_FAIL_AFTER_CATALOG_WRITE === "1") {
       throw new Error("Forced failure after model catalog publication.");
@@ -1143,28 +1352,28 @@ function main() {
     if (error && typeof error === "object") error.catalogRollbackSafe = true;
     throw error;
   }
-  process.stdout.write(
-    `${JSON.stringify({
-      path: MERGED_CATALOG_PATH,
-      models: merged.length,
-      routed_models: routedModels.length,
-      routed_agents: routedAgents.written.length,
-      removed_agents: routedAgents.removed.length,
-      vision_bridge_engine: visionEngine?.slug || null,
-      vision_bridged_models: catalogModels.filter(
-        (model) => model.visionBridgeEngine !== undefined,
-      ).length,
-      native_models: !loginFree && openaiAuthenticated
-        ? merged.filter((model) => !MODEL_BY_SLUG.has(String(model.slug))).length
-        : 0,
-      aliased_models: Object.keys(aliases).length,
-      login_free: loginFree,
-      routed_catalog_active: routedCatalog || loginFree,
-      openai_authenticated: openaiAuthenticated,
-      openai_auth_reason: auth.reason,
-      selected_model: selectedModel() || null,
-    })}\n`,
-  );
+  const result = {
+    path: MERGED_CATALOG_PATH,
+    models: merged.length,
+    routed_models: routedModels.length,
+    routed_agents: routedAgents.written.length,
+    removed_agents: routedAgents.removed.length,
+    vision_bridge_engine: visionEngine?.slug || null,
+    vision_bridged_models: catalogModels.filter(
+      (model) => model.visionBridgeEngine !== undefined,
+    ).length,
+    native_models: !loginFree && openaiAuthenticated
+      ? merged.filter((model) => !MODEL_BY_SLUG.has(String(model.slug))).length
+      : 0,
+    aliased_models: Object.keys(aliases).length,
+    login_free: loginFree,
+    routed_catalog_active: routedCatalog || loginFree,
+    openai_authenticated: openaiAuthenticated,
+    openai_auth_reason: auth.reason,
+    selected_model: selectedModel() || null,
+  };
+  if (output) process.stdout.write(`${JSON.stringify(result)}\n`);
+  return result;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
@@ -1172,7 +1381,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     // The lock begins before the first ownership or mutable-state read and is
     // released only after probes and the coupled catalog-file transaction are
     // complete. Every app/CLI/autonomous caller executes this same entrypoint.
-    await withCatalogPublicationLock(main);
+    await withCatalogPublicationLock(() => publishCatalog());
   } catch (error) {
     // Ownership conflicts are an operator mistake with a specific remedy, so
     // print the guidance rather than a stack trace.

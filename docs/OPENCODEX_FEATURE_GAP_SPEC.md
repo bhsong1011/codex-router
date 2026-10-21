@@ -17,9 +17,8 @@ the referenced project and its current contracts before implementing a proposal.
 ## 1. Verified current baseline
 
 The current router already provides a shared local service for Codex, with
-optional publication to DeepSeek Harness and Gemini CLI. These are the only
-supported client targets on `main`; no OpenCode or Cursor client target is
-shipped. It preserves the native GPT catalog and login, and keeps the native
+optional publication to DeepSeek Harness, Gemini CLI, and Cursor. OpenCode is
+not shipped as a client target. It preserves the native GPT catalog and login, and keeps the native
 default model, reasoning metadata, and speed controls client-owned by default.
 A routed default is available only through an explicit router-owned opt-in. It
 routes the checked-in provider registry and explicitly curated local models
@@ -46,7 +45,7 @@ Useful source and test anchors:
   `test/model-discovery.test.mjs`.
 - Credentials and redaction: `src/provider-credentials.mjs`,
   `src/file-security.mjs`, `test/provider-credentials.test.mjs`.
-- Failover and usage: `src/model-failover.mjs`, `src/provider-cooldown.mjs`,
+- Failover and usage: `src/model-failover.mjs`,
   `src/provider-usage.mjs`, `test/model-failover.test.mjs`.
 - Vision and collaboration: `src/vision-bridge.mjs`,
   `src/subagent-proofs.mjs`, `src/multi-agent-state.mjs`, and their tests.

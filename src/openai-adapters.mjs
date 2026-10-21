@@ -1,6 +1,107 @@
 import { Transform } from "node:stream";
+import { StringDecoder } from "node:string_decoder";
 
 const RESPONSE_PROTOCOL = "openai-responses";
+const NAMESPACE_DELIMITER = "__";
+
+// Known collaboration namespaces that require restoration. This is the exact
+// set of v1/v2 native collaboration tools that Codex flattens and expects to
+// see restored. MCP tools (mcp__*) are never restored here - they follow a
+// different flatten contract and are handled by namespace-relay.mjs.
+const COLLABORATION_NAMESPACES = new Set([
+  "multi_agent_v1",
+  "collaboration", // v2 native collaboration namespace
+]);
+
+// Build a lookup map from flattened collaboration tool names back to their
+// native namespaced form. Only restores tools from actual type: "namespace"
+// entries in the request, or known collaboration namespaces. This prevents
+// false positives like treating "mcp__node_repl__js" as a collaboration tool.
+export function buildNamespaceLookupsFromTools(tools) {
+  const flatToNative = new Map();
+  if (!Array.isArray(tools)) return flatToNative;
+  
+  // First, collect namespace tools to build the authoritative mapping
+  const namespaceTools = new Map();
+  for (const tool of tools) {
+    if (!tool || typeof tool !== "object" || Array.isArray(tool)) continue;
+    
+    if (tool.type === "namespace" && typeof tool.name === "string" && Array.isArray(tool.tools)) {
+      // This is a type: "namespace" entry, record all its child tools
+      for (const child of tool.tools) {
+        if (child?.type !== "function" || typeof child.name !== "string" || !child.name) continue;
+        const flattenedName = `${tool.name}${NAMESPACE_DELIMITER}${child.name}`;
+        namespaceTools.set(flattenedName, { namespace: tool.name, name: child.name });
+      }
+    }
+  }
+  
+  // Namespace containers alone are enough to restore calls (Responses-native
+  // providers keep that shape). Seed the map before scanning flat functions.
+  for (const [flattenedName, native] of namespaceTools) {
+    flatToNative.set(flattenedName, native);
+    const dotted = `${native.namespace}.${native.name}`;
+    if (!flatToNative.has(dotted)) flatToNative.set(dotted, native);
+  }
+
+  // Second pass: look for flattened function names
+  for (const tool of tools) {
+    if (!tool || typeof tool !== "object" || Array.isArray(tool)) continue;
+    if (tool.type === "namespace") continue; // Skip namespace containers
+    
+    // Extract function name from either Responses format (tool.name) or 
+    // Chat Completions format (tool.function.name)
+    const functionName = tool.name || tool.function?.name;
+    if (typeof functionName !== "string" || !functionName) continue;
+    
+    // Check if this looks like a flattened name
+    const delimiterIndex = functionName.indexOf(NAMESPACE_DELIMITER);
+    if (delimiterIndex === -1) continue;
+    
+    // If this name was from a namespace tool, use that mapping
+    if (namespaceTools.has(functionName)) {
+      flatToNative.set(functionName, namespaceTools.get(functionName));
+      continue;
+    }
+    
+    // Otherwise, only restore known collaboration namespaces to avoid false positives
+    // Split on first delimiter: "multi_agent_v1__spawn_agent" -> ["multi_agent_v1", "spawn_agent"]
+    const firstDelimiterEnd = delimiterIndex + NAMESPACE_DELIMITER.length;
+    const namespace = functionName.substring(0, delimiterIndex);
+    const name = functionName.substring(firstDelimiterEnd);
+    
+    if (COLLABORATION_NAMESPACES.has(namespace)) {
+      flatToNative.set(functionName, { namespace, name });
+    }
+  }
+  
+  return flatToNative;
+}
+
+// Restore a function call from flattened name to namespaced shape
+function restoreNamespacedFunctionCall(call, flatToNative) {
+  if (!call || typeof call !== "object" || !flatToNative.size) return call;
+  
+  const callName = call.name;
+  if (typeof callName !== "string") return call;
+  
+  const native = flatToNative.get(callName);
+  if (!native) return call;
+  
+  // Return the call with namespace restored and flattened name removed
+  return {
+    ...call,
+    name: native.name,
+    namespace: native.namespace,
+  };
+}
+
+// Only function calls carry a namespace. Everything else is returned by
+// identity so a stream event keeps the bytes it arrived with.
+function restoreFunctionCallNamespace(item, flatToNative) {
+  if (!item || typeof item !== "object" || item.type !== "function_call") return item;
+  return restoreNamespacedFunctionCall(item, flatToNative);
+}
 
 function adapterError(message, code = "invalid_responses_request") {
   const error = new Error(message);
@@ -197,7 +298,7 @@ function normalizeResponsesRequest(payload) {
   return next;
 }
 
-function normalizeResponseBody(payload) {
+function normalizeResponseBody(payload, flatToNative) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     throw upstreamResponseError("The upstream Responses response must be an object.");
   }
@@ -205,6 +306,17 @@ function normalizeResponseBody(payload) {
   if (next.output !== undefined && !Array.isArray(next.output)) {
     throw upstreamResponseError("The upstream Responses response has an invalid output array.");
   }
+  
+  // Restore namespaces in function call items within the output array
+  if (Array.isArray(next.output) && flatToNative && flatToNative.size > 0) {
+    next.output = next.output.map((item) => {
+      if (item && typeof item === "object" && item.type === "function_call") {
+        return restoreNamespacedFunctionCall(item, flatToNative);
+      }
+      return item;
+    });
+  }
+  
   return next;
 }
 
@@ -249,8 +361,10 @@ function serializeFrame(frame, data = frame.data) {
   return `${lines.join("\n")}\n\n`;
 }
 
-function streamState() {
+function streamState({ pinResponseId = false, onInvalid } = {}) {
   return {
+    pinResponseId,
+    onInvalid: typeof onInvalid === "function" ? onInvalid : undefined,
     responseId: undefined,
     outputIndex: 0,
     itemIndexes: new Map(),
@@ -275,6 +389,14 @@ function invalidStream(state, message) {
   if (state.invalid) return "";
   state.invalid = true;
   state.terminal = true;
+  // The reason travels to the client only inside this SSE frame, and LiteLLM
+  // replaces it with "Response API in-stream error" on the way (#837). Hand it
+  // to the caller as well so the forwarder can put it in the service log; it
+  // is always router-authored text, never upstream bytes. A reporting failure
+  // must not change what the stream emits.
+  try {
+    state.onInvalid?.(message);
+  } catch {}
   return serializeFrame({ event: "error" }, {
     type: "error",
     code: "invalid_responses_stream",
@@ -291,11 +413,31 @@ function rememberStreamIndex(state, key, index) {
   return true;
 }
 
-function normalizeResponsesEvent(frame, state) {
+// A keep-alive carries no Responses semantics. OpenCode Go and Zen close every
+// stream with `event: ping` / `{"type":"ping","cost":"0"}` *after*
+// `response.completed`; treating it as post-terminal data appended
+// `invalid_responses_stream` to every completed turn, which LiteLLM re-raised
+// as "Response API in-stream error". Codex ignores bytes after a terminal
+// event; opencode's AI SDK and pi validate them and failed the turn.
+function keepAliveFrame(frame, data) {
+  return frame.event === "ping" || (data && typeof data === "object" && data.type === "ping");
+}
+
+function normalizeResponsesEvent(frame, state, flatToNative) {
+  // An SSE comment, or a frame with no data line and no event, is not an event
+  // and is not forwarded. It is still proof the upstream was talking, so a
+  // stream that ends before its terminal event is still reported by `flush`.
+  if (frame.data === "" && !frame.event) {
+    state.sawEvent = true;
+    return "";
+  }
   const data = frameData(frame);
   state.sawEvent = true;
   if (state.invalid) return "";
   if (state.terminal && data !== "[DONE]") {
+    // Real data after the terminal event is still refused. Only a keep-alive,
+    // which cannot change a finished response, is dropped.
+    if (keepAliveFrame(frame, data)) return "";
     return invalidStream(state, "The Responses stream emitted data after its terminal event.");
   }
   if (frame.event === "error") state.terminal = true;
@@ -314,6 +456,12 @@ function normalizeResponsesEvent(frame, state) {
       return invalidStream(state, "The Responses stream changed response IDs.");
     }
     state.responseId ||= responseId;
+  } else if (state.pinResponseId && state.responseId && data.response && typeof data.response === "object") {
+    // GitHub Copilot mints a fresh id for every lifecycle event of one
+    // response. The id announced by `response.created` is the one the client
+    // already holds, so later events are pinned to it on that route only; a
+    // mismatched terminal id from any other upstream still voids the stream.
+    data.response.id = state.responseId;
   }
   if (data.type === "response.output_item.added") {
     const item = data.item && typeof data.item === "object" ? data.item : undefined;
@@ -340,6 +488,18 @@ function normalizeResponsesEvent(frame, state) {
     }
     state.outputIndex = index + 1;
     if (!validOutputIndex(data.output_index)) data.output_index = index;
+    
+    // Restore namespace for function call items
+    const restoredAdded = restoreFunctionCallNamespace(item, flatToNative);
+    if (restoredAdded !== item) data.item = restoredAdded;
+  }
+  // The terminal item is the one a client executes, and it is re-sent in full
+  // rather than diffed from `added`. Restoring only `added` left the flattened
+  // name on the call Codex actually ran, so namespace tools answered
+  // "unsupported call" on every Responses route that relays flattened names.
+  if (data.type === "response.output_item.done") {
+    const restoredDone = restoreFunctionCallNamespace(data.item, flatToNative);
+    if (restoredDone !== data.item) data.item = restoredDone;
   }
   if (data.type === "response.function_call_arguments.delta" || data.type === "response.function_call_arguments.done") {
     const key = data.call_id || data.item_id;
@@ -366,13 +526,20 @@ function normalizeResponsesEvent(frame, state) {
       return invalidStream(state, "The Responses completion used a different response ID.");
     }
     if (state.responseId && !data.response.id) data.response.id = state.responseId;
+    // Non-incremental consumers read the calls off the completion snapshot
+    // instead of the item events, so it has to carry the same restored shape.
+    if (Array.isArray(data.response.output)) {
+      data.response.output = data.response.output.map((item) =>
+        restoreFunctionCallNamespace(item, flatToNative),
+      );
+    }
   }
   return serializeFrame(frame, data);
 }
 
-export function createResponsesStreamTransform() {
+export function createResponsesStreamTransform(flatToNative = new Map(), options = {}) {
   let buffer = "";
-  const state = streamState();
+  const state = streamState(options);
   const decoder = new TextDecoder();
   const nextBoundary = (value) => {
     const match = /\r?\n\r?\n/.exec(value);
@@ -387,7 +554,7 @@ export function createResponsesStreamTransform() {
           const frame = buffer.slice(0, boundary.index);
           buffer = buffer.slice(boundary.index + boundary.length);
           if (frame.trim()) {
-            const normalized = normalizeResponsesEvent(parseFrame(frame), state);
+            const normalized = normalizeResponsesEvent(parseFrame(frame), state, flatToNative);
             if (normalized) this.push(normalized);
           }
         }
@@ -400,10 +567,13 @@ export function createResponsesStreamTransform() {
       try {
         buffer += decoder.decode();
         if (buffer.trim()) {
-          const normalized = normalizeResponsesEvent(parseFrame(buffer), state);
+          const normalized = normalizeResponsesEvent(parseFrame(buffer), state, flatToNative);
           if (normalized) this.push(normalized);
         }
         if (state.sawEvent && !state.terminal && !state.invalid) {
+          try {
+            state.onInvalid?.("The upstream Responses stream ended before a terminal event.");
+          } catch {}
           this.push(serializeFrame({ event: "error" }, {
             type: "error",
             code: "upstream_stream_incomplete",
@@ -419,14 +589,18 @@ export function createResponsesStreamTransform() {
   });
 }
 
-export function createResponsesJsonTransform() {
+export function createResponsesJsonTransform(flatToNative = new Map()) {
   let body = "";
+  const decoder = new StringDecoder("utf8");
   return new Transform({
     transform(chunk, _encoding, callback) {
-      body += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+      // HTTP chunks can end inside a multibyte character, including text and
+      // JSON-encoded tool arguments. Decode the response as one byte stream.
+      body += typeof chunk === "string" ? chunk : decoder.write(chunk);
       callback();
     },
     flush(callback) {
+      body += decoder.end();
       let parsed;
       try {
         parsed = JSON.parse(body);
@@ -435,7 +609,7 @@ export function createResponsesJsonTransform() {
         return;
       }
       try {
-        this.push(JSON.stringify(normalizeResponseBody(parsed)));
+        this.push(JSON.stringify(normalizeResponseBody(parsed, flatToNative)));
       } catch (error) {
         callback(error);
         return;

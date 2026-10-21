@@ -19,12 +19,19 @@ import {
 import {
   clearServiceProcessState,
   readServiceProcessState,
-  serviceProcessOwns,
+  serviceProcessOwnership,
+  serviceRecordSettled,
 } from "./service-process.mjs";
-import { protectPrivateFile } from "./file-security.mjs";
-import { antigravityClientSecretEnvironment } from "./antigravity-oauth-constants.mjs";
+import { ensureCheckoutReadable, protectPrivateFile } from "./file-security.mjs";
 import { providerApiKeyServiceEnvironment } from "./provider-api-key-service-environment.mjs";
+import { responsesWsServiceEnvironment } from "./responses-ws-client.mjs";
+import { serviceZaiCodingStreamEnvironment } from "./zai-stream-timeouts.mjs";
+import { serviceNativeCatalogEnvironment } from "./native-catalog-settings.mjs";
 import { serviceProxyEnvironment } from "./proxy-environment.mjs";
+import { serviceAppConnectorEnvironment } from "./app-connector-policy.mjs";
+import { serviceGrokPatchHookEnvironment } from "./grok-patch-hook-settings.mjs";
+import { serviceStartupTimeoutEnvironment } from "./startup-timeout.mjs";
+import { resetStartupAttempts, serviceStartupBackoffEnvironment } from "./startup-attempts.mjs";
 import {
   skipServiceManagerCall,
   assertServiceWriteIsolated,
@@ -85,8 +92,14 @@ function wrapper() {
     CODEX_ROUTER_PORT: String(PORTS.router),
     CODEX_ROUTER_API_PORT: String(PORTS.api),
     ...serviceProxyEnvironment(),
-    ...antigravityClientSecretEnvironment(),
+    ...serviceAppConnectorEnvironment(),
+    ...serviceGrokPatchHookEnvironment(),
     ...providerApiKeyServiceEnvironment(),
+    ...responsesWsServiceEnvironment(),
+    ...serviceZaiCodingStreamEnvironment(),
+    ...serviceNativeCatalogEnvironment(),
+    ...serviceStartupTimeoutEnvironment(),
+    ...serviceStartupBackoffEnvironment(),
     // The LiteLLM gateway is a Python process. Force UTF-8 output so its
     // startup banner and logs do not crash on Windows systems whose default
     // ANSI/OEM code page is not UTF-8 (e.g. Russian cp1251), where Python
@@ -100,16 +113,19 @@ function wrapper() {
     .join("\r\n")}\r\n"${cmdEscape(process.execPath)}" "${cmdEscape(start)}" >> "${cmdEscape(LOG_PATH)}" 2>&1\r\n`;
 }
 
-// The scheduled task launches this script through `wscript.exe //B //NoLogo`,
+// The scheduled task launches this script through
+// `wscript.exe //E:VBScript //B //NoLogo`,
 // which is a windowless host, and the script starts the CMD wrapper with a
 // window style of 0. Without it the wrapper owned a console window that stayed
 // on screen for the router's lifetime and reappeared on every watchdog restart.
 //
-// The `True` wait flag is what keeps Task Scheduler's restart settings alive:
-// Run then blocks until the wrapper exits and returns its exit code, which the
-// script re-raises through WScript.Quit. Quitting with a fixed 0 (or letting the
-// script fall off the end) would report every crash as a clean exit and silently
-// disable RestartCount/RestartInterval.
+// The `True` wait flag keeps the task instance alive for the router's lifetime
+// so Task Scheduler state and `schtasks /End` track the real process tree.
+// Propagating the wrapper exit code still matters for diagnostics
+// (`LastTaskResult`), but it does not drive relaunch: Task Scheduler's
+// RestartOnFailure only covers actions that fail to start, not a non-zero
+// exit after a successful start (issue #581). Relaunch after exit or a power
+// event comes from the minute heartbeat trigger in installTask().
 function launcher() {
   // A Windows path cannot contain a double quote, but escape it anyway so a
   // hand-edited state directory can never break out of the string literal.
@@ -141,6 +157,8 @@ function schtasks(args, options = {}) {
   return execFileSync("schtasks.exe", args, {
     encoding: "utf8",
     stdio: options.quiet ? ["ignore", "ignore", "ignore"] : ["ignore", "pipe", "pipe"],
+    timeout: options.timeout,
+    windowsHide: true,
   });
 }
 
@@ -182,15 +200,18 @@ function writeLaunchers() {
   );
 }
 
-// `//B` suppresses script errors and prompts, `//NoLogo` suppresses the banner;
-// neither host allocates a console, so nothing is drawn at logon.
+// `//E:VBScript` selects the engine explicitly so a user-level `.vbs` file
+// association (for example, Notepad++) cannot prevent Windows Script Host from
+// loading the launcher. `//B` suppresses script errors and prompts, and
+// `//NoLogo` suppresses the banner; neither host allocates a console, so
+// nothing is drawn at logon.
 function taskAction() {
   return {
     execute: "wscript.exe",
     // Unlike cmd.exe, wscript.exe follows the standard command-line parser, so
     // the launcher path takes a single quote pair. cmd.exe's doubled-quote form
     // would parse as an empty argument followed by a split path.
-    argument: `//B //NoLogo "${launcherPath}"`,
+    argument: `//E:VBScript //B //NoLogo "${launcherPath}"`,
   };
 }
 
@@ -205,10 +226,15 @@ function installTask() {
     // around the launcher path never pass through powershell.exe's -Command
     // reparse or the schtasks argument escaper.
     "$action = New-ScheduledTaskAction -Execute $env:CODEX_ROUTER_TASK_EXECUTE -Argument $env:CODEX_ROUTER_TASK_ARGUMENT",
-    "$trigger = New-ScheduledTaskTrigger -AtLogOn -User ([Security.Principal.WindowsIdentity]::GetCurrent().Name)",
-    "$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew",
+    // Logon alone never re-fires on wake/fast-startup, and RestartOnFailure
+    // does not relaunch after a started action exits (issue #581). The minute
+    // heartbeat is the supervisor: MultipleInstances IgnoreNew drops it while
+    // the router is alive, and StartWhenAvailable catches ticks missed in sleep.
+    "$logon = New-ScheduledTaskTrigger -AtLogOn -User ([Security.Principal.WindowsIdentity]::GetCurrent().Name)",
+    "$heartbeat = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration (New-TimeSpan -Days 9999)",
+    "$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -StartWhenAvailable",
     "$principal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Limited",
-    "Register-ScheduledTask -TaskName $env:CODEX_ROUTER_TASK -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null",
+    "Register-ScheduledTask -TaskName $env:CODEX_ROUTER_TASK -Action $action -Trigger @($logon, $heartbeat) -Settings $settings -Principal $principal -Force | Out-Null",
   ].join("; ");
   try {
     execFileSync(
@@ -221,6 +247,9 @@ function installTask() {
           CODEX_ROUTER_TASK_EXECUTE: execute,
           CODEX_ROUTER_TASK_ARGUMENT: argument,
         },
+        // Registration also runs from the GUI installer and the Control
+        // Center, where a console child gets its own window (issue #565).
+        windowsHide: true,
         stdio: ["ignore", "ignore", "ignore"],
       },
     );
@@ -272,31 +301,35 @@ function waitForTaskToStop() {
   // An undefined state means no PowerShell could answer -- the same restricted
   // shell that blocks registration -- so there is nothing to poll and waiting
   // would only spend the deadline on a question that cannot be answered.
-  while (taskState() === "running") {
+  while (Date.now() < deadline && taskState({ deadline }) === "running") {
     if (Date.now() >= deadline) return;
-    sleep(TASK_STOP_POLL_MS);
+    sleep(Math.min(TASK_STOP_POLL_MS, Math.max(0, deadline - Date.now())));
   }
 }
 
 function servicePorts(state) {
-  const ports = state?.ports && typeof state.ports === "object" ? state.ports : PORTS;
-  return [...new Set(Object.values(ports).filter((port) => Number.isSafeInteger(port) && port > 0))];
+  // Include the current configuration as well as the recorded generation: an
+  // upgrade or edited record cannot hide a still-bound managed port.
+  const recorded = state?.ports && typeof state.ports === "object" ? Object.values(state.ports) : [];
+  return [...new Set([...Object.values(PORTS), ...recorded]
+    .filter((port) => Number.isSafeInteger(port) && port > 0))];
 }
 
 // `taskkill /T /F` is the ownership boundary. This netstat check is only a
-// final readiness guard: if an unrelated process owns one of the configured
-// ports it is never killed, and restart waits until the normal readiness check
-// can report the conflict instead of claiming the old tree was stopped.
-function managedPortStillListening(state) {
+// final shutdown guard: an unrelated listener is never killed, and occupied
+// ports prevent a replacement start from claiming the old tree was stopped.
+function managedPortStillListening(state, deadline) {
   // netstat is a machine-wide probe. It is not needed to exercise fixture
   // service lifecycle code and can observe unrelated listeners, so keep it
   // out of real Windows test runs.
   if (skipServiceManagerCall({ hostManaged: HOST_MANAGED })) return false;
   try {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return undefined;
     const output = execFileSync("netstat.exe", ["-ano", "-p", "tcp"], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
-      timeout: SERVICE_TREE_COMMAND_TIMEOUT_MS,
+      timeout: Math.min(SERVICE_TREE_COMMAND_TIMEOUT_MS, remaining),
       windowsHide: true,
     });
     const ports = new Set(servicePorts(state).map((port) => `:${port}`));
@@ -310,11 +343,28 @@ function managedPortStillListening(state) {
         return fields[0] === "TCP" && fields[3] === "LISTENING" && ports.has(suffix);
       });
   } catch {
-    // A missing/blocked netstat cannot prove a listener is present. The
-    // identity-checked process tree is still terminated below, and the normal
-    // health probe remains the final readiness check.
-    return false;
+    // An unavailable query cannot establish that the service ports are quiet.
+    return undefined;
   }
+}
+
+class UnverifiedServiceStopError extends Error {
+  constructor(detail) {
+    super(`The Windows service stop could not be verified: ${detail} The process record was kept; retry when the host can answer its probes.`);
+    this.code = "SERVICE_STOP_UNVERIFIED";
+  }
+}
+
+function probeOwnership(state, deadline) {
+  const remaining = deadline - Date.now();
+  // An ownership check can spawn identity, CIM, and WMI probes. Reserve a
+  // fourth slice for netstat, rather than letting each probe spend the entire
+  // remaining allowance. Startup's cold-host override is deliberately unused.
+  if (remaining < 4) return "unknown";
+  return serviceProcessOwnership(state, {
+    platform: effectivePlatform,
+    probeBudget: { timeoutMs: Math.min(SERVICE_TREE_COMMAND_TIMEOUT_MS, Math.floor(remaining / 4)), attempts: 1 },
+  });
 }
 
 function stopOwnedServiceTree() {
@@ -322,75 +372,117 @@ function stopOwnedServiceTree() {
   // Under test, the service-manager mutation was skipped, so there is no
   // owned tree to stop and no reason to touch the host or wait on it.
   if (skipServiceManagerCall({ hostManaged: HOST_MANAGED })) return;
-  const state = readServiceProcessState();
-  if (!state || state.pid === process.pid || !serviceProcessOwns(state, { platform: effectivePlatform })) {
-    return;
-  }
-  try {
-    execFileSync("taskkill.exe", ["/PID", String(state.pid), "/T", "/F"], {
-      encoding: "utf8",
-      stdio: ["ignore", "ignore", "ignore"],
-      timeout: SERVICE_TREE_COMMAND_TIMEOUT_MS,
-      windowsHide: true,
-    });
-  } catch {
-    // A process that already exited is the desired state. If taskkill failed
-    // for another reason, the bounded wait below leaves the record intact so a
-    // later stop can try the same verified identity again.
-  }
+  const state = readServiceProcessState(undefined, { strict: true });
+  if (!state) return;
+  if (state.pid === process.pid) throw new UnverifiedServiceStopError("the record names this service-manager process.");
   const deadline = Date.now() + SERVICE_TREE_STOP_TIMEOUT_MS;
+  const ownership = probeOwnership(state, deadline);
+  if (ownership === "unknown") {
+    throw new UnverifiedServiceStopError(`the ownership probe for pid ${state.pid} did not answer.`);
+  }
+  if (ownership === "owned") {
+    try {
+      execFileSync("taskkill.exe", ["/PID", String(state.pid), "/T", "/F"], {
+        encoding: "utf8",
+        stdio: ["ignore", "ignore", "ignore"],
+        timeout: Math.min(SERVICE_TREE_COMMAND_TIMEOUT_MS, Math.max(1, deadline - Date.now())),
+        windowsHide: true,
+      });
+    } catch {
+      // An already-exited process is fine only when the subsequent probes
+      // establish that fact. A failed taskkill alone never completes the stop.
+    }
+  }
+  let currentOwnership = ownership;
   while (Date.now() < deadline) {
-    const alive = serviceProcessOwns(state, { platform: effectivePlatform });
-    const listening = managedPortStillListening(state);
-    if (!alive && !listening) {
+    if (
+      serviceRecordSettled({
+        ownership: currentOwnership,
+        portListening: currentOwnership === "foreign" ? managedPortStillListening(state, deadline) : undefined,
+      })
+    ) {
       clearServiceProcessState();
       return;
     }
-    sleep(SERVICE_TREE_STOP_POLL_MS);
+    sleep(Math.min(SERVICE_TREE_STOP_POLL_MS, Math.max(0, deadline - Date.now())));
+    currentOwnership = probeOwnership(state, deadline);
   }
-  if (
-    !serviceProcessOwns(state, { platform: effectivePlatform }) &&
-    !managedPortStillListening(state)
-  ) {
-    clearServiceProcessState();
-  }
+  throw new UnverifiedServiceStopError("the recorded tree and service ports were not confirmed stopped within 15 seconds.");
 }
 
-function endTask() {
+function endTask({ taskDisabled = false } = {}) {
   // Do not poll after a skipped `/End`: taskState is a truthful read, but in a
   // test there was no mutation to wait for and a missing PowerShell can spend
   // the full timeout. This also keeps Kimi OAuth cleanup bounded.
   const managerSkipped = skipServiceManagerCall({ hostManaged: HOST_MANAGED });
   if (managerSkipped) return;
   try {
-    schtasks(["/End", "/TN", taskName], { quiet: true, mutating: true });
-  } catch {
-    // The task may not exist, or may not be running. An orphaned router root
-    // can still be recorded even in that case, so continue to the ownership
-    // cleanup rather than returning early.
+    // Keep a minute heartbeat from starting a new generation between the
+    // ownership check and settlement. Successful restart/install re-enable it.
+    // A failure to disable is also a failed stop, never install recovery.
+    if (!taskDisabled && taskExists({ strict: true })) setTaskEnabled(false);
+    try {
+      schtasks(["/End", "/TN", taskName], { quiet: true, mutating: true });
+    } catch {
+      // A missing/idle task can still have a recorded orphaned router root.
+    }
+    waitForTaskToStop();
+    stopOwnedServiceTree();
+  } catch (error) {
+    if (error?.code === "SERVICE_STOP_UNVERIFIED") throw error;
+    throw new UnverifiedServiceStopError("the task could not be disabled or its recorded process state could not be read or cleared.");
   }
-  waitForTaskToStop();
-  stopOwnedServiceTree();
 }
 
 // Only a task that still exists can be started. `Register-ScheduledTask -Force`
 // unregisters before it registers, so a failed registration leaves either the
 // previous definition or nothing at all, and `/Run` against a name that is gone
 // recovers nothing while reporting an error of its own.
-function taskExists() {
+function taskExists({ strict = false } = {}) {
+  const deadline = Date.now() + TASK_STOP_TIMEOUT_MS;
   try {
-    schtasks(["/Query", "/TN", taskName], { quiet: true });
+    schtasks(["/Query", "/TN", taskName], { quiet: true, timeout: TASK_STOP_TIMEOUT_MS });
     return true;
   } catch {
-    return false;
+    // A failed query may be denied or unavailable, not an absent registration.
+    // Enumerate successfully before concluding that the heartbeat is gone.
   }
+  const script = "$ErrorActionPreference='Stop'; try { $task = Get-ScheduledTask -ErrorAction Stop | Where-Object { $_.TaskName -eq $env:CODEX_ROUTER_TASK -and $_.TaskPath -eq '\\' }; if ($null -eq $task) { [Console]::Out.Write('absent') } else { [Console]::Out.Write('present') } } catch { exit 1 }";
+  for (const executable of ["powershell.exe", "pwsh.exe"]) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    try {
+      const answer = execFileSync(executable, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
+        encoding: "utf8",
+        env: { ...process.env, CODEX_ROUTER_TASK: taskName },
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: Math.min(TASK_STATE_TIMEOUT_MS, remaining),
+        windowsHide: true,
+      }).trim();
+      if (answer === "present") return true;
+      if (answer === "absent") return false;
+    } catch {
+      // A second installed interpreter may answer within the same allowance.
+    }
+  }
+  if (strict) throw new UnverifiedServiceStopError("the scheduled task registration query did not answer, so its heartbeat could not be confirmed disabled.");
+  return false;
 }
 
-function taskState() {
+function setTaskEnabled(enabled) {
+  schtasks(
+    ["/Change", "/TN", taskName, enabled ? "/ENABLE" : "/DISABLE"],
+    { quiet: true, mutating: true },
+  );
+}
+
+function taskState({ deadline } = {}) {
   const script =
     "try { [Console]::Out.Write((Get-ScheduledTask -TaskName $env:CODEX_ROUTER_TASK).State.ToString()) } catch { exit 1 }";
   for (const executable of ["powershell.exe", "pwsh.exe"]) {
     try {
+      const remaining = deadline === undefined ? TASK_STATE_TIMEOUT_MS : deadline - Date.now();
+      if (remaining <= 0) return undefined;
       return execFileSync(
         executable,
         ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
@@ -398,7 +490,10 @@ function taskState() {
           encoding: "utf8",
           env: { ...process.env, CODEX_ROUTER_TASK: taskName },
           stdio: ["ignore", "pipe", "ignore"],
-          timeout: TASK_STATE_TIMEOUT_MS,
+          timeout: Math.min(TASK_STATE_TIMEOUT_MS, remaining),
+          // Status is polled from the tray on a timer, so an unhidden console
+          // here is a window that reappears on its own (issue #565).
+          windowsHide: true,
         },
       ).trim().toLowerCase();
     } catch {
@@ -451,11 +546,19 @@ if (command === "render") {
 } else if (command === "render-task") {
   process.stdout.write(`${JSON.stringify(taskAction())}\n`);
 } else if (command === "install") {
+  serviceAppConnectorEnvironment();
   // Keep the guard outside the scheduler-recovery catch below. An unredirected
   // test install is a safety violation, not a restricted Task Scheduler
   // failure, and must exit non-zero without touching the host filesystem.
   guardLauncherWrite();
+  let launcherFailure;
+  let stopVerified = false;
   try {
+    // Ensure the checkout directory is readable by the Limited-level scheduled
+    // task. An elevated installer creates files with ACLs that only allow the
+    // elevated account to read them, while the task runs at Limited level
+    // (issue #548). Grant Users read access so the task can load modules.
+    ensureCheckoutReadable(SOURCE_ROOT);
     // Writing the launchers belongs inside the try: renameSync over the .vbs
     // raises a sharing violation while a running wscript.exe still holds it
     // open, and that used to throw out of install with nothing to catch it.
@@ -466,9 +569,15 @@ if (command === "render") {
     // running instance, and MultipleInstances IgnoreNew would then drop the new
     // hidden run — the console window would survive until the next logon.
     endTask();
+    stopVerified = true;
+    resetStartupAttempts({ required: false });
     installTask();
     schtasks(["/Run", "/TN", taskName], { quiet: true, mutating: true });
-  } catch {
+  } catch (error) {
+    // A failed stop is not a recoverable registration error. In particular,
+    // recovery must never launch another instance over an unverified tree.
+    if (error?.code === "SERVICE_STOP_UNVERIFIED") throw error;
+    launcherFailure = error;
     // Scheduled-task creation can be restricted in a non-elevated terminal. The
     // launchers are still written, so the install is reported as success and
     // the caller can retry -- but endTask() has already stopped whatever was
@@ -478,14 +587,45 @@ if (command === "render") {
     // snapshot was taken, and re-creating the old console-visible action would
     // reintroduce the very defect this launcher exists to fix.
     try {
-      if (taskExists()) schtasks(["/Run", "/TN", taskName], { quiet: true, mutating: true });
+      if (stopVerified && taskExists()) {
+        resetStartupAttempts({ required: false });
+        setTaskEnabled(true);
+        schtasks(["/Run", "/TN", taskName], { quiet: true, mutating: true });
+      }
     } catch {
       // Nothing left to start; the caller's readiness check reports the failure.
     }
   }
+  // `path` names a file the caller is told this install produced, so read it
+  // back rather than assume it. The catch above was written for a restricted
+  // Task Scheduler, but writeLaunchers() runs inside it too: a failed ACL
+  // hardening unlinks the temporary and leaves nothing at `path`, and the
+  // swallowed exception was the only evidence that happened. Reporting a task
+  // that points at a launcher which is not there is the "installed but missing
+  // from disk" of issue #760 -- and because install still exited 0, the
+  // operator's first sign of trouble was the readiness wait failing 300
+  // seconds later with the health probe's own bare "fetch failed".
+  const launchers = existsSync(wrapperPath) && existsSync(launcherPath);
   // Launchers alone are not an installed service. A restricted scheduler (or
   // a test-mode mutation guard) must not claim success when the task is absent.
-  process.stdout.write(`${JSON.stringify({ installed: taskExists(), path: wrapperPath })}\n`);
+  process.stdout.write(
+    `${JSON.stringify({ installed: launchers && taskExists(), launchers, path: wrapperPath })}\n`,
+  );
+  if (!launchers || (launcherFailure && !stopVerified)) {
+    // A missing launcher is not the survivable partial install the catch above
+    // tolerates: nothing the task could run exists. Say why, and fail here so
+    // the installer stops on this step instead of on a health probe that can
+    // only report that nothing is listening.
+    console.error(
+      `Failed to write the service launchers to ${STATE_DIR}.`
+        + (launcherFailure
+          ? ` ${launcherFailure instanceof Error ? launcherFailure.message : String(launcherFailure)}`
+          : ""),
+    );
+    // exitCode, not exit(): process.stdout is asynchronous for a Windows
+    // console, and exiting here would truncate the JSON line written above.
+    process.exitCode = 1;
+  }
 } else if (command === "uninstall") {
   // Refuse before `/End`, `/Delete`, or any filesystem removal when a test has
   // not redirected its service state directory.
@@ -521,12 +661,45 @@ if (command === "render") {
     `${JSON.stringify({ installed, loaded, state })}\n`,
   );
 } else if (command === "stop") {
-  // Stopping is idempotent, like uninstall and restart: a task that is missing
-  // or already idle is the state the caller asked for, not an error to raise.
-  endTask();
+  // A heartbeat trigger must not undo an explicit stop. Disable the task before
+  // ending the active instance so scheduled ticks stay inert until start/restart.
+  // If the task is already missing, stopping remains idempotent.
+  const registered = taskExists({ strict: !skipServiceManagerCall({ hostManaged: HOST_MANAGED }) });
+  if (registered) {
+    setTaskEnabled(false);
+  }
+  endTask({ taskDisabled: registered });
   process.stdout.write(`${JSON.stringify({ state: "stopped" })}\n`);
 } else {
-  if (command === "restart") endTask();
-  schtasks(["/Run", "/TN", taskName], { quiet: true, mutating: true });
-  process.stdout.write(`${JSON.stringify({ state: "running" })}\n`);
+  // start and restart. `stop` above has always guarded on taskExists(); these
+  // two did not, so an absent registration reached the operator as
+  // schtasks.exe's own complaint about `/Change` against a name that is not
+  // there -- with no statement of which task, and no fix (issue #760). That
+  // state is reachable: a restricted Task Scheduler leaves `install` reporting
+  // `installed: false` with the launchers written, and the reporter also had
+  // the task torn out from under them by the rollback #767 removed.
+  //
+  // There is nothing to recover here. `/Run` would fail the same way one call
+  // later, and re-registering the task behind a `start` would make a lifecycle
+  // verb quietly perform an install -- the asymmetry the "stop and start act
+  // on the same layer" rule exists to prevent. So name the task, say it is not
+  // registered, and point at the command that registers it.
+  resetStartupAttempts();
+  if (!taskExists({ strict: command === "restart" && !skipServiceManagerCall({ hostManaged: HOST_MANAGED }) })) {
+    console.error(
+      `The "${taskName}" scheduled task is not registered, so there is nothing to ${command}. `
+        + "Register it with `node src/service.mjs install`, or repair the whole "
+        + "installation with `./model-router.ps1 codex doctor --fix`.",
+    );
+    // exitCode, not exit(): stdout is asynchronous for a Windows console.
+    process.exitCode = 1;
+  } else {
+    if (command === "restart") {
+      endTask();
+      resetStartupAttempts();
+    }
+    setTaskEnabled(true);
+    schtasks(["/Run", "/TN", taskName], { quiet: true, mutating: true });
+    process.stdout.write(`${JSON.stringify({ state: "running" })}\n`);
+  }
 }

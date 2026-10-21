@@ -4,6 +4,9 @@ import { isDeepStrictEqual } from "node:util";
 
 import { secretEqual } from "./caller-auth.mjs";
 import { TARGET } from "./paths.mjs";
+import { responsesStreamFailure } from "./responses-stream-failure.mjs";
+
+export { markResponsesStream } from "./responses-stream-failure.mjs";
 
 // Some Responses -> Chat Completions bridges (LiteLLM's, notably) emit one
 // assistant message per Responses item, so a stored turn of
@@ -317,7 +320,7 @@ export const MAX_BODY_BYTES = Number(
     (TARGET === "codex"
       ? process.env.CODEX_ROUTER_MAX_BODY_BYTES || process.env.KIMI_PROXY_MAX_BODY_BYTES
       : undefined) ||
-    64 * 1024 * 1024,
+    128 * 1024 * 1024,
 );
 
 export const MAX_BUFFERED_RESPONSE_BYTES = Number(
@@ -547,6 +550,38 @@ function readWithAbort(reader, signal) {
   });
 }
 
+// The decompressed size a Zstandard frame header declares, or undefined when
+// the frame omits it (streaming encoders may) or the bytes are not a zstd frame
+// at all. Only the header is read; nothing is decoded, so this is safe to run
+// on an untrusted body before any native decompressor sees it.
+//
+// Layout, RFC 8878 §3.1.1: the magic number 0xFD2FB528 (little-endian), then
+// a Frame_Header_Descriptor byte whose top two bits size the content-size
+// field (0, 2, 4, or 8 bytes -- with 0 meaning a 1-byte field only when the
+// Single_Segment bit, bit 5, is set), and whose low two bits size the
+// Dictionary_ID (0, 1, 2, or 4 bytes). A Window_Descriptor byte sits between
+// them unless Single_Segment is set. The 2-byte size form stores the value
+// minus 256.
+export function zstdFrameContentSize(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 6) return undefined;
+  if (buffer.readUInt32LE(0) !== 0xfd2fb528) return undefined;
+  const descriptor = buffer[4];
+  const singleSegment = (descriptor & 0x20) !== 0;
+  const sizeFlag = descriptor >> 6;
+  const sizeBytes = sizeFlag === 0 ? (singleSegment ? 1 : 0) : [0, 2, 4, 8][sizeFlag];
+  if (sizeBytes === 0) return undefined;
+  const dictionaryBytes = [0, 1, 2, 4][descriptor & 0x03];
+  const offset = 5 + (singleSegment ? 0 : 1) + dictionaryBytes;
+  if (buffer.length < offset + sizeBytes) return undefined;
+  if (sizeBytes === 1) return buffer[offset];
+  if (sizeBytes === 2) return buffer.readUInt16LE(offset) + 256;
+  if (sizeBytes === 4) return buffer.readUInt32LE(offset);
+  const declared = buffer.readBigUInt64LE(offset);
+  return declared > BigInt(Number.MAX_SAFE_INTEGER)
+    ? Number.MAX_SAFE_INTEGER
+    : Number(declared);
+}
+
 export async function readRequestBody(
   request,
   { maxBytes = MAX_BODY_BYTES, signal } = {},
@@ -723,19 +758,18 @@ export async function finishResponse(response) {
 // ("error decoding response body") with nothing to say about the cause. Ending
 // the body instead produces a well-formed, if short, HTTP message.
 //
-// A gracefully ended SSE stream, though, is indistinguishable from a completed
-// one: the turn would simply look short and successful. So on `text/event-stream`
-// we first emit a terminal `error` event, matching the event framing the router
-// already writes elsewhere and the Responses API's own `error` event. A parser
-// that understands it surfaces a real failure; one that does not ignores the
-// unknown event and lands on the plain graceful end, which is still strictly
-// better than a reset. The frame carries a fixed router-side message and never
-// upstream error text, so no response body can leak through it.
+// A graceful SSE end alone cannot state a turn's failure. Marked Responses
+// streams with trusted final-egress metadata get a typed `response.failed`.
+// Native Responses also permit a minimal local failure when metadata is unknown.
+// Other streams without trustworthy metadata keep the generic `error` frame.
+// Prompt clean EOF lets clients handle the failure;
+// retries still follow their policy. The message is approved router-side text,
+// never an upstream error body, so no response body can leak through it.
 //
 // The frame is prefixed with a blank line because the stream is being ended at
 // the point upstream died, which is very often mid-line: transforms forward
 // upstream's chunk boundaries verbatim, and a single `output_text.delta` can
-// carry a long span. Writing `event: error` straight onto an unterminated
+// carry a long span. Writing an `event:` field straight onto an unterminated
 // `data:` line does not produce an error event at all -- a conforming parser
 // reads the field name as more of the previous event's data, so the failure
 // signal turns into garbage appended to the last delta, which is exactly the
@@ -756,19 +790,24 @@ export function endStreamedResponse(response, { message } = {}) {
   response.end();
 }
 
-// Emit a terminal `error` event into a response whose head is already sent,
+// Emit a terminal failure into a response whose head is already sent,
 // without ending it -- the caller decides when the stream is over. Used where
 // the router has committed to a 200 and then hits a failure it must state
 // rather than let pass as a short, successful-looking turn. The framing and
 // the leading blank line are the same as `endStreamedResponse` above, and for
 // the same reasons; the message is always router-side text, never an upstream
 // body.
-export function writeStreamErrorEvent(response, { code, message }) {
+export function writeStreamErrorEvent(response, { code, message, localRejection = false }) {
   if (!response || response.writableEnded || response.destroyed) return false;
   if (!isEventStream(response)) return false;
   try {
-    const data = { type: "error", code, message, param: null };
-    response.write(`\n\nevent: error\ndata: ${JSON.stringify(data)}\n\n`);
+    const failure = responsesStreamFailure(response, { code, message, localRejection });
+    if (failure?.terminal) {
+      if (failure.closePendingFrame) response.write("\n\n");
+      return false;
+    }
+    const data = failure?.event || { type: "error", code, message, param: null };
+    response.write(`\n\nevent: ${data.type}\ndata: ${JSON.stringify(data)}\n\n`);
     return true;
   } catch {
     // The socket may already be gone; the caller ends the response anyway.

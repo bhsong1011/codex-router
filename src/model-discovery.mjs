@@ -23,13 +23,20 @@ import {
   resolveProviderBaseUrl,
 } from "./model-registry.mjs";
 import { curatedModelBlockReason } from "./opencode-curation.mjs";
+import {
+  OPENCODE_SESSION_FALLBACKS,
+  applyOpenCodeSessionHeaders,
+  isOpenCodeProvider,
+} from "./opencode-session.mjs";
 import { providerCatalogRouteIds } from "./provider-catalogs.mjs";
 import { readUserModels } from "./user-models.mjs";
 import { credentialStatus, resolveProviderCredential } from "./provider-credentials.mjs";
+import { VERSION } from "./version.mjs";
 import {
   fetchUntrustedModelCatalog,
   validateModelCatalogPayload,
 } from "./untrusted-model-discovery.mjs";
+import { discoverVertexProviderModels } from "./vertex-model-discovery.mjs";
 import {
   ensureFreshGitHubCopilotSession,
   githubCopilotCatalogHeaders,
@@ -40,11 +47,17 @@ function option(name) {
   return index === -1 ? undefined : process.argv[index + 1];
 }
 
+function isAimlChatRecord(item) {
+  return item?.type === "openai/chat-completions";
+}
+
 export function modelIds(payload, provider) {
-  const data = Array.isArray(payload) ? payload : payload?.data;
+  const data = Array.isArray(payload) ? payload : payload?.data ?? payload?.models;
   if (!Array.isArray(data)) throw new Error("The provider returned an invalid model list.");
   const candidates = provider?.authMode === "anonymous"
     ? data.filter((item) => anonymousModelAllowed(provider, item?.id))
+    : provider?.id === "aimlapi"
+    ? data.filter(isAimlChatRecord)
     : provider?.id === "orca"
     ? data.filter((item) => {
         // OrcaRouter's catalog also contains image, video, audio, and
@@ -84,21 +97,26 @@ export function modelIds(payload, provider) {
 // `upstreamId`). Keep discovery provider-agnostic without changing the
 // filtering policy for built-in providers.
 function modelRecordId(item) {
-  return String(item?.id ?? item?.model ?? item?.upstreamId ?? "").trim();
+  return String(item?.id ?? item?.model ?? item?.upstreamId ?? item?.slug ?? "").trim();
 }
 
 function modelRecords(payload, provider) {
-  const data = Array.isArray(payload) ? payload : payload?.data;
+  const data = Array.isArray(payload) ? payload : payload?.data ?? payload?.models;
   if (!Array.isArray(data)) throw new Error("The provider returned an invalid model list.");
   const ids = new Set(modelIds(payload, provider));
-  return data.filter((item) => ids.has(modelRecordId(item)));
+  return data.filter((item) => ids.has(modelRecordId(item)) &&
+    (provider?.id !== "aimlapi" || isAimlChatRecord(item)));
 }
 
 function metadataFromRecords(payload, provider) {
   const metadata = {};
   for (const record of modelRecords(payload, provider)) {
     try {
-      const entry = modelMetadataFromProviderRecord(record);
+      const entry = modelMetadataFromProviderRecord(provider.id === "aimlapi" ? {
+        ...record,
+        display_name: record.info?.name,
+        context_length: record.info?.contextLength,
+      } : record);
       metadata[entry.upstreamId] = entry;
     } catch {
       // Model ids remain useful even when an optional provider capability
@@ -157,7 +175,7 @@ function zeroPrice(value) {
 // price, or zero input and output token prices.
 export function freeModelIds(payload, provider) {
   if (provider?.id !== "orca") return [];
-  const data = Array.isArray(payload) ? payload : payload?.data;
+  const data = Array.isArray(payload) ? payload : payload?.data ?? payload?.models;
   if (!Array.isArray(data)) throw new Error("The provider returned an invalid model list.");
   const callable = new Set(modelIds(payload, provider));
   return data
@@ -198,19 +216,34 @@ function advertisedContextLength(item) {
   return smallest;
 }
 
+// Model id -> input modalities the provider itself stated for that model.
+// Present only where a record said so: curation must be able to tell a served
+// answer from the text-only default the merged view fills in.
+export function advertisedInputModalities(modelMetadata) {
+  const modalities = {};
+  for (const [id, metadata] of Object.entries(modelMetadata || {})) {
+    if (Array.isArray(metadata?.inputModalities) && metadata.inputModalities.length > 0) {
+      modalities[id] = [...metadata.inputModalities];
+    }
+  }
+  return modalities;
+}
+
 // Model id -> advertised context window, for the models `modelIds` kept. A
 // model the provider filtered out has no answer worth carrying, and a model
 // the provider sized in silence is absent rather than guessed: curation falls
 // back to its conservative default only when nothing was advertised.
 export function modelContextLengths(payload, provider) {
-  const data = Array.isArray(payload) ? payload : payload?.data;
+  const data = Array.isArray(payload) ? payload : payload?.data ?? payload?.models;
   if (!Array.isArray(data)) return {};
   const kept = new Set(modelIds(payload, provider));
   const lengths = {};
-  for (const item of data) {
+  for (const item of modelRecords(payload, provider)) {
     const id = modelRecordId(item);
     if (!id || !kept.has(id) || id in lengths) continue;
-    const length = advertisedContextLength(item);
+    const length = advertisedContextLength(provider?.id === "aimlapi"
+      ? { ...item, context_length: item.info?.contextLength }
+      : item);
     if (length !== undefined) lengths[id] = length;
   }
   return lengths;
@@ -307,6 +340,13 @@ async function providerPayload(provider, identity) {
       ...githubCopilotCatalogHeaders(session.token),
     };
   }
+  if (isOpenCodeProvider(provider)) {
+    headers["User-Agent"] = `codex-router/${VERSION}`;
+    applyOpenCodeSessionHeaders(headers, {
+      provider,
+      fallback: OPENCODE_SESSION_FALLBACKS.discovery,
+    });
+  }
   return fetchUntrustedModelCatalog(`${baseUrl}/models`, {
     headers,
     allowPrivate: Boolean(provider.keyless),
@@ -323,10 +363,45 @@ async function providerPayload(provider, identity) {
  */
 export async function discoverProviderModels(
   providerId,
-  { refresh = false, cache = true, fixture = false, scope, loadPayload = providerPayload } = {},
+  {
+    refresh = false,
+    cache = true,
+    fixture = false,
+    fixturePayload,
+    fixturePath,
+    scope,
+    loadPayload = providerPayload,
+    fetchImpl,
+    timeoutMs,
+    allowPrivate,
+    resolveHost,
+    proxyResolvesDestination,
+    credential,
+    catalog,
+    staticCatalog = false,
+  } = {},
 ) {
   const provider = RUNTIME_PROVIDERS.get(providerId);
   if (!provider) throw new Error(`Unknown provider: ${providerId}`);
+  if (provider.protocol === "vertex") {
+    const cliFixture = option("--fixture");
+    return discoverVertexProviderModels(provider, {
+      refresh,
+      cache,
+      scope,
+      ...(fixture !== false && fixture !== undefined ? { fixture } : {}),
+      ...(fixturePayload !== undefined ? { fixturePayload } : {}),
+      ...(fixturePath || cliFixture ? { fixturePath: fixturePath || cliFixture } : {}),
+      ...(fetchImpl ? { fetchImpl } : {}),
+      ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+      ...(allowPrivate !== undefined ? { allowPrivate } : {}),
+      ...(resolveHost ? { resolveHost } : {}),
+      ...(proxyResolvesDestination !== undefined ? { proxyResolvesDestination } : {}),
+      ...(credential ? { credential } : {}),
+      ...(catalog ? { catalog } : {}),
+      ...(staticCatalog ? { staticCatalog: true } : {}),
+    });
+  }
   if (provider.generic === true) {
     const fixturePath = option("--fixture");
     const genericFixture = fixturePath
@@ -461,6 +536,7 @@ export async function discoverProviderModels(
     // Sizing the provider published for itself. Curation stores it rather than
     // guessing a window for a model whose catalog entry already names one.
     contextLengths,
+    inputModalities: advertisedInputModalities(modelMetadata),
     // Normalized provider-declared capabilities and documented supplements.
     // Missing fields stay missing: discovery is an evidence record, not a
     // reason to invent curation defaults or enable a route automatically.
@@ -523,6 +599,27 @@ export async function discoverGenericProviderModels(
     validateModelCatalogPayload(payload);
     discovered = modelIds(payload, descriptor);
     modelMetadata = metadataFromRecords(payload, descriptor);
+    // An OpenAI-compatible `/v1/models` list can say nothing about size or
+    // modalities (Ollama's does). When the same server describes its models
+    // individually, fill in exactly the fields the list left blank so
+    // curation stores the served window instead of its conservative guess.
+    if (!usingFixture && typeof snapshot.fetchModelDetails === "function") {
+      const details = await snapshot.fetchModelDetails({
+        ids: discovered,
+        fetchImpl,
+        timeoutMs,
+        resolveHost,
+        proxyResolvesDestination,
+      });
+      for (const [id, record] of Object.entries(details || {})) {
+        try {
+          const described = modelMetadataFromProviderRecord(record);
+          modelMetadata[id] = { ...described, ...(modelMetadata[id] || {}) };
+        } catch {
+          // One malformed description must not discard the catalog.
+        }
+      }
+    }
     fetchedAt = new Date().toISOString();
     if (storeAnswer) {
       if (genericProviderDiscoverySnapshot(providerId).identityFingerprint !== identityFingerprint) {
@@ -578,6 +675,7 @@ export async function discoverGenericProviderModels(
     blocked,
     unavailable: registered.filter((id) => !discoveredSet.has(id)),
     contextLengths,
+    inputModalities: advertisedInputModalities(modelMetadata),
     modelMetadata: merged,
     cached: Boolean(cached),
     stale: Boolean(cached?.stale),

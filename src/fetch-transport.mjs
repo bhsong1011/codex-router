@@ -1,6 +1,15 @@
 import { Agent, EnvHttpProxyAgent, fetch as undiciFetch, setGlobalDispatcher } from "undici";
 
+import { connectTimeoutMs } from "./connect-timeout.mjs";
 import { environmentHttpProxyConfigured } from "./proxy-environment.mjs";
+
+// The connect-phase bound lives in `connect-timeout.mjs`, which must stay free
+// of undici (see there). Re-exported here for existing importers.
+export { connectTimeoutMs };
+
+// How long one address attempt may run before the next is tried. Only
+// meaningful with `autoSelectFamily`, whose default is 250ms.
+const AUTO_SELECT_FAMILY_ATTEMPT_TIMEOUT_MS = 250;
 
 // Node 26's bundled fetch negotiates HTTP/2 by default. A live router process
 // observed its pooled session remain destroyed after ERR_HTTP2_INVALID_SESSION,
@@ -21,26 +30,74 @@ import { environmentHttpProxyConfigured } from "./proxy-environment.mjs";
 // hold connections longer than it does -- surfacing as UND_ERR_SOCKET on a
 // POST Undici will not retry. Only the loopback probe pool below, whose one
 // origin is our own server, raises it.
-export function fetchDispatcherOptions() {
+export function fetchDispatcherOptions(environment = process.env) {
   return {
     allowH2: false,
     pipelining: 1,
+    connectTimeout: connectTimeoutMs(environment),
+    autoSelectFamily: true,
+    autoSelectFamilyAttemptTimeout: AUTO_SELECT_FAMILY_ATTEMPT_TIMEOUT_MS,
   };
 }
 
+// `bodyTimeoutMs` raises Undici's 300s idle bound between body chunks. Only a
+// process that carries nothing but long-silent streams (the Grok OAuth
+// forwarder) sets it for its whole pool. The headers bound moves with it: a
+// Grok turn can stay silent until the first response headers, and Undici's
+// 300s headers default would abort that wait while the body bound still had
+// room. Callers that omit `bodyTimeoutMs` keep both defaults.
 export function installStableFetchTransport({
   AgentClass = Agent,
   EnvHttpProxyAgentClass = EnvHttpProxyAgent,
   setDispatcher = setGlobalDispatcher,
   environment = process.env,
   execArgv = process.execArgv,
+  bodyTimeoutMs,
 } = {}) {
   const DispatcherClass = environmentHttpProxyConfigured(environment, execArgv)
     ? EnvHttpProxyAgentClass
     : AgentClass;
-  const dispatcher = new DispatcherClass(fetchDispatcherOptions());
+  const dispatcher = new DispatcherClass({
+    ...fetchDispatcherOptions(environment),
+    ...(bodyTimeoutMs ? { headersTimeout: bodyTimeoutMs, bodyTimeout: bodyTimeoutMs } : {}),
+  });
   setDispatcher(dispatcher);
   return dispatcher;
+}
+
+// Grok OAuth and local Ollama turns can be silent beyond Undici's 300s idle
+// default. Their route-specific hops use separate pools sized to their own
+// configured bounds; other providers keep the shared pool. The dispatcher
+// class and proxy decision match the shared pool, so only the idle bounds differ. The headers bound moves with the
+// body bound: a Grok compaction is not streamed, so the gateway answers its
+// headers only after the whole generation, and Undici's 300s headers default
+// would end a long compaction before the stall guard's allowance.
+const longIdleStreamDispatchers = new Map();
+
+export function longIdleStreamDispatcher(bodyTimeoutMs, {
+  AgentClass = Agent,
+  EnvHttpProxyAgentClass = EnvHttpProxyAgent,
+  environment = process.env,
+  execArgv = process.execArgv,
+} = {}) {
+  let dispatcher = longIdleStreamDispatchers.get(bodyTimeoutMs);
+  if (!dispatcher) {
+    const DispatcherClass = environmentHttpProxyConfigured(environment, execArgv)
+      ? EnvHttpProxyAgentClass
+      : AgentClass;
+    dispatcher = new DispatcherClass({
+      ...fetchDispatcherOptions(environment),
+      headersTimeout: bodyTimeoutMs,
+      bodyTimeout: bodyTimeoutMs,
+    });
+    longIdleStreamDispatchers.set(bodyTimeoutMs, dispatcher);
+  }
+  return dispatcher;
+}
+
+// Undici's own `fetch`, for the reason given at the probe pool below.
+export function longIdleStreamFetch(url, init = {}, { bodyTimeoutMs } = {}) {
+  return undiciFetch(url, { ...init, dispatcher: longIdleStreamDispatcher(bodyTimeoutMs) });
 }
 
 // Health probes must not share the streaming pool. A GET /health/liveliness
@@ -83,4 +140,15 @@ export function loopbackProbeDispatcher() {
 
 export function loopbackProbeFetch(url, init = {}, dispatcher = loopbackProbeDispatcher()) {
   return undiciFetch(url, { ...init, dispatcher });
+}
+
+// Re-entry surfaces carry the caller capability in their loopback URL. Unlike
+// health probes, that hop must never honor an environment proxy: doing so can
+// disclose the local capability to a corporate or user-configured proxy. Keep
+// one direct HTTP/1.1 pool for those authenticated same-machine requests.
+let sharedDirectLoopbackDispatcher;
+
+export function directLoopbackFetch(url, init = {}) {
+  sharedDirectLoopbackDispatcher ??= new Agent(fetchDispatcherOptions());
+  return undiciFetch(url, { ...init, dispatcher: sharedDirectLoopbackDispatcher });
 }

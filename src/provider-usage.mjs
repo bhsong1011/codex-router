@@ -2,12 +2,21 @@ import { PROVIDERS } from "./model-registry.mjs";
 import { providerAccountUsageSnapshot } from "./provider-account-usage.mjs";
 import { canonicalProviderId, readProviderSelection } from "./provider-selection.mjs";
 import { allUsageEvents } from "./usage-events.mjs";
+import { knownGenerationOutcome, usageEventSucceeded } from "./response-outcome.mjs";
 
+// OpenAI's account stream reports dailyUsageBuckets keyed by UTC calendar day.
+// These router-derived buckets were keyed by the machine's local day, so the
+// two day spaces were merged by string in mergeAccountUsageBuckets() and drawn
+// on one chart as if they described the same window. East of UTC that silently
+// misattributed every bar by the zone's offset, and the current local day had
+// no account bucket to match at all until the offset elapsed -- a Pro account
+// mid-session showed "today: 0" every morning. One day space, and it has to be
+// the one the authoritative stream already uses.
 function dateKey(value) {
   const date = new Date(value);
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(date.getUTCDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
 }
 
@@ -51,6 +60,16 @@ const NATIVE_OPENAI = {
   kind: "oauth",
 };
 
+function outcomeCounts() {
+  return { completed: 0, failed: 0, incomplete: 0, canceled: 0, indeterminate: 0 };
+}
+
+function observeOutcome(record, event) {
+  const outcome = knownGenerationOutcome(event.generationOutcome);
+  if (outcome) record.outcomeCounts[outcome] += 1;
+  else record.legacyOutcomeRequests += 1;
+}
+
 function providerUsageRecord(provider) {
   return {
     id: provider.id,
@@ -65,10 +84,13 @@ function providerUsageRecord(provider) {
     scope: "local-router",
     requests: 0,
     successfulRequests: 0,
+    outcomeCounts: outcomeCounts(),
+    legacyOutcomeRequests: 0,
     meteredRequests: 0,
     inputTokens: 0,
     regularInputTokens: 0,
     cachedInputTokens: 0,
+    cacheTelemetrySeen: false,
     outputTokens: 0,
     totalTokens: 0,
     last24hInputTokens: 0,
@@ -128,7 +150,8 @@ export function aggregateProviderUsage(events, { days = 90, now = Date.now() } =
     }
     if (event.meteringVersion !== 1 && !hasMeteredUsage(event)) continue;
     provider.requests += 1;
-    if (event.status >= 200 && event.status < 400) provider.successfulRequests += 1;
+    if (usageEventSucceeded(event)) provider.successfulRequests += 1;
+    observeOutcome(provider, event);
     const selectedOutputTokens = nonnegative(event.outputTokens);
     const inputTokens = nonnegative(event.billedInputTokens ?? event.inputTokens);
     const outputTokens = nonnegative(event.billedOutputTokens ?? event.outputTokens);
@@ -160,6 +183,7 @@ export function aggregateProviderUsage(events, { days = 90, now = Date.now() } =
     provider.regularInputTokens += regularInput;
     if (cachedInputTokens !== undefined) {
       cacheTelemetrySeen = true;
+      provider.cacheTelemetrySeen = true;
       if (at >= rolling24hCutoff) last24hCachedInputTokens += measuredCached;
       const cachedDay = dailyCachedInputTokens.get(day) || 0;
       dailyCachedInputTokens.set(day, cachedDay + measuredCached);
@@ -196,6 +220,8 @@ export function aggregateProviderUsage(events, { days = 90, now = Date.now() } =
       displayName: modelDisplayName(slug),
       requests: 0,
       successfulRequests: 0,
+      outcomeCounts: outcomeCounts(),
+      legacyOutcomeRequests: 0,
       meteredRequests: 0,
       inputTokens: 0,
       outputTokens: 0,
@@ -205,7 +231,8 @@ export function aggregateProviderUsage(events, { days = 90, now = Date.now() } =
       lastUsedAt: new Date(at).toISOString(),
     };
     model.requests += 1;
-    if (event.status >= 200 && event.status < 400) model.successfulRequests += 1;
+    if (usageEventSucceeded(event)) model.successfulRequests += 1;
+    observeOutcome(model, event);
     if (hasMeteredUsage(event)) {
       model.meteredRequests += 1;
     }
@@ -223,13 +250,20 @@ export function aggregateProviderUsage(events, { days = 90, now = Date.now() } =
     // 426-token one at 69 on the same model.
     const firstTokenMs = optionalNonnegative(event.firstTokenMs);
     const generationDurationMs = durationMs - (firstTokenMs ?? durationMs);
+    // The numerator must count exactly the tokens generated inside that
+    // window. Reasoning tokens are generated inside it when the provider
+    // streamed reasoning deltas (the clock started on the first of them), and
+    // before it when the provider thought in silence until the first visible
+    // token. Only the second case subtracts them; without the marker (rows
+    // written before it existed) the inclusive count is the closer answer on
+    // every route seen so far. Provider totals still count full output.
+    const speedOutputTokens = tokensGeneratedAfterFirstToken(event, selectedOutputTokens);
     // A long Codex turn can trip the empty-completion hold budget and still
     // finish as a normal 200 with streamed tokens. That flag means "we
     // stopped waiting to classify emptiness", not "this rate is unusable".
     // Keep those replies; drop only empty/retried/canceled ones.
     const measurable =
-      event.status >= 200 &&
-      event.status < 400 &&
+      usageEventSucceeded(event) &&
       !event.retries &&
       event.emptyCompletion !== true &&
       event.emptyCompletionRetried !== true &&
@@ -239,16 +273,16 @@ export function aggregateProviderUsage(events, { days = 90, now = Date.now() } =
     // No served model streams anywhere near this fast, so treat it as a broken
     // sample rather than a record-breaking one.
     const impossibleRate =
-      (selectedOutputTokens * 1_000) / generationDurationMs >
+      (speedOutputTokens * 1_000) / generationDurationMs >
       MAX_PLAUSIBLE_TOKENS_PER_SECOND;
     if (
       measurable &&
-      selectedOutputTokens > 0 &&
+      speedOutputTokens > 0 &&
       firstTokenMs !== undefined &&
       generationDurationMs > 0 &&
       !impossibleRate
     ) {
-      model.speedSamples.push({ outputTokens: selectedOutputTokens, generationDurationMs });
+      model.speedSamples.push({ outputTokens: speedOutputTokens, generationDurationMs });
       // Keep the displayed rate current instead of averaging the model's
       // entire 90-day usage history. Twenty replies smooth one-off bursts
       // without letting old sessions dominate the result.
@@ -317,6 +351,19 @@ export function aggregateProviderUsage(events, { days = 90, now = Date.now() } =
         ),
     })),
   };
+}
+
+// Some providers report output tokens that already exclude reasoning (a
+// reasoning count larger than the output count proves it), so the inclusive
+// total is rebuilt before deciding whether to subtract.
+export function tokensGeneratedAfterFirstToken(event, outputTokens) {
+  const reasoningTokens = optionalNonnegative(event.reasoningTokens) ?? 0;
+  const inclusiveOutputTokens =
+    reasoningTokens > outputTokens ? outputTokens + reasoningTokens : outputTokens;
+  if (event.reasoningStreamed === false) {
+    return Math.max(0, inclusiveOutputTokens - reasoningTokens);
+  }
+  return inclusiveOutputTokens;
 }
 
 export async function providerUsageSnapshot(options = {}) {

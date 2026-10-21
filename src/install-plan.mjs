@@ -32,9 +32,18 @@ export const SOURCE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.u
 // The litellm pin itself is a security floor as much as a version: 1.95.0
 // required `cryptography>=48.0.1,<49.0`, which no patched cryptography can
 // satisfy (GHSA-g6cj-pr64-35w5 is fixed in 50.0.0). Do not move it back.
-export const PYTHON_REQUIREMENTS = ["litellm[proxy]==1.96.0", "fastapi==0.139.2"];
+// Keep these transitive security floors direct so lock regeneration cannot
+// select affected multidict or urllib3 releases again. LiteLLM 1.96.2 fixes
+// GHSA-3cv6-jpf6-8222; multidict 6.9.1 fixes GHSA-54p9-h82j-f925; urllib3
+// 2.8.0 fixes GHSA-gh4c-6fx4-qh6g, GHSA-vxq7-64xx-v4gw and GHSA-8988-9cw3-xx77.
+export const PYTHON_REQUIREMENTS = [
+  "litellm[proxy]==1.96.2",
+  "fastapi==0.139.2",
+  "multidict==6.9.1",
+  "urllib3==2.8.0",
+];
 
-// Pinning the two direct requirements left their whole transitive tree floating:
+// Pinning only the gateway requirements left their transitive tree floating:
 // every install re-resolved `litellm[proxy]` against PyPI and executed whatever
 // it got. `requirements/python.txt` is the hash-verified closure of the pins
 // above, and both installers now install *from that file* with
@@ -211,6 +220,11 @@ function controlCenterSources(root) {
     path.join(base, "package.json"),
     path.join(base, "package-lock.json"),
     path.join(base, "electron-builder.yml"),
+    path.join(root, "src", "spawnable-command.mjs"),
+    path.join(root, "src", "chatgpt-login-lease.mjs"),
+    path.join(root, "src", "file-security.mjs"),
+    path.join(root, "src", "path-security.mjs"),
+    path.join(root, "src", "process-identity.mjs"),
     path.join(base, "index.html"),
     path.join(base, "main.mjs"),
     path.join(base, "vite.config.ts"),
@@ -232,6 +246,8 @@ function controlCenterSources(root) {
     ]),
     path.join(base, "assets", "icon.png"),
     path.join(base, "assets", "icon.ico"),
+    path.join(base, "assets", "trayTemplate.png"),
+    path.join(base, "assets", "trayTemplate@2x.png"),
   ];
 }
 
@@ -249,6 +265,7 @@ const TRAY_PLATFORMS = {
       return [
         path.join(root, "scripts", "build-macos-tray-app.sh"),
         path.join(root, "scripts", "build-macos-widget.sh"),
+        path.join(root, "src", "macos-developer-tools.mjs"),
         path.join(base, "Package.swift"),
         path.join(base, "Resources", "Info.plist"),
         path.join(base, "Resources", "ModelRouterTray.entitlements"),

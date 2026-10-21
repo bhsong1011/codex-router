@@ -18,6 +18,7 @@ export interface RouterDataReady {
   presence: boolean;
   health: boolean;
   accountUsage: boolean;
+  accountPool: boolean;
   providerUsage: boolean;
 }
 
@@ -46,6 +47,12 @@ export interface RouterModel {
   autoCompact?: number;
   inputModalities?: string[];
   isFree?: boolean;
+  /**
+   * Locally curated: this route came from the operator's `user-models.json`
+   * overlay rather than a checked-in `config/` entry, so curation can prune it
+   * again. Never set on a route this checkout ships.
+   */
+  local?: boolean;
   /** False only for a checked-in research route that is not currently routable. */
   available?: boolean;
 }
@@ -241,6 +248,7 @@ export interface RouterTarget {
   routerDefaultModel?: string;
   routerDefaultManaged?: boolean;
   usageEvents?: UsageEvent[];
+  usageEventHours?: UsageEventHour[];
   modelSettings?: {
     subagents: SubagentSettings;
     picker: { hidden: string[]; visible?: string[]; hasExplicitVisibility?: boolean; path?: string };
@@ -290,6 +298,50 @@ export interface ChatGptSessionStatus {
   session: "usable" | "expired" | "unavailable";
   present: boolean;
   expiresInHours?: number;
+  email?: string;
+}
+
+export interface ChatGptSubscriptionAccount {
+  id: string;
+  state: "active" | "paused" | "revoked" | string;
+  paused: boolean;
+  priority: number;
+  label?: string;
+  createdAt?: string;
+  subscription?: {
+    status?: "pending" | "usable" | "expired" | "invalid" | string;
+    authenticated?: boolean;
+    usable?: boolean;
+    expired?: boolean;
+    hasAccountId?: boolean;
+    expiresInHours?: number;
+    email?: string;
+    usage?: { period: "weekly" | "monthly" | "current"; remainingPercent: number; resetsAt?: number | null };
+  };
+  health?: { state?: string; lastStatus?: number; lastError?: string };
+  turns: number;
+  requests: number;
+}
+
+export interface ChatGptAccountPool {
+  version: number;
+  policy: { enabled: boolean; mode: "switch"; selectedAccountId?: string };
+  accounts: Record<string, ChatGptSubscriptionAccount>;
+  loginAttempts?: Record<string, {
+    status: "pending" | "failed";
+    error?: string;
+    retryable?: boolean;
+    removable?: boolean;
+  }>;
+  sessions: { count: number };
+  profile?: ChatGptProfileSwitch;
+}
+
+export interface ChatGptProfileSwitch {
+  desired?: string;
+  active?: string;
+  pending: boolean;
+  running?: boolean;
 }
 
 export interface RouterCatalogSnapshot {
@@ -305,10 +357,22 @@ export interface RouterCatalogSnapshot {
   dashboard?: RouterDashboardSnapshot;
 }
 
+/** A custom endpoint mutation plus the one live check that followed it. */
+export interface CustomEndpointResult {
+  providerId: string;
+  check?: { ok: boolean; status: number; reason?: string };
+}
+
 export interface ProviderSetup {
   id: string;
   displayName: string;
-  kind: "oauth" | "api" | "anonymous" | "per-model";
+  kind: "oauth" | "api" | "anonymous" | "per-model" | "configuration";
+  /** Operator-added OpenAI-compatible endpoint (a generic provider). */
+  generic?: boolean;
+  enabled?: boolean;
+  baseUrl?: string;
+  adapter?: string;
+  hasKey?: boolean;
   configured: boolean;
   action: string;
   planNote?: string;
@@ -318,10 +382,15 @@ export interface ProviderSetup {
     kind: "models-endpoint" | "devin" | string;
   }>;
   credentialLabel?: string;
+  configurationNote?: string;
   cliInstalled?: boolean;
   cliRunnable?: boolean;
   signIn?: boolean;
   signedIn?: boolean;
+  verified?: boolean;
+  disconnectable?: boolean;
+  probeNote?: string;
+  blockedNote?: string;
   signInAction?: string;
 }
 
@@ -368,6 +437,8 @@ export interface ProviderCatalog {
 
 export interface ProviderSetupSnapshot {
   providers: ProviderSetup[];
+  /** Operator-added OpenAI-compatible endpoints; shown under Custom. */
+  customEndpoints?: ProviderSetup[];
 }
 
 export interface UsageBucket {
@@ -399,6 +470,9 @@ export interface UsageMetric {
 
 export interface AccountUsage {
   fetchedAt?: string;
+  accountSelection?: string;
+  accountEmail?: string | null;
+  profilePending?: boolean;
   planType?: string;
   primary?: UsageMetric | null;
   secondary?: UsageMetric | null;
@@ -411,7 +485,16 @@ export interface AccountUsage {
   };
 }
 
-export interface ProviderModelUsage {
+export type GenerationOutcome = "completed" | "failed" | "incomplete" | "canceled" | "indeterminate";
+
+export interface GenerationOutcomeStats {
+  outcomeCounts?: Partial<Record<GenerationOutcome, number>>;
+  /** Requests recorded before generation outcomes were available. */
+  legacyOutcomeRequests?: number;
+  requests?: number;
+}
+
+export interface ProviderModelUsage extends GenerationOutcomeStats {
   slug?: string;
   displayName?: string;
   inputTokens?: number;
@@ -425,13 +508,14 @@ export interface ProviderModelUsage {
   lastUsedAt?: string;
 }
 
-export interface ProviderUsage {
+export interface ProviderUsage extends GenerationOutcomeStats {
   id: string;
   displayName: string;
   credentialType?: string;
   inputTokens?: number;
   regularInputTokens?: number;
   cachedInputTokens?: number;
+  cacheTelemetrySeen?: boolean;
   outputTokens?: number;
   totalTokens?: number;
   requests?: number;
@@ -475,12 +559,30 @@ export interface ProviderUsageSnapshot {
   providers: ProviderUsage[];
 }
 
+// One local hour of router traffic, aggregated by the router over the whole
+// window rather than over the capped `usageEvents` sample. `usageEvents` still
+// carries the per-request detail the recent-activity list needs; these buckets
+// carry the totals a 24-hour chart cannot get from a bounded sample.
+export interface UsageEventHour {
+  startedAt: string;
+  tokens: number;
+  requests: number;
+  measuredTokens: boolean;
+  regularInputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  measuredBreakdown: boolean;
+}
+
 export interface UsageEvent {
   meteringVersion?: number;
   at: string;
   model?: string;
   provider?: string;
   status?: number;
+  /** HTTP delivery status is separate from the terminal generation result. */
+  httpStatus?: number;
+  generationOutcome?: GenerationOutcome;
   durationMs?: number;
   /** Milliseconds until the upstream response headers arrived. */
   responseStartMs?: number;
@@ -491,6 +593,9 @@ export interface UsageEvent {
   cachedInputTokens?: number;
   outputTokens?: number;
   billedOutputTokens?: number;
+  /** Reasoning tokens (silent thinking) included in outputTokens. */
+  reasoningTokens?: number;
+  reasoningStreamed?: boolean;
   totalTokens?: number;
   estimatedInputTokens?: number;
   retries?: number;
@@ -560,18 +665,44 @@ export interface PresenceSnapshot {
 
 export interface OperationEvent {
   id?: string;
+  name?: string;
   action?: string;
   status?: "started" | "completed" | "failed" | string;
   message?: string;
+  error?: string;
 }
 
-export type HarnessId = "codex" | "deepcode";
+export type HarnessId =
+  | "codex"
+  | "dsh"
+  | "gemini"
+  | "cursor"
+  | "claude"
+  | "openclaw"
+  // Document-configured harnesses: published into rather than installed as.
+  // See `src/routed-harness-catalog.mjs`.
+  | "opencode"
+  | "pi"
+  | "omp"
+  | "commandcode"
+  | "hermes";
 export type HarnessSurface = "app" | "terminal";
 
 export interface HarnessDescriptor {
   id: HarnessId;
   displayName: string;
-  ownership: "openai" | "third-party";
+  ownership:
+    | "openai"
+    | "deepseek"
+    | "google"
+    | "cursor"
+    | "anthropic"
+    | "openclaw"
+    | "opencode"
+    | "pi"
+    | "omp"
+    | "commandcode"
+    | "nousresearch";
   description: string;
   cliInstalled: boolean;
   cliVersion?: string;
@@ -579,6 +710,21 @@ export interface HarnessDescriptor {
   configured: boolean;
   canInstall: boolean;
   installRequirement?: string;
+  /** Whether this client is installed and has an updater this router can run. */
+  canUpdate?: boolean;
+  /** The command an update would run, e.g. `opencode upgrade`. */
+  updateCommand?: string;
+  publicOrigin?: string;
+  agentConfigured?: boolean;
+  appConfigured?: boolean;
+  tunnel?: {
+    provider: "cloudflare";
+    binaryInstalled: boolean;
+    loggedIn: boolean;
+    configured: boolean;
+    hostname?: string;
+    nextAction: "install-cloudflared" | "login" | "choose-hostname" | "ready";
+  };
   docsUrl: string;
 }
 
@@ -586,6 +732,22 @@ export interface HarnessSnapshot {
   platform: string;
   terminalAvailable: boolean;
   harnesses: HarnessDescriptor[];
+}
+
+export type AgentBridgeId = "anthropic" | "cursor" | "gemini";
+
+export interface AgentBridgeDescriptor {
+  id: AgentBridgeId;
+  displayName: string;
+  protocol: "claude-code" | "acp" | string;
+  installed: boolean;
+  sessions: number;
+  authentication: "client-owned" | "unavailable" | string;
+}
+
+export interface AgentBridgeSnapshot {
+  version: 1;
+  bridges: AgentBridgeDescriptor[];
 }
 
 export interface HarnessSession {
@@ -618,18 +780,29 @@ export interface ContextSessionsSnapshot {
   counts: {
     total: number;
     codex: number;
-    deepcode: number;
+    dsh: number;
+    cursor: number;
+    claude: number;
+    gemini: number;
+    openclaw: number;
+    opencode: number;
+    pi: number;
+    omp: number;
+    commandcode: number;
+    hermes: number;
     archived: number;
   };
 }
 
 export interface RouterControlApi {
+  setInterfaceLanguage?(language: import("./i18n").LanguageId): void;
   readonly platform: string;
   minimizeWindow(): Promise<unknown>;
   toggleMaximizeWindow(): Promise<unknown>;
   closeWindow(): Promise<unknown>;
   getSnapshot(): Promise<RouterSnapshot>;
   getChatGptSession(): Promise<ChatGptSessionStatus>;
+  getChatGptAccountPool(): Promise<ChatGptAccountPool>;
   getHealth(): Promise<RouterHealth>;
   getProviders(): Promise<ProviderSetupSnapshot>;
   discoverProviderModels(provider: string, options?: { refresh?: boolean }): Promise<ProviderCatalog>;
@@ -642,12 +815,19 @@ export interface RouterControlApi {
   repairInstall(): Promise<DoctorSnapshot>;
   getPresence(): Promise<PresenceSnapshot>;
   getHarnesses(): Promise<HarnessSnapshot>;
+  getAgentBridges(): Promise<AgentBridgeSnapshot>;
   getContextSessions(): Promise<ContextSessionsSnapshot>;
   refreshAll(): Promise<unknown>;
   setProviderEnabled(provider: string, enabled: boolean): Promise<unknown>;
   addProviderModels(provider: string, modelIds: string[]): Promise<unknown>;
   connectProvider(provider: string): Promise<unknown>;
   saveProviderCredential(provider: string, credential: string): Promise<unknown>;
+  addCustomEndpoint(endpoint: { displayName: string; baseUrl: string; adapter: "openai-chat" | "openai-responses"; credential?: string }): Promise<CustomEndpointResult>;
+  editCustomEndpoint(provider: string, endpoint: { displayName: string; baseUrl: string; adapter: "openai-chat" | "openai-responses" }): Promise<CustomEndpointResult>;
+  removeCustomEndpointModels(provider: string, slugs: string[]): Promise<unknown>;
+  /** Prune locally curated models (the `user-models.json` overlay) on any provider. */
+  removeLocalModels(slugs: string[]): Promise<unknown>;
+  addCustomEndpointModel(provider: string, modelId: string): Promise<unknown>;
   removeProviderCredential(provider: string): Promise<unknown>;
   setSubagentMode(mode: "all" | "selected" | "proven"): Promise<unknown>;
   setSubagentModel(slug: string, enabled: boolean): Promise<unknown>;
@@ -687,15 +867,27 @@ export interface RouterControlApi {
   clearRouterDefault(): Promise<unknown>;
   setSignedRouting(enabled: boolean): Promise<unknown>;
   setChatGptSessionSharing(enabled: boolean): Promise<ChatGptSessionStatus>;
+  addChatGptSubscriptionAccount(label?: string): Promise<unknown>;
+  loginChatGptSubscriptionAccount(accountId: string): Promise<unknown>;
+  removeChatGptSubscriptionAccount(accountId: string): Promise<unknown>;
+  setChatGptAccountSelection(selection: string): Promise<unknown>;
   setPresence(mode: "always" | "follow-codex"): Promise<PresenceSnapshot>;
   controlService(action: "status" | "start"): Promise<unknown>;
   controlTray(action: "enable" | "disable" | "status" | "restart"): Promise<unknown>;
   launchHarness(harnessId: HarnessId, surface: HarnessSurface): Promise<unknown>;
-  installHarness(harnessId: "deepcode"): Promise<unknown>;
+  probeAgentBridge(bridgeId: AgentBridgeId): Promise<unknown>;
+  loginAgentBridge(bridgeId: AgentBridgeId): Promise<unknown>;
+  setupHarness(harnessId: HarnessId, hostname?: string): Promise<unknown>;
+  /** Move one routed client, or every installed one ("all"), to its latest release. */
+  updateHarness(harnessId: HarnessId | "all"): Promise<unknown>;
+  prepareCursorTunnel(): Promise<unknown>;
+  connectCursor(hostname?: string): Promise<unknown>;
+  disconnectCursor(): Promise<unknown>;
+  disconnectHarness(harnessId: HarnessId): Promise<unknown>;
   openHarnessSession(harnessId: HarnessId, sessionId: string, surface: HarnessSurface, model?: string): Promise<unknown>;
   openExternal(url: string): Promise<void>;
   onNavigation?(listener: (request: {
-    destination: "usage" | "usage-resets";
+    destination: "usage" | "usage-resets" | "settings";
     sourceId?: string;
   }) => void): () => void;
   onOperation?(listener: (event: OperationEvent) => void): () => void;

@@ -609,6 +609,31 @@ test("set-apply keeps provider mutation, publication, and rollback in one transa
   assert.match(source, /args\[0\] === "set-apply"[\s\S]{0,260}runSetApply\(args\[1\], args\[2\]\)/);
 });
 
+test("OpenClaw client setup uses the shared transactional enable path", () => {
+  const source = readFileSync(path.join(root, "src", "control.mjs"), "utf8");
+  const setup = source.match(
+    /async function handleClientSetup[\s\S]*?\r?\n}\r?\n\r?\nasync function handleClientExport/,
+  )?.[0];
+  assert.ok(setup, "client setup helper should be readable");
+  assert.match(setup, /"openclaw"/);
+  assert.match(setup, /currentCheckoutInstaller\(process\.platform, target, \{ posixScript: "enable" \}\)/);
+  assert.doesNotMatch(setup, /setupOpenClaw/);
+});
+
+test("Cursor client disconnect uses the Node uninstall path on every platform", () => {
+  const source = readFileSync(path.join(root, "src", "control.mjs"), "utf8");
+  const start = source.indexOf("async function handleClientDisconnect");
+  const end = source.indexOf("async function handleClientUpdate", start);
+  assert.ok(start >= 0 && end > start, "client disconnect helper should be readable");
+  const disconnect = source.slice(start, end);
+  assert.match(disconnect, /cursor-config-manager\.mjs", "uninstall"/);
+  assert.match(disconnect, /config-manager\.mjs", "disable"/);
+  assert.match(disconnect, /installedTargets\(\)/);
+  assert.match(disconnect, /service\.mjs/);
+  assert.doesNotMatch(disconnect, /currentCheckoutInstaller\(/);
+  assert.doesNotMatch(disconnect, /posixScript:\s*"disable"/);
+});
+
 test("login-free control selects a ready external model and restores Codex defaults", () => {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "control-login-free-"));
   const signedOutCodex = writeSignedOutCodexStub(stateDir);
@@ -687,6 +712,7 @@ test("login-free control selects a ready external model and restores Codex defau
         ["deepseek/deepseek-v4-flash-vision-exp", "hide"],
         ["deepseek/deepseek-v4.1-flash", "list"],
         ["deepseek/deepseek-v4-pro", "list"],
+        ["deepseek/deepseek-v4.1-flash", "list"],
       ],
     );
     const aliases = JSON.parse(readFileSync(path.join(stateDir, "native-aliases.json"), "utf8"));

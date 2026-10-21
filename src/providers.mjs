@@ -14,7 +14,9 @@ import {
 import {
   loginOauthProvider,
   providerNeedsCuration,
+  removeApiCredential,
 } from "./provider-onboarding.mjs";
+import { credentialSetupHint } from "./provider-credentials.mjs";
 import {
   canonicalProviderId,
   disableProvider,
@@ -28,6 +30,37 @@ import {
   targetRestartHint,
 } from "./target-integration.mjs";
 import { withModelOverlayLock } from "./model-overlay-lock.mjs";
+import { forgetProviderCatalogFamilyCache } from "./provider-catalogs.mjs";
+import { restartRouterServiceIfInstalled } from "./router-restart.mjs";
+import { activateAntigravityProbe } from "./antigravity-probe-activation.mjs";
+import {
+  boundedOperationChild,
+  operationDeadlineFromEnvironment,
+  remainingOperationMs,
+  runOperationProcessTree,
+} from "./process-tree.mjs";
+
+const MAX_PROVIDER_OPERATION_MS = 11 * 60_000;
+
+function providerOperationContext(command) {
+  if (!["login", "probe", "disconnect"].includes(command)) return {};
+  const deadline = operationDeadlineFromEnvironment(process.env, {
+    timeoutMs: MAX_PROVIDER_OPERATION_MS,
+    maximumMs: MAX_PROVIDER_OPERATION_MS,
+  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    const error = new Error("The provider operation exceeded its absolute deadline.");
+    error.code = "router_operation_timeout";
+    controller.abort(error);
+  }, remainingOperationMs(deadline));
+  timer.unref?.();
+  return {
+    deadline,
+    signal: controller.signal,
+    dispose: () => clearTimeout(timer),
+  };
+}
 import {
   GENERIC_PROVIDERS_PATH,
   getGenericProvider,
@@ -54,11 +87,13 @@ import {
 import {
   USER_MODELS_PATH,
   readUserModels,
+  userModelEntry,
   writeUserModels,
 } from "./user-models.mjs";
 import {
   MODEL_PICKER_STATE_PATH,
   forgetModelVisibility,
+  setModelsVisible,
 } from "./model-picker-state.mjs";
 import {
   removeSearchSidecarBindingsForProvider,
@@ -69,6 +104,22 @@ function providersCommand(action, providerId) {
   return process.platform === "win32"
     ? `.\\codex-router.ps1 providers ${action} ${providerId}`
     : `./bin/providers ${action} ${providerId}`;
+}
+
+function antigravityProbeOptions(flags) {
+  const allowed = new Set(["--live", "--yes", "--provision-project"]);
+  const unknown = flags.find((flag) => !allowed.has(flag));
+  if (unknown) {
+    throw new Error(
+      `Unknown Antigravity probe option: ${unknown}. ` +
+        "Usage: providers probe antigravity-oauth --live --yes [--provision-project]",
+    );
+  }
+  return {
+    live: flags.includes("--live"),
+    confirmed: flags.includes("--yes"),
+    allowOnboard: flags.includes("--provision-project"),
+  };
 }
 
 // One entry per OAuth vendor keeps adding a provider a registry-plus-map
@@ -116,8 +167,20 @@ function list() {
 
 const GENERIC_MUTATIONS = new Set(["add", "edit", "enable", "disable", "remove"]);
 
+async function readSecretFromStdin() {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of process.stdin) {
+    size += chunk.length;
+    if (size > 16 * 1024) throw new Error("The provider credential is too large.");
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks).toString("utf8").trim();
+}
+
 async function runGenericCredentialCommand(args, {
   prompt = promptForSecret,
+  readStdin = readSecretFromStdin,
   transact = transactModelOverlayMutation,
   applyPublication = applyModelOverlayPublication,
 } = {}) {
@@ -127,8 +190,12 @@ async function runGenericCredentialCommand(args, {
   if (!providerId || !["status", "set", "remove"].includes(action)) {
     throw new Error("Usage: providers generic credential PROVIDER status|set|remove [--json]");
   }
-  const unexpected = args.slice(3).filter((arg) => arg !== "--json");
+  // --stdin lets the Control Center hand the key over a pipe; the default
+  // hidden prompt needs a terminal the desktop app does not have.
+  const fromStdin = args.includes("--stdin");
+  const unexpected = args.slice(3).filter((arg) => arg !== "--json" && arg !== "--stdin");
   if (unexpected.length) throw new Error(`Unknown generic credential option: ${unexpected[0]}`);
+  if (fromStdin && action !== "set") throw new Error("--stdin applies only to credential set.");
   const descriptor = getGenericProvider(providerId);
   const status = () => ({
     providerId,
@@ -143,9 +210,14 @@ async function runGenericCredentialCommand(args, {
     return result;
   }
 
-  const value = action === "set"
-    ? prompt(`${descriptor.displayName} API key`)
-    : undefined;
+  const value = action !== "set"
+    ? undefined
+    : fromStdin
+      ? await readStdin()
+      : prompt(`${descriptor.displayName} API key`);
+  if (action === "set" && !String(value || "").trim()) {
+    throw new Error(`${descriptor.displayName} API key is empty.`);
+  }
   let credentialId = descriptor.credentialRef;
   await transact({
     files: [
@@ -200,9 +272,55 @@ async function runGenericCredentialCommand(args, {
   return result;
 }
 
+// Curation can only offer what an endpoint's /models route advertises. A
+// private or preview model an operator was given directly is never on that
+// list, so name it here instead. The id is the one the endpoint expects on the
+// wire; nothing verifies it, exactly as nothing verifies a base URL.
+async function runGenericAddModelCommand(args, {
+  transact = transactModelOverlayMutation,
+  applyPublication = applyModelOverlayPublication,
+} = {}) {
+  const providerId = String(args[1] || "").trim();
+  const modelId = String(args[2] || "").trim();
+  const json = args.includes("--json");
+  if (!providerId || !modelId || modelId.startsWith("--")) {
+    throw new Error("Usage: providers generic add-model PROVIDER MODEL_ID [--json]");
+  }
+  const descriptor = getGenericProvider(providerId);
+  let entry;
+  await transact({
+    files: [USER_MODELS_PATH, MODEL_PICKER_STATE_PATH],
+    mutate: () => {
+      const current = readUserModels();
+      if (current.some((model) => model.provider === providerId && model.upstreamModel === modelId)) {
+        throw new Error(`${modelId} is already a curated ${descriptor.displayName} model.`);
+      }
+      entry = userModelEntry({
+        providerId,
+        upstreamId: modelId,
+        priority: 100 + current.filter((model) => model.provider === providerId).length,
+      });
+      if (current.some((model) => model.slug === entry.slug || model.gatewayModel === entry.gatewayModel)) {
+        throw new Error(`${entry.slug} collides with an existing routed model.`);
+      }
+      writeUserModels([...current, entry]);
+      // Adding a model by name is choosing it, exactly as ticking it is.
+      setModelsVisible([entry.slug], true);
+    },
+    restart: true,
+    applyPublication,
+  });
+  const result = { provider: providerId, added: modelId, slug: entry.slug };
+  process.stdout.write(json
+    ? `${JSON.stringify(result, null, 2)}\n`
+    : `Added ${entry.slug} to ${descriptor.displayName}. ${targetRestartHint()}\n`);
+  return result;
+}
+
 export async function runGenericCommand(args, dependencies) {
   const action = args[0] || "list";
   if (action === "credential") return runGenericCredentialCommand(args, dependencies);
+  if (action === "add-model") return runGenericAddModelCommand(args, dependencies);
   if (!GENERIC_MUTATIONS.has(action)) {
     return runGenericProviderCli(args);
   }
@@ -275,6 +393,8 @@ export async function runGenericCommand(args, dependencies) {
 
 async function main() {
   const command = process.argv[2] || "list";
+  const operation = providerOperationContext(command);
+  try {
   const providerId = process.argv[3];
   if (command === "generic") {
     await runGenericCommand(process.argv.slice(3));
@@ -303,33 +423,86 @@ async function main() {
     // Antigravity is the one OAuth provider whose browser flow belongs to the
     // router. Kimi and Grok retain their official CLI sessions, which need a
     // real terminal instead of a child with piped stdio.
-    await loginOauthProvider(provider.id);
-    if (readProviderSelection().includes(provider.id)) {
-      process.stdout.write(`${provider.displayName} sign-in completed; the provider remains enabled.\n`);
-    } else {
+    await loginOauthProvider(provider.id, operation);
+    await withModelOverlayLock(() => refreshTargetPickerIfInstalled(operation));
+    process.stdout.write(
+      `${provider.displayName} sign-in completed with the operator-owned OAuth client. ` +
+        `The route remains disabled until an explicit live compatibility test succeeds.\n` +
+        `Run \`${providersCommand("probe", provider.id)} --live --yes\`; this sends a small prompt and uses provider quota.\n`,
+    );
+    return;
+  }
+  if (command === "probe") {
+    if (provider?.id !== "antigravity-oauth") {
+      throw new Error("Usage: providers probe antigravity-oauth --live --yes [--provision-project]");
+    }
+    const { probeAntigravity } = await import("./antigravity-oauth-probe.mjs");
+    const refreshInstalledClients = ({
+      signal = operation.signal,
+      deadline = operation.deadline,
+    } = {}) => withModelOverlayLock(async () => {
+      await forgetProviderCatalogFamilyCache(provider.id);
+      return refreshTargetPickerIfInstalled({ signal, deadline });
+    });
+    const { result, refreshed } = await activateAntigravityProbe({
+      probe: probeAntigravity,
+      probeOptions: antigravityProbeOptions(process.argv.slice(4)),
+      // Probe invalidation happens before its first provider request. Publish
+      // that fail-closed state immediately so a previous proof cannot remain
+      // advertised while the explicit re-probe is in flight or fails.
+      withdraw: refreshInstalledClients,
+      // A successful managed restart waits for start.mjs, which conditionally
+      // spawns and health-gates this forwarder before router health succeeds.
+      restart: () => restartRouterServiceIfInstalled(operation),
+      publish: refreshInstalledClients,
+      signal: operation.signal,
+      deadline: operation.deadline,
+    });
+    process.stdout.write(
+      `${provider.displayName} accepted the truthful Codex Router live probe with ${result.model}.\n`,
+    );
+    if (!readProviderSelection().includes(provider.id)) {
       process.stdout.write(
-        `${provider.displayName} sign-in completed. Run \`${providersCommand("enable", provider.id)}\` to add its models without changing any other provider.\n`,
+        `Run \`${providersCommand("enable", provider.id)}\` to add its models without changing any other provider.\n`,
       );
     }
-    // The forwarder that serves these models is spawned only when a session
-    // exists, so a router that started before this sign-in has none. Say so
-    // here rather than leaving the first routed turn to fail on a port nothing
-    // is listening on.
     process.stdout.write(
-      `The Antigravity forwarder starts with the router service; run \`${targetCli("control service restart")}\` so it picks up this session.\n`,
+      "The managed router service restarted and confirmed the verified Antigravity boundary.\n",
+    );
+    if (refreshed) process.stdout.write(`${targetRestartHint()}\n`);
+    return;
+  }
+  if (command === "disconnect") {
+    if (provider?.id !== "antigravity-oauth") {
+      throw new Error("Usage: providers disconnect antigravity-oauth");
+    }
+    await withModelOverlayLock(async () => {
+      await removeApiCredential(provider.id);
+      // removeApiCredential also withdraws the selection. Republish even when
+      // the credential vanished first, or installed clients can retain a
+      // stale Antigravity route after an otherwise successful disconnect.
+      await refreshTargetPickerIfInstalled(operation);
+    });
+    process.stdout.write(
+      `${provider.displayName} disconnected; its operator OAuth client, session, live proof, and picker selection were removed.\n`,
     );
     return;
   }
   if (!provider || !["enable", "disable"].includes(command)) {
     throw new Error(
-      "Usage: providers [list [--json]|login antigravity-oauth|enable ID|disable ID|generic ...]",
+      "Usage: providers [list [--json]|login antigravity-oauth|probe antigravity-oauth --live --yes [--provision-project]|disconnect antigravity-oauth|enable ID|disable ID|generic ...]",
     );
   }
   if (command === "enable" && !configured(provider)) {
     const keySetup = `run \`${targetCli(`provider-key ${provider.id} set`)}\``;
+    const oauthStatus = provider.kind === "oauth"
+      ? SIGN_IN_STATUS[provider.id]?.status()
+      : undefined;
     const setup = provider.kind === "oauth"
-      ? SIGN_IN_STATUS[provider.id]?.setup || "sign in with the provider CLI"
-      : keySetup;
+      ? oauthStatus?.setup || SIGN_IN_STATUS[provider.id]?.setup || "sign in with the provider CLI"
+      : provider.credential?.resolver
+        ? credentialSetupHint(provider)
+        : keySetup;
     throw new Error(`${provider.displayName} is not configured; ${setup} first.`);
   }
   let providers;
@@ -338,7 +511,7 @@ async function main() {
     providers = command === "enable"
       ? enableProvider(providerId)
       : disableProvider(providerId);
-    refreshed = refreshTargetPickerIfInstalled();
+    refreshed = await refreshTargetPickerIfInstalled();
   });
   // "shown in the model picker" is false for a catalog-only provider with no
   // curated models: enabling it changes nothing the user can see. Say what
@@ -358,10 +531,37 @@ async function main() {
       `Run ./bin/curate-models ${providerId} in an interactive terminal to choose its models.\n`,
     );
   }
+  } finally {
+    operation.dispose?.();
+  }
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  main().catch((error) => {
+  const command = process.argv[2] || "list";
+  const needsBoundary = ["login", "probe", "disconnect"].includes(command);
+  const execute = async () => {
+    if (needsBoundary && !boundedOperationChild(process.env, {
+      maximumMs: MAX_PROVIDER_OPERATION_MS,
+    })) {
+      const deadline = operationDeadlineFromEnvironment(process.env, {
+        timeoutMs: MAX_PROVIDER_OPERATION_MS,
+        maximumMs: MAX_PROVIDER_OPERATION_MS,
+      });
+      const result = await runOperationProcessTree(process.execPath, [fileURLToPath(import.meta.url), ...process.argv.slice(2)], {
+        cwd: process.cwd(),
+        env: process.env,
+        childEnvironment: {
+          CODEX_ROUTER_OPERATION_CHILD: "1",
+        },
+        deadline,
+        stdio: "inherit",
+      });
+      if (result.status !== 0) process.exitCode = result.status ?? 1;
+      return;
+    }
+    await main();
+  };
+  execute().catch((error) => {
     console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;
   });
