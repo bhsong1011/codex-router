@@ -23,15 +23,10 @@ function reasoningContent(value) {
     .map((text) => ({ type: "reasoning_text", text }));
 }
 
-// Codex replays a turn's reasoning immediately before the message that
-// followed it, but a model that thinks between issuing a tool call and the
-// result arriving leaves reasoning items inside the call/output exchange.
-// DeepSeek pairs every tool_calls message with its outputs directly, so a
-// reasoning_text part in between is rejected as "No tool output found for
-// tool call ...". Hoist displaced reasoning to the head of the assistant
-// turn that owns the exchange (its message, or the first call when the turn
-// has no message), preserving item order otherwise. Idempotent: hoisted
-// reasoning sits outside any open exchange, so a second pass moves nothing.
+// Codex can replay reasoning or inject developer guidance between a tool call
+// and its result. DeepSeek requires each call/output exchange to stay adjacent,
+// so hoist those messages before the first call. Idempotent: hoisted items sit
+// outside any open exchange, so a second pass moves nothing.
 const TOOL_CALL_TYPES = new Set(["function_call", "custom_tool_call"]);
 const TOOL_OUTPUT_TYPES = new Set(["function_call_output", "custom_tool_call_output"]);
 
@@ -39,7 +34,7 @@ function isAssistantMessage(item) {
   return item?.role === "assistant" || (item?.type === "message" && item?.role === "assistant");
 }
 
-function relocateReasoningOutOfToolExchanges(items) {
+function relocateMessagesOutOfToolExchanges(items) {
   const result = [];
   const openCalls = new Set();
   let exchangeStart = -1;
@@ -55,7 +50,10 @@ function relocateReasoningOutOfToolExchanges(items) {
       continue;
     }
     if (TOOL_CALL_TYPES.has(type)) {
-      if (openCalls.size === 0 && exchangeStart === -1) exchangeStart = result.length;
+      if (openCalls.size === 0 && exchangeStart === -1) {
+        exchangeStart = result.length;
+        hoistAt = -1;
+      }
       // Outputs reference their call by call_id only, so tracking both the
       // item id and the call_id would leave the exchange open forever on
       // calls whose ids differ.
@@ -75,7 +73,7 @@ function relocateReasoningOutOfToolExchanges(items) {
       if (openCalls.size === 0) exchangeStart = -1;
       continue;
     }
-    if (type === "reasoning" && openCalls.size > 0 && exchangeStart >= 0) {
+    if ((type === "reasoning" || type === "message") && openCalls.size > 0 && exchangeStart >= 0) {
       const at = hoistAt >= 0 ? hoistAt : exchangeStart;
       result.splice(at, 0, item);
       hoistAt = at + 1;
@@ -156,7 +154,7 @@ export function deepSeekResponsesInput(input) {
     if (!content.length) content = reasoningContent(item.raw_content);
     return content.length ? [{ type: "reasoning", content }] : [];
   });
-  return ensureReasoningForAssistantTurns(relocateReasoningOutOfToolExchanges(mapped));
+  return ensureReasoningForAssistantTurns(relocateMessagesOutOfToolExchanges(mapped));
 }
 
 // Only apply_patch has a native custom-tool contract at this endpoint. Other

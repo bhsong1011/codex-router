@@ -127,6 +127,21 @@ test("reasoning before a call with no assistant message hoists ahead of the firs
   ]);
 });
 
+test("messages in later tool exchanges stay with their own exchange", () => {
+  const input = [
+    { type: "function_call", call_id: "call_1", name: "shell", arguments: "{}" },
+    { type: "function_call_output", call_id: "call_1", output: "one" },
+    { type: "function_call", call_id: "call_2", name: "shell", arguments: "{}" },
+    { type: "message", role: "developer", content: "guidance" },
+    { type: "function_call_output", call_id: "call_2", output: "two" },
+  ];
+  const normalized = deepSeekResponsesInput(input);
+  assert.deepEqual(normalized.map((item) =>
+    item.type === "message" ? item.role : item.type === "function_call" ? `call:${item.call_id}` : item.type), [
+    "call:call_1", "function_call_output", "developer", "call:call_2", "function_call_output",
+  ]);
+});
+
 test("only unsupported custom tools require the function bridge", () => {
   assert.deepEqual(deepSeekCustomToolNames(
     [{ type: "custom", name: "apply_patch" }, { type: "custom", name: "exec" }],
@@ -457,7 +472,11 @@ test("direct DeepSeek Responses preserves images, reasoning, tools and stream bo
       { type: "reasoning", content: [{ type: "reasoning_text", text: "PRIOR_REASONING" }] },
       { type: "message", role: "assistant", phase: "commentary", content: [{ type: "output_text", text: "PRIOR_ANSWER" }] },
       { type: "function_call", name: "probe", namespace: "fixture", call_id: "call_previous", arguments: "{}" },
+      { type: "message", role: "developer", content: [{ type: "input_text", text: "Environment tool guidance." }] },
+      { type: "function_call", name: "probe", namespace: "fixture", call_id: "call_previous_2", arguments: "{}" },
       { type: "function_call_output", call_id: "call_previous", output: [{ type: "input_text", text: "fixture" }, { type: "input_image", image_url: IMAGE, detail: "original" }] },
+      { type: "message", role: "developer", content: [{ type: "input_text", text: "Additional tool guidance." }] },
+      { type: "function_call_output", call_id: "call_previous_2", output: "fixture 2" },
     ];
     const result = await send(history);
     const events = parseEvents(await result.text());
@@ -468,6 +487,17 @@ test("direct DeepSeek Responses preserves images, reasoning, tools and stream bo
     assert.equal(requestText.split("PRIOR_REASONING").length - 1, 1);
     assert.equal(requestText.split("PRIOR_ANSWER").length - 1, 1);
     assert.deepEqual(requests.at(-1).body.input.find((item) => item.type === "reasoning"), history[1]);
+    const sentInput = requests.at(-1).body.input;
+    const firstCallIndex = sentInput.findIndex((item) => item.call_id === "call_previous");
+    const secondCallIndex = sentInput.findIndex((item) => item.call_id === "call_previous_2");
+    const firstOutputIndex = sentInput.findIndex((item) => item.type === "function_call_output" && item.call_id === "call_previous");
+    const secondOutputIndex = sentInput.findIndex((item) => item.type === "function_call_output" && item.call_id === "call_previous_2");
+    const guidanceIndexes = sentInput.flatMap((item, index) => item.role === "developer" ? [index] : []);
+    assert.ok(guidanceIndexes.every((index) => index < firstCallIndex) &&
+      secondCallIndex === firstCallIndex + 1 &&
+      firstOutputIndex === secondCallIndex + 1 &&
+      secondOutputIndex === firstOutputIndex + 1,
+      "client-injected developer guidance must not split a function call from its output");
     // Built-in Responses providers keep Codex's message phase; only
     // operator-configured Responses endpoints have it removed.
     assert.equal(requests.at(-1).body.input.find((item) => item.role === "assistant")?.phase, "commentary");

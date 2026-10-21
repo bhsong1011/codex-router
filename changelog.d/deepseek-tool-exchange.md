@@ -1,0 +1,1 @@
+- **Keep DeepSeek tool calls adjacent to their results when replaying Codex history.** Client-injected messages can no longer split a call/output exchange and trigger a provider rejection.
