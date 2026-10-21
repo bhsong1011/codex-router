@@ -712,6 +712,9 @@ async function makeProcessTreeControlRoot() {
   const root = await mkdtemp(path.join(os.tmpdir(), "router-control-tree-"));
   await mkdir(path.join(root, "src"), { recursive: true });
   await mkdir(path.join(root, "bin"), { recursive: true });
+  await mkdir(path.join(root, "config"), { mode: 0o700 });
+  await chmod(path.join(root, "src"), 0o700);
+  await chmod(path.join(root, "bin"), 0o700);
   await writeFile(
     path.join(root, "src", "control.mjs"),
     [
@@ -759,6 +762,9 @@ async function makeBarrierControlRoot() {
   const root = await mkdtemp(path.join(os.tmpdir(), "router-control-barrier-"));
   await mkdir(path.join(root, "src"), { recursive: true });
   await mkdir(path.join(root, "bin"), { recursive: true });
+  await mkdir(path.join(root, "config"), { mode: 0o700 });
+  await chmod(path.join(root, "src"), 0o700);
+  await chmod(path.join(root, "bin"), 0o700);
   const processTreeModule = new URL("../src/process-tree.mjs", import.meta.url).href;
   await writeFile(
     path.join(root, "src", "control.mjs"),
@@ -1042,6 +1048,8 @@ test("control center follows the recorded router owner", async () => {
   try {
     await mkdir(path.join(owner, "src"), { recursive: true });
     await mkdir(path.join(owner, "bin"), { recursive: true });
+    await chmod(path.join(owner, "src"), 0o700);
+    await chmod(path.join(owner, "bin"), 0o700);
     await writeFile(path.join(owner, "src", "control.mjs"), "", { mode: 0o700 });
     await writeFile(path.join(owner, "bin", "control"), "#!/bin/sh\n", { mode: 0o700 });
     await writeFile(
@@ -1079,6 +1087,10 @@ test("control center refuses mutations across app/control protocol skew", async 
 
     const bundled = JSON.parse(await readFile(new URL("../apps/control-center/package.json", import.meta.url), "utf8"));
     await mkdir(path.join(owner, "apps", "control-center"), { recursive: true });
+    await chmod(path.join(owner, "src"), 0o700);
+    await chmod(path.join(owner, "bin"), 0o700);
+    await chmod(path.join(owner, "apps"), 0o700);
+    await chmod(path.join(owner, "apps", "control-center"), 0o700);
     await writeFile(
       path.join(owner, "apps", "control-center", "package.json"),
       JSON.stringify({ version: bundled.version, controlProtocol: bundled.controlProtocol }),
@@ -1117,6 +1129,9 @@ test("trusted install provenance overrides contradictory package-manager environ
   try {
     await mkdir(path.join(owner, "src"), { recursive: true });
     await mkdir(path.join(owner, "bin"), { recursive: true });
+    await mkdir(path.join(owner, "config"), { mode: 0o700 });
+    await chmod(path.join(owner, "src"), 0o700);
+    await chmod(path.join(owner, "bin"), 0o700);
     await writeFile(
       path.join(owner, "src", "control.mjs"),
       "process.stdout.write(JSON.stringify({ packageManager: process.env.CODEX_ROUTER_PACKAGE_MANAGER ?? null }));\n",
@@ -2147,6 +2162,9 @@ test("credential input stays off argv and is delivered over stdin", async () => 
   try {
     await mkdir(path.join(temporaryRoot, "src"), { recursive: true });
     await mkdir(path.join(temporaryRoot, "bin"), { recursive: true });
+    await mkdir(path.join(temporaryRoot, "config"), { mode: 0o700 });
+    await chmod(path.join(temporaryRoot, "src"), 0o700);
+    await chmod(path.join(temporaryRoot, "bin"), 0o700);
     await writeFile(
       path.join(temporaryRoot, "src", "control.mjs"),
       "let input = ''; for await (const chunk of process.stdin) input += chunk; process.stdout.write(JSON.stringify({ argv: process.argv.slice(2), input }));\n",
