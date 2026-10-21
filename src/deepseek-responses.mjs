@@ -77,7 +77,11 @@ function relocateMessagesOutOfToolExchanges(items) {
       if (openCalls.size === 0) exchangeStart = -1;
       continue;
     }
-    if ((type === "reasoning" || type === "message") && openCalls.size > 0 && exchangeStart >= 0) {
+    if (
+      (type === "reasoning" || type === "message" || item?.role === "developer")
+      && openCalls.size > 0
+      && exchangeStart >= 0
+    ) {
       const at = hoistAt >= 0 ? hoistAt : exchangeStart;
       result.splice(at, 0, item);
       hoistAt = at + 1;

@@ -154,6 +154,23 @@ test("assistant messages are hoisted out of tool-call exchanges", () => {
   ]);
 });
 
+test("role-only developer messages are hoisted out of function and custom-tool exchanges", () => {
+  const guidance = { role: "developer", content: "Tool guidance." };
+
+  for (const [call, output] of [
+    [
+      { type: "function_call", call_id: "call_1", name: "exec_command", arguments: "{}" },
+      { type: "function_call_output", call_id: "call_1", output: "done" },
+    ],
+    [
+      { type: "custom_tool_call", call_id: "call_2", name: "exec", input: "command" },
+      { type: "custom_tool_call_output", call_id: "call_2", output: "done" },
+    ],
+  ]) {
+    assert.deepEqual(deepSeekResponsesInput([call, guidance, output]), [guidance, call, output]);
+  }
+});
+
 test("only unsupported custom tools require the function bridge", () => {
   assert.deepEqual(deepSeekCustomToolNames(
     [{ type: "custom", name: "apply_patch" }, { type: "custom", name: "exec" }],
@@ -484,10 +501,10 @@ test("direct DeepSeek Responses preserves images, reasoning, tools and stream bo
       { type: "reasoning", content: [{ type: "reasoning_text", text: "PRIOR_REASONING" }] },
       { type: "message", role: "assistant", phase: "commentary", content: [{ type: "output_text", text: "PRIOR_ANSWER" }] },
       { type: "function_call", name: "probe", namespace: "fixture", call_id: "call_previous", arguments: "{}" },
-      { type: "message", role: "developer", content: [{ type: "input_text", text: "Environment tool guidance." }] },
+      { role: "developer", content: [{ type: "input_text", text: "Environment tool guidance." }] },
       { type: "function_call", name: "probe", namespace: "fixture", call_id: "call_previous_2", arguments: "{}" },
       { type: "function_call_output", call_id: "call_previous", output: [{ type: "input_text", text: "fixture" }, { type: "input_image", image_url: IMAGE, detail: "original" }] },
-      { type: "message", role: "developer", content: [{ type: "input_text", text: "Additional tool guidance." }] },
+      { role: "developer", content: [{ type: "input_text", text: "Additional tool guidance." }] },
       { type: "function_call_output", call_id: "call_previous_2", output: "fixture 2" },
     ];
     const result = await send(history);
