@@ -1,11 +1,5 @@
 import { isUtf8 } from "node:buffer";
 
-const DEEPSEEK_FLASH_MODELS = new Set([
-  "deepseek-flash",
-  "deepseek-v4-flash",
-  "deepseek-v4-flash-vision-exp",
-]);
-
 const DEEPSEEK_FLASH_IMAGE_TOKENS = 1024;
 
 // The estimate exists to keep a false zero from being believed, not to price an
@@ -17,13 +11,11 @@ const DEEPSEEK_FLASH_IMAGE_TOKENS = 1024;
 // so a route that takes no images is unaffected.
 export const DEFAULT_IMAGE_TOKEN_BOUND = 4096;
 
-// DeepSeek's hosted Flash API resizes every image to at most 1024 tokens.
-// The older Flash names now alias that model. That bound is not established for
-// resellers, other providers, or other DeepSeek models, which take the
-// conservative default above rather than no bound at all.
+// DeepSeek's canonical Flash API resizes every image to at most 1024 tokens.
+// Resellers and other DeepSeek models take the conservative default.
 // Verified 2026-09-10: https://api-docs.deepseek.com/guides/vision/#token-usage
 export function maxImageTokensForRoute(route) {
-  return route?.provider === "deepseek" && DEEPSEEK_FLASH_MODELS.has(route.upstreamModel)
+  return route?.provider === "deepseek" && route.upstreamModel === "deepseek-flash"
     ? DEEPSEEK_FLASH_IMAGE_TOKENS
     : DEFAULT_IMAGE_TOKEN_BOUND;
 }

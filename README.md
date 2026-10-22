@@ -264,8 +264,8 @@ Linux installations support the Codex CLI.
 | Kimi K3 (OAuth) | `kimi-oauth/k3` | Existing Kimi Code CLI OAuth session |
 | Kimi K3 (API) | `kimi-api/kimi-k3` | Separately billed Kimi Platform API key |
 | Kimi K3 (China API) | `kimi-api-cn/kimi-k3` | Separately billed Moonshot **China** platform key |
-| DeepSeek V4 Pro (API) | `deepseek/deepseek-v4-pro` | DeepSeek API key |
-| deepseek-flash | `deepseek/deepseek-flash` | DeepSeek API key |
+| DeepSeek V4 Pro | `deepseek/deepseek-v4-pro` | DeepSeek API key |
+| DeepSeek Flash | `deepseek/deepseek-flash` | DeepSeek API key |
 | Grok 4.5 (OAuth) | `grok-oauth/grok-4.5` | Official Grok CLI OAuth session |
 | Grok 4.5 (API) | `grok-api/grok-4.5` | Separately billed xAI API key |
 | Claude Opus 4.8 (API) | `anthropic-api/claude-opus-4.8` | Separately billed Anthropic API key |
@@ -2083,7 +2083,7 @@ llm-pi-ai:
       apiKeyEnv: "CODEX_ROUTER_CALLER_KEY"
       models:
         - id: "deepseek/deepseek-v4-pro"
-          name: "DeepSeek V4 Pro (API)"
+          name: "DeepSeek V4 Pro"
           contextWindow: 1048576
           input:
             - "text"

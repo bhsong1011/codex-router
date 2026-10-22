@@ -7,9 +7,9 @@
       "upstreamModel": "deepseek-flash",
       "provider": "deepseek",
       "listed": true,
-      "displayName": "deepseek-flash",
+      "displayName": "DeepSeek Flash",
       "description": "DeepSeek-V4.1-Flash-1017, served through the DeepSeek API model ID deepseek-flash; fast reasoning, image understanding, tool calls, and a 1M context window.",
-      "priority": 8,
+      "priority": 34,
       "defaultEffort": "high",
       "reasoningLevels": [
         {

@@ -23,7 +23,7 @@ test("deepseek-flash publishes its documented capabilities", () => {
   assert.deepEqual(model.inputModalities, ["text", "image"]);
   assert.notEqual(model.multiAgentVersion, "v2");
   const published = routedModel({ slug: "gpt-5.5" }, model);
-  assert.equal(published.display_name, "deepseek-flash");
+  assert.equal(published.display_name, "DeepSeek Flash");
   assert.deepEqual(published.input_modalities, ["text", "image"]);
 });
 
@@ -123,9 +123,9 @@ test("DeepSeek V4.1 Flash on Ollama Cloud uses the cloud tag and the shared serv
   assert.ok(model.priority > MODEL_BY_SLUG.get("ollama-cloud/deepseek-v4-flash").priority);
 });
 
-test("V4.1 Flash is added alongside the remaining V4 routes", () => {
+test("the direct DeepSeek API catalog uses only current model IDs", () => {
   for (const [slug, upstreamModel] of [
-    ["deepseek/deepseek-v4-flash-vision-exp", "deepseek-v4-flash-vision-exp"],
+    ["deepseek/deepseek-flash", "deepseek-flash"],
     ["deepseek/deepseek-v4-pro", "deepseek-v4-pro"],
     ["openrouter/deepseek-v4-pro", "deepseek/deepseek-v4-pro"],
     ["opencode-go/deepseek-v4-flash", "deepseek-v4-flash"],
@@ -138,6 +138,11 @@ test("V4.1 Flash is added alongside the remaining V4 routes", () => {
     assert.equal(model.upstreamModel, upstreamModel);
     assert.equal(model.listed, true);
   }
+  for (const slug of [
+    "deepseek/deepseek-chat",
+    "deepseek/deepseek-reasoner",
+    "deepseek/deepseek-v4-flash-vision-exp",
+  ]) assert.equal(MODEL_BY_SLUG.has(slug), false, slug);
 });
 
 test("DeepSeek V4 Pro on OpenRouter matches the live catalog capabilities", () => {

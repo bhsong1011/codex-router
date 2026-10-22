@@ -119,7 +119,6 @@ test("provider registry exposes configured API and OAuth model families", () => 
       "commandcode/step-3.7-flash",
       "custom/qwen3.8-27b",
       "deepseek/deepseek-flash",
-      "deepseek/deepseek-v4-flash-vision-exp",
       "deepseek/deepseek-v4-pro",
       "grok-api/grok-4.5",
       "grok-api/grok-4.7",
@@ -682,7 +681,6 @@ test("provider registry exposes configured API and OAuth model families", () => 
   const standaloneSearchSlugs = new Set([
     "opencode-go/glm-5.3-flash",
     "deepseek/deepseek-flash",
-    "deepseek/deepseek-v4-flash-vision-exp",
     "opencode-go/deepseek-v4-flash",
     "xiaomi-mimo/mimo-v2.5",
     "zai-coding/glm-5.3",
@@ -700,7 +698,6 @@ test("provider registry exposes configured API and OAuth model families", () => 
   ).map((model) => model.slug);
   assert.deepEqual(originalDetailSlugs.sort(), [
     "anthropic-api/claude-opus-4.8",
-    "deepseek/deepseek-v4-flash-vision-exp",
     "grok-api/grok-4.5",
     "grok-api/grok-4.7",
     "grok-oauth/grok-4.5",
@@ -774,25 +771,32 @@ test("provider registry exposes configured API and OAuth model families", () => 
     "grok-oauth/grok-4.5",
     "grok-api/grok-4.5",
     "deepseek/deepseek-flash",
-    "deepseek/deepseek-v4-flash-vision-exp",
     "deepseek/deepseek-v4-pro",
-    "deepseek/deepseek-reasoner",
   ]) {
     assert.equal(MODEL_BY_SLUG.get(slug).supportsReasoningSummaries, true);
   }
   assert.equal(MODEL_BY_SLUG.has("deepseek/deepseek-v4.1-flash"), false);
   assert.equal(MODEL_BY_SLUG.has("deepseek/deepseek-v4-flash"), false);
-  assert.equal(MODEL_BY_SLUG.get("deepseek/deepseek-chat").supportsReasoningSummaries, undefined);
+  for (const slug of [
+    "deepseek/deepseek-chat",
+    "deepseek/deepseek-reasoner",
+    "deepseek/deepseek-v4-flash-vision-exp",
+  ]) assert.equal(MODEL_BY_SLUG.has(slug), false, slug);
   for (const slug of [
     "deepseek/deepseek-flash",
-    "deepseek/deepseek-v4-flash-vision-exp",
     "deepseek/deepseek-v4-pro",
   ]) {
     const model = MODEL_BY_SLUG.get(slug);
     assert.equal(model.contextWindow, 1_048_576);
     assert.equal(model.autoCompact, 900_000);
-    assert.match(model.description, /DeepSeek(?: |-)?V4/);
   }
+  assert.equal(MODEL_BY_SLUG.get("deepseek/deepseek-flash").displayName, "DeepSeek Flash");
+  assert.equal(MODEL_BY_SLUG.get("deepseek/deepseek-v4-pro").displayName, "DeepSeek V4 Pro");
+  const personalMax = Math.max(
+    ...LISTED_MODELS.filter((model) => model.provider === "chatgpt-login").map(({ priority }) => priority),
+  );
+  assert.ok(MODEL_BY_SLUG.get("deepseek/deepseek-flash").priority > personalMax);
+  assert.ok(MODEL_BY_SLUG.get("deepseek/deepseek-v4-pro").priority > personalMax);
   assert.deepEqual(
     MODEL_BY_SLUG.get("deepseek/deepseek-flash").inputModalities,
     ["text", "image"],
@@ -800,10 +804,6 @@ test("provider registry exposes configured API and OAuth model families", () => 
   assert.deepEqual(
     MODEL_BY_SLUG.get("deepseek/deepseek-v4-pro").inputModalities,
     ["text"],
-  );
-  assert.deepEqual(
-    MODEL_BY_SLUG.get("deepseek/deepseek-v4-flash-vision-exp").inputModalities,
-    ["text", "image"],
   );
 });
 
@@ -866,7 +866,7 @@ test("only checked-in Gemini reseller models opt into trailing model-turn trimmi
 
 test("DeepSeek V4 Flash routes opt in to Codex standalone web search", () => {
   for (const slug of [
-    "deepseek/deepseek-v4-flash-vision-exp",
+    "deepseek/deepseek-flash",
     "opencode-go/deepseek-v4-flash",
   ]) {
     assert.deepEqual(MODEL_BY_SLUG.get(slug)?.searchTool, { mode: "standalone" }, slug);
@@ -888,29 +888,6 @@ test("DeepSeek V4 Pro on the direct API advertises the same effort ladder as V4 
   assert.equal(pro.defaultEffort, "high");
   assert.equal(pro.requestProfile, "deepseek-thinking");
   assert.equal(pro.compHash, "deepseek-v4-pro-v2");
-});
-
-test("DeepSeek V4 Flash Vision Exp advertises only verified direct-API capabilities", () => {
-  const model = MODEL_BY_SLUG.get("deepseek/deepseek-v4-flash-vision-exp");
-  assert.ok(model);
-  assert.equal(model.provider, "deepseek");
-  assert.equal(model.gatewayModel, "deepseek-v4-flash-vision-exp");
-  assert.equal(model.upstreamModel, "deepseek-v4-flash-vision-exp");
-  assert.equal(model.listed, true);
-  assert.equal(model.requestProfile, "deepseek-thinking");
-  assert.equal(model.defaultEffort, "high");
-  assert.deepEqual(
-    model.reasoningLevels.map((level) => level.effort),
-    ["low", "high", "max"],
-  );
-  assert.equal(model.contextWindow, 1_048_576);
-  assert.equal(model.autoCompact, 900_000);
-  assert.deepEqual(model.inputModalities, ["text", "image"]);
-  assert.equal(model.supportsImageDetailOriginal, true);
-  assert.deepEqual(model.searchTool, { mode: "standalone" });
-  assert.equal(model.supportsReasoningSummaries, true);
-  assert.equal(endpointForModel(model), PROVIDERS.get("deepseek"));
-  assert.ok(API_MODELS.includes(model));
 });
 
 test("GLM-5.3 on OpenCode Go carries the 1M GLM-5.3 window, not GLM-5.1's 200K", () => {
@@ -1083,15 +1060,13 @@ test("official Xiaomi MiMo routes advertise only verified capabilities", () => {
   assert.deepEqual(vlm.searchTool, { mode: "standalone" });
 });
 
-test("deprecated DeepSeek aliases remain routable but stay out of the picker", () => {
+test("retired DeepSeek API model IDs are absent from the router catalog", () => {
   for (const slug of [
     "deepseek/deepseek-chat",
     "deepseek/deepseek-reasoner",
+    "deepseek/deepseek-v4-flash-vision-exp",
   ]) {
-    const model = MODEL_BY_SLUG.get(slug);
-    assert.ok(model);
-    assert.equal(model.listed, false);
-    assert.ok(API_MODELS.includes(model));
+    assert.equal(MODEL_BY_SLUG.has(slug), false, slug);
   }
 });
 

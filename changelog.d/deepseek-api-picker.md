@@ -1,0 +1,1 @@
+- **The DeepSeek API picker now uses the current Flash and Pro model IDs and keeps both after personal OpenAI models.** Retired direct API aliases are removed from the catalog.

@@ -1622,17 +1622,14 @@ test(
       );
       assert.equal(visibility.get("deepseek/deepseek-flash"), "list");
       assert.equal(visibility.has("deepseek/deepseek-v4-flash"), false);
-      assert.equal(visibility.get("deepseek/deepseek-v4-flash-vision-exp"), "list");
+      assert.equal(visibility.has("deepseek/deepseek-v4-flash-vision-exp"), false);
       assert.equal(visibility.get("deepseek/deepseek-v4-pro"), "hide");
       assert.equal(visibility.get("gpt-5.6-sol-1m"), "hide");
 
       const picker = JSON.parse(
         readFileSync(path.join(stateDir, "model-picker.json"), "utf8"),
       );
-      assert.deepEqual(picker.visible, [
-        "deepseek/deepseek-flash",
-        "deepseek/deepseek-v4-flash-vision-exp",
-      ]);
+      assert.deepEqual(picker.visible, ["deepseek/deepseek-flash"]);
     } finally {
       rmSync(codexHome, { recursive: true, force: true });
     }

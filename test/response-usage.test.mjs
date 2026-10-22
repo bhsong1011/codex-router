@@ -37,8 +37,8 @@ test("DeepSeek file references still contribute image tokens", () => {
   assert.ok(estimate >= 2048 && estimate < 2200, `image reference estimate was ${estimate}`);
 });
 
-test("documented direct DeepSeek models keep their 1024-token image bound", () => {
-  for (const upstreamModel of ["deepseek-flash", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp"]) {
+test("the canonical direct DeepSeek Flash model keeps its 1024-token image bound", () => {
+  for (const upstreamModel of ["deepseek-flash"]) {
     assert.equal(maxImageTokensForRoute({ provider: "deepseek", upstreamModel }), 1024);
     assert.equal(maxImageTokensForRoute({ provider: "opencode-go", upstreamModel }), DEFAULT_IMAGE_TOKEN_BOUND);
     assert.equal(maxImageTokensForRoute({ provider: "custom", upstreamModel }), DEFAULT_IMAGE_TOKEN_BOUND);
